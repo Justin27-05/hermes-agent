@@ -149,6 +149,55 @@ def _normalize_path(path: str) -> str:
 # Connection management
 # ---------------------------------------------------------------------------
 
+_JOURNAL_MODE_MAX_ATTEMPTS = 6
+_JOURNAL_MODE_RETRY_BASE_SECONDS = 0.02
+_JOURNAL_MODE_RETRY_MAX_SECONDS = 0.2
+
+
+def _is_journal_mode_busy(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return (
+        "database is locked" in message
+        or "database is busy" in message
+    )
+
+
+def _apply_wal_with_retry(conn: sqlite3.Connection) -> str:
+    """Bound transient contention while establishing the journal mode."""
+    from hermes_state import apply_wal_with_fallback
+
+    for attempt in range(_JOURNAL_MODE_MAX_ATTEMPTS):
+        try:
+            return apply_wal_with_fallback(conn, db_label="projects.db")
+        except sqlite3.OperationalError as exc:
+            if not _is_journal_mode_busy(exc):
+                raise
+
+            try:
+                row = conn.execute("PRAGMA journal_mode").fetchone()
+            except sqlite3.OperationalError as probe_exc:
+                if not _is_journal_mode_busy(probe_exc):
+                    raise
+            else:
+                mode = (
+                    str(row[0]).strip().lower()
+                    if row and row[0] is not None
+                    else ""
+                )
+                if mode == "wal":
+                    return "wal"
+
+            if attempt + 1 == _JOURNAL_MODE_MAX_ATTEMPTS:
+                raise
+            delay = min(
+                _JOURNAL_MODE_RETRY_BASE_SECONDS * (2 ** attempt),
+                _JOURNAL_MODE_RETRY_MAX_SECONDS,
+            )
+            time.sleep(delay)
+
+    raise AssertionError("unreachable")
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Initialize the catalog plus the additive ProjectRuntime schema."""
     # Local import keeps the catalog and runtime persistence modules acyclic.
@@ -175,9 +224,7 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     try:
         conn.row_factory = sqlite3.Row
-        from hermes_state import apply_wal_with_fallback
-
-        apply_wal_with_fallback(conn, db_label="projects.db")
+        _apply_wal_with_retry(conn)
         conn.execute("PRAGMA foreign_keys=ON")
         init_schema(conn)
     except Exception:

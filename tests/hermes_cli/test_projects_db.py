@@ -3,10 +3,33 @@
 from __future__ import annotations
 
 import os
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from hermes_cli import projects_db as pdb
+
+
+ALL_SCHEMA_TABLES = {
+    "projects",
+    "project_folders",
+    "project_meta",
+    "discovered_repos",
+    "project_contracts",
+    "project_runtime_state",
+    "project_conversations",
+    "project_surface_bindings",
+    "project_turns",
+    "project_run_controls",
+    "project_events",
+    "project_deliveries",
+    "project_approvals",
+    "project_artifacts",
+    "project_operations",
+    "project_worker_leases",
+}
 
 
 def _norm(path: str) -> str:
@@ -260,21 +283,190 @@ def test_connect_reinitializes_catalog_and_runtime_after_same_path_replacement(
     finally:
         replacement.close()
 
-    assert {
-        "projects",
-        "project_folders",
-        "project_meta",
-        "discovered_repos",
-        "project_contracts",
-        "project_runtime_state",
-        "project_conversations",
-        "project_surface_bindings",
-        "project_turns",
-        "project_run_controls",
-        "project_events",
-        "project_deliveries",
-        "project_approvals",
-        "project_artifacts",
-        "project_operations",
-        "project_worker_leases",
-    } <= tables
+    assert ALL_SCHEMA_TABLES <= tables
+
+
+def test_connect_retries_one_transient_journal_mode_lock(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+
+    real_apply_wal = hermes_state.apply_wal_with_fallback
+    attempts = []
+    sleeps = []
+
+    def locked_once(conn, *, db_label):
+        attempts.append(db_label)
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_apply_wal(conn, db_label=db_label)
+
+    monkeypatch.setattr(
+        hermes_state,
+        "apply_wal_with_fallback",
+        locked_once,
+    )
+    monkeypatch.setattr(pdb.time, "sleep", sleeps.append)
+
+    conn = pdb.connect(db_path=tmp_path / "projects.db")
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM project_runtime_state"
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+    assert attempts == ["projects.db", "projects.db"]
+    assert len(sleeps) == 1
+
+
+def test_connect_does_not_retry_non_busy_journal_mode_error(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+
+    attempts = []
+    sleeps = []
+
+    def fail_with_unrelated_error(conn, *, db_label):
+        attempts.append(db_label)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(
+        hermes_state,
+        "apply_wal_with_fallback",
+        fail_with_unrelated_error,
+    )
+    monkeypatch.setattr(pdb.time, "sleep", sleeps.append)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        pdb.connect(db_path=tmp_path / "projects.db")
+
+    assert attempts == ["projects.db"]
+    assert sleeps == []
+
+
+def test_connect_bounds_persistent_journal_mode_lock_retries(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+
+    attempts = []
+
+    def remain_locked(conn, *, db_label):
+        attempts.append(db_label)
+        raise sqlite3.OperationalError("database is busy")
+
+    monkeypatch.setattr(
+        hermes_state,
+        "apply_wal_with_fallback",
+        remain_locked,
+    )
+    monkeypatch.setattr(pdb.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is busy"):
+        pdb.connect(db_path=tmp_path / "projects.db")
+
+    assert 1 < len(attempts) < 20
+
+
+def test_connect_reprobe_keeps_existing_wal_without_retrying_or_downgrading(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+
+    db_path = tmp_path / "projects.db"
+    seed = sqlite3.connect(db_path)
+    try:
+        assert seed.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    finally:
+        seed.close()
+
+    attempts = []
+    sleeps = []
+
+    def collide_with_existing_wal(conn, *, db_label):
+        attempts.append(db_label)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        hermes_state,
+        "apply_wal_with_fallback",
+        collide_with_existing_wal,
+    )
+    monkeypatch.setattr(pdb.time, "sleep", sleeps.append)
+
+    conn = pdb.connect(db_path=db_path)
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        conn.close()
+
+    assert mode == "wal"
+    assert ALL_SCHEMA_TABLES <= tables
+    assert attempts == ["projects.db"]
+    assert sleeps == []
+
+
+def test_concurrent_first_opens_both_receive_complete_schema(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+
+    real_apply_wal = hermes_state.apply_wal_with_fallback
+
+    for run in range(12):
+        db_path = tmp_path / f"projects-{run}.db"
+        connect_barrier = threading.Barrier(2)
+        journal_barrier = threading.Barrier(2)
+        call_lock = threading.Lock()
+        journal_calls = 0
+
+        def synchronize_first_journal_attempt(conn, *, db_label):
+            nonlocal journal_calls
+            with call_lock:
+                journal_calls += 1
+                synchronize = journal_calls <= 2
+            if synchronize:
+                journal_barrier.wait(timeout=5)
+            return real_apply_wal(conn, db_label=db_label)
+
+        monkeypatch.setattr(
+            hermes_state,
+            "apply_wal_with_fallback",
+            synchronize_first_journal_attempt,
+        )
+
+        def open_and_read_schema():
+            connect_barrier.wait(timeout=5)
+            conn = pdb.connect(db_path=db_path)
+            try:
+                tables = {
+                    row["name"]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                return tables, mode
+            finally:
+                conn.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda _index: open_and_read_schema(),
+                    range(2),
+                )
+            )
+
+        for tables, mode in results:
+            assert ALL_SCHEMA_TABLES <= tables
+            assert mode in {"wal", "delete"}
+        assert len({mode for _tables, mode in results}) == 1

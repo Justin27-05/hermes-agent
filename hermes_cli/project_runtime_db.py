@@ -253,18 +253,29 @@ def execute_schema_statements(
     conn: sqlite3.Connection, schema_sql: str
 ) -> None:
     """Execute a SQL schema without committing a caller-owned transaction."""
-    statement_lines: list[str] = []
-    for line in schema_sql.splitlines(keepends=True):
-        statement_lines.append(line)
-        statement = "".join(statement_lines)
+    statement_chars: list[str] = []
+    for char in schema_sql:
+        statement_chars.append(char)
+        if char != ";":
+            continue
+        statement = "".join(statement_chars)
         if not sqlite3.complete_statement(statement):
             continue
         if statement.strip():
             conn.execute(statement)
-        statement_lines.clear()
+        statement_chars.clear()
 
-    if "".join(statement_lines).strip():
-        raise ValueError("incomplete schema SQL")
+    remainder = "".join(statement_chars)
+    if not remainder.strip():
+        return
+    try:
+        # Valid SQL need not end in a semicolon. SQLite also accepts
+        # whitespace/comment-only input as a no-op.
+        conn.execute(remainder)
+    except sqlite3.OperationalError as exc:
+        if "incomplete input" in str(exc).lower():
+            raise ValueError("incomplete schema SQL") from exc
+        raise
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:

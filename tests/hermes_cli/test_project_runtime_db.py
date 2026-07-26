@@ -251,6 +251,56 @@ def test_ensure_schema_is_idempotent(runtime_conn):
     assert second == first
 
 
+@pytest.mark.parametrize(
+    ("schema_sql", "expected_tables"),
+    [
+        (
+            "CREATE TABLE trailing_line(value TEXT);\n"
+            "-- trailing line comment",
+            {"trailing_line"},
+        ),
+        (
+            "CREATE TABLE trailing_block(value TEXT);\n"
+            "/* trailing block comment */",
+            {"trailing_block"},
+        ),
+        (
+            "CREATE TABLE same_line_one(value TEXT); "
+            "CREATE TABLE same_line_two(value TEXT);",
+            {"same_line_one", "same_line_two"},
+        ),
+    ],
+)
+def test_execute_schema_statements_accepts_valid_formatting(
+    schema_sql, expected_tables
+):
+    conn = sqlite3.connect(":memory:")
+    try:
+        prdb.execute_schema_statements(conn, schema_sql)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        conn.close()
+
+    assert expected_tables <= tables
+
+
+def test_execute_schema_statements_rejects_incomplete_sql():
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(ValueError, match="incomplete schema SQL"):
+            prdb.execute_schema_statements(
+                conn,
+                "CREATE TABLE genuinely_incomplete(",
+            )
+    finally:
+        conn.close()
+
+
 def test_every_runtime_table_has_project_fk_and_unique_identity(runtime_conn):
     for table in RUNTIME_TABLES:
         foreign_keys = runtime_conn.execute(

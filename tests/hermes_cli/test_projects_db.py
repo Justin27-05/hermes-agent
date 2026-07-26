@@ -221,3 +221,21 @@ def test_db_path_under_hermes_home():
     # Resolves under HERMES_HOME (set by the autouse isolation fixture).
     assert pdb.projects_db_path().name == "projects.db"
     assert os.path.basename(str(pdb.projects_db_path().parent))  # non-empty parent
+
+
+def test_connect_adds_runtime_schema_without_adopting_archived_project(conn):
+    project_id = pdb.create_project(conn, name="Legacy archived")
+    pdb.archive_project(conn, project_id)
+
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+
+    assert "project_runtime_state" in tables
+    assert conn.execute(
+        "SELECT 1 FROM project_runtime_state WHERE project_id = ?",
+        (project_id,),
+    ).fetchone() is None

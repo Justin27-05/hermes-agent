@@ -152,6 +152,17 @@ def _normalize_path(path: str) -> str:
 _INITIALIZED_PATHS: set[str] = set()
 
 
+def init_schema(conn: sqlite3.Connection) -> None:
+    """Initialize the catalog plus the additive ProjectRuntime schema."""
+    conn.executescript(SCHEMA_SQL)
+    _migrate_add_optional_columns(conn)
+
+    # Local import keeps the catalog and runtime persistence modules acyclic.
+    from hermes_cli.project_runtime_db import ensure_schema
+
+    ensure_schema(conn)
+
+
 def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     """Open (and initialize if needed) the per-profile projects DB.
 
@@ -170,8 +181,7 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
         apply_wal_with_fallback(conn, db_label="projects.db")
         conn.execute("PRAGMA foreign_keys=ON")
         if resolved not in _INITIALIZED_PATHS:
-            conn.executescript(SCHEMA_SQL)
-            _migrate_add_optional_columns(conn)
+            init_schema(conn)
             _INITIALIZED_PATHS.add(resolved)
     except Exception:
         conn.close()

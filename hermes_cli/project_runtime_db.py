@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS project_run_controls (
     control_state    TEXT NOT NULL,
     control_version  INTEGER NOT NULL,
     idempotency_key  TEXT,
+    command_fingerprint TEXT,
     attempt_id       TEXT,
     updated_at       INTEGER NOT NULL,
     UNIQUE (project_id, turn_id),
@@ -301,6 +302,14 @@ ON project_conversations(project_id)
 WHERE parent_conversation_id IS NULL;
 """
 
+TASK4_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_project_turns_claim_fifo
+ON project_turns(project_id, status, sequence);
+
+CREATE INDEX IF NOT EXISTS idx_project_run_controls_project_turn
+ON project_run_controls(project_id, turn_id);
+"""
+
 
 Lifecycle = Literal["active", "awaiting_acceptance", "completed"]
 ApprovalStatus = Literal["pending", "approved", "denied", "expired"]
@@ -314,6 +323,48 @@ class RuntimeState:
     version: int
     conversation_root_id: Optional[str]
     conversation_tip_id: Optional[str]
+    updated_at: int
+
+
+@dataclass(frozen=True)
+class RuntimeTurnRecord:
+    """One raw durable turn record; the service owns public JSON decoding."""
+
+    turn_id: str
+    project_id: str
+    sequence: int
+    idempotency_key: str
+    payload_json: str
+    origin_binding_id: str | None
+    status: str
+    attempt_id: str | None
+    lease_generation: int
+    fencing_token: int
+    created_at: int
+    updated_at: int
+
+
+@dataclass(frozen=True)
+class RuntimeControlRecord:
+    turn_id: str
+    project_id: str
+    control_state: str
+    control_version: int
+    idempotency_key: str | None
+    command_fingerprint: str | None
+    attempt_id: str | None
+    updated_at: int
+
+
+@dataclass(frozen=True)
+class WorkerLeaseRecord:
+    lease_id: str
+    project_id: str
+    turn_id: str
+    worker_id: str
+    lease_generation: int
+    fencing_token: int
+    expires_at: int
     updated_at: int
 
 
@@ -409,9 +460,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     execute_schema_statements(conn, RUNTIME_SCHEMA_SQL)
     _ensure_runtime_state_columns(conn)
     _ensure_approval_columns(conn)
+    _ensure_run_control_columns(conn)
     _validate_existing_lineage(conn)
     try:
         execute_schema_statements(conn, LINEAGE_INDEX_SQL)
+        execute_schema_statements(conn, TASK4_INDEX_SQL)
     except sqlite3.IntegrityError as exc:
         raise LineageMigrationError(
             "multiple conversation roots exist for one project"
@@ -545,6 +598,16 @@ def _ensure_approval_columns(conn: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_run_control_columns(conn: sqlite3.Connection) -> None:
+    """Add Task-4's immutable control-command fingerprint additively."""
+    add_column_if_missing(
+        conn,
+        "project_run_controls",
+        "command_fingerprint",
+        "command_fingerprint TEXT",
+    )
+
+
 @contextlib.contextmanager
 def write_transaction(
     conn: sqlite3.Connection,
@@ -583,6 +646,368 @@ def runtime_state_for_project(
 ) -> Optional[RuntimeState]:
     """Read one project's runtime state, if it has been explicitly adopted."""
     return _runtime_state_for_project(conn, project_id)
+
+
+def runtime_turn_from_row(row: sqlite3.Row) -> RuntimeTurnRecord:
+    """Map a turn row without interpreting its caller payload."""
+    return RuntimeTurnRecord(
+        turn_id=row["turn_id"],
+        project_id=row["project_id"],
+        sequence=row["sequence"],
+        idempotency_key=row["idempotency_key"],
+        payload_json=row["payload_json"],
+        origin_binding_id=row["origin_binding_id"],
+        status=row["status"],
+        attempt_id=row["attempt_id"],
+        lease_generation=row["lease_generation"],
+        fencing_token=row["fencing_token"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def runtime_control_from_row(row: sqlite3.Row) -> RuntimeControlRecord:
+    """Map the durable control lane for one exact project turn."""
+    return RuntimeControlRecord(
+        turn_id=row["turn_id"],
+        project_id=row["project_id"],
+        control_state=row["control_state"],
+        control_version=row["control_version"],
+        idempotency_key=row["idempotency_key"],
+        command_fingerprint=row["command_fingerprint"],
+        attempt_id=row["attempt_id"],
+        updated_at=row["updated_at"],
+    )
+
+
+def worker_lease_from_row(row: sqlite3.Row) -> WorkerLeaseRecord:
+    """Map a current worker identity; expiry interpretation remains Task 5."""
+    return WorkerLeaseRecord(
+        lease_id=row["lease_id"],
+        project_id=row["project_id"],
+        turn_id=row["turn_id"],
+        worker_id=row["worker_id"],
+        lease_generation=row["lease_generation"],
+        fencing_token=row["fencing_token"],
+        expires_at=row["expires_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def runtime_turn_for_project(
+    conn: sqlite3.Connection, *, project_id: str, turn_id: str
+) -> RuntimeTurnRecord | None:
+    row = conn.execute(
+        """
+        SELECT * FROM project_turns
+        WHERE project_id = ? AND turn_id = ?
+        """,
+        (project_id, turn_id),
+    ).fetchone()
+    return runtime_turn_from_row(row) if row is not None else None
+
+
+def runtime_control_for_turn(
+    conn: sqlite3.Connection, *, project_id: str, turn_id: str
+) -> RuntimeControlRecord | None:
+    row = conn.execute(
+        """
+        SELECT * FROM project_run_controls
+        WHERE project_id = ? AND turn_id = ?
+        """,
+        (project_id, turn_id),
+    ).fetchone()
+    return runtime_control_from_row(row) if row is not None else None
+
+
+def queued_turns_for_project(
+    conn: sqlite3.Connection, *, project_id: str
+) -> tuple[RuntimeTurnRecord, ...]:
+    rows = conn.execute(
+        """
+        SELECT * FROM project_turns
+        WHERE project_id = ? AND status = 'queued'
+        ORDER BY sequence, turn_id
+        """,
+        (project_id,),
+    ).fetchall()
+    return tuple(runtime_turn_from_row(row) for row in rows)
+
+
+def current_worker_lease_for_turn(
+    conn: sqlite3.Connection, *, project_id: str, turn_id: str
+) -> WorkerLeaseRecord | None:
+    row = conn.execute(
+        """
+        SELECT * FROM project_worker_leases
+        WHERE project_id = ? AND turn_id = ?
+        """,
+        (project_id, turn_id),
+    ).fetchone()
+    return worker_lease_from_row(row) if row is not None else None
+
+
+def _allocate_project_sequence(
+    conn: sqlite3.Connection, *, table: Literal["turns", "events"], project_id: str
+) -> int:
+    """Allocate one per-project sequence while the caller owns a write transaction."""
+    table_name = {
+        "turns": "project_turns",
+        "events": "project_events",
+    }.get(table)
+    if table_name is None:
+        raise ValueError("unsupported runtime sequence table")
+    return conn.execute(
+        f"SELECT COALESCE(MAX(sequence), 0) + 1 FROM {table_name} WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()[0]
+
+
+def _append_runtime_event(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    project_id: str,
+    kind: str,
+    turn_id: str | None,
+    payload_json: str,
+    created_at: int,
+) -> int:
+    """Append one canonical event under the caller's existing write boundary."""
+    sequence = _allocate_project_sequence(conn, table="events", project_id=project_id)
+    conn.execute(
+        """
+        INSERT INTO project_events (
+            event_id, project_id, sequence, kind, turn_id, payload_json,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, project_id, sequence, kind, turn_id, payload_json, created_at),
+    )
+    return sequence
+
+
+def _advance_runtime_version(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    expected_version: int,
+    updated_at: int,
+) -> RuntimeState | None:
+    """CAS the project-wide token without starting or committing a transaction."""
+    cursor = conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET version = version + 1, updated_at = ?
+        WHERE project_id = ? AND version = ?
+        """,
+        (updated_at, project_id, expected_version),
+    )
+    if cursor.rowcount != 1:
+        return None
+    return _runtime_state_for_project(conn, project_id)
+
+
+def _insert_queued_runtime_turn(
+    conn: sqlite3.Connection,
+    *,
+    turn_id: str,
+    project_id: str,
+    sequence: int,
+    idempotency_key: str,
+    payload_json: str,
+    origin_binding_id: str,
+    now: int,
+) -> RuntimeTurnRecord:
+    """Create the inseparable initial queued turn and its control row."""
+    conn.execute(
+        """
+        INSERT INTO project_turns (
+            turn_id, project_id, sequence, idempotency_key, payload_json,
+            origin_binding_id, status, attempt_id, lease_generation,
+            fencing_token, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', NULL, 0, 0, ?, ?)
+        """,
+        (turn_id, project_id, sequence, idempotency_key, payload_json, origin_binding_id, now, now),
+    )
+    conn.execute(
+        """
+        INSERT INTO project_run_controls (
+            turn_id, project_id, control_state, control_version,
+            idempotency_key, command_fingerprint, attempt_id, updated_at
+        ) VALUES (?, ?, 'running', 0, NULL, NULL, NULL, ?)
+        """,
+        (turn_id, project_id, now),
+    )
+    result = runtime_turn_for_project(conn, project_id=project_id, turn_id=turn_id)
+    assert result is not None
+    return result
+
+
+def _claim_oldest_queued_runtime_turn(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    worker_id: str,
+    attempt_id: str,
+    now: int,
+    lease_seconds: int,
+) -> RuntimeTurnRecord | None:
+    """Claim only the exact FIFO head; Task 5 owns expiry and takeover."""
+    if conn.execute(
+        """
+        SELECT 1 FROM project_turns
+        WHERE project_id = ?
+          AND status IN ('claimed', 'awaiting_approval', 'stop_requested', 'stopped', 'reconciling')
+        LIMIT 1
+        """,
+        (project_id,),
+    ).fetchone() is not None:
+        return None
+    row = conn.execute(
+        """
+        SELECT * FROM project_turns
+        WHERE project_id = ? AND status = 'queued'
+        ORDER BY sequence, turn_id LIMIT 1
+        """,
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    turn = runtime_turn_from_row(row)
+    control = runtime_control_for_turn(conn, project_id=project_id, turn_id=turn.turn_id)
+    if control is None or control.control_state not in {"running", "resume_requested"}:
+        raise RuntimeError("queued runtime turn has an invalid control row")
+    generation = turn.lease_generation + 1
+    fence = turn.fencing_token + 1
+    if conn.execute(
+        """
+        UPDATE project_turns
+        SET status = 'claimed', attempt_id = ?, lease_generation = ?,
+            fencing_token = ?, updated_at = ?
+        WHERE project_id = ? AND turn_id = ? AND status = 'queued'
+          AND lease_generation = ? AND fencing_token = ?
+        """,
+        (attempt_id, generation, fence, now, project_id, turn.turn_id, turn.lease_generation, turn.fencing_token),
+    ).rowcount != 1:
+        return None
+    if conn.execute(
+        """
+        UPDATE project_run_controls
+        SET control_state = 'running', control_version = control_version + 1,
+            attempt_id = ?, updated_at = ?
+        WHERE project_id = ? AND turn_id = ? AND control_version = ?
+        """,
+        (attempt_id, now, project_id, turn.turn_id, control.control_version),
+    ).rowcount != 1:
+        raise RuntimeError("runtime control changed during guarded turn claim")
+    conn.execute(
+        """
+        INSERT INTO project_worker_leases (
+            lease_id, project_id, turn_id, worker_id, lease_generation,
+            fencing_token, expires_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (attempt_id, project_id, turn.turn_id, worker_id, generation, fence, now + lease_seconds, now),
+    )
+    result = runtime_turn_for_project(conn, project_id=project_id, turn_id=turn.turn_id)
+    assert result is not None
+    return result
+
+
+_TASK4_TRANSITIONS = {
+    ("queued", "cancelled", "terminal"),
+    ("claimed", "stop_requested", "stop_requested"),
+    ("stop_requested", "stopped", "stopped"),
+    ("stopped", "queued", "resume_requested"),
+}
+
+
+def _transition_runtime_turn_and_control(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    turn_id: str,
+    expected_turn_status: str,
+    next_turn_status: str,
+    expected_control_version: int,
+    next_control_state: str,
+    now: int,
+    idempotency_key: str | None = None,
+    command_fingerprint: str | None = None,
+) -> RuntimeControlRecord | None:
+    """Atomically move a legal turn/control pair under caller-owned SQL scope."""
+    if (expected_turn_status, next_turn_status, next_control_state) not in _TASK4_TRANSITIONS:
+        raise ValueError("unsupported Task-4 turn/control transition")
+    if conn.execute(
+        """
+        UPDATE project_turns SET status = ?, updated_at = ?
+        WHERE project_id = ? AND turn_id = ? AND status = ?
+        """,
+        (next_turn_status, now, project_id, turn_id, expected_turn_status),
+    ).rowcount != 1:
+        return None
+    if conn.execute(
+        """
+        UPDATE project_run_controls
+        SET control_state = ?, control_version = control_version + 1,
+            idempotency_key = COALESCE(?, idempotency_key),
+            command_fingerprint = COALESCE(?, command_fingerprint), updated_at = ?
+        WHERE project_id = ? AND turn_id = ? AND control_version = ?
+        """,
+        (next_control_state, idempotency_key, command_fingerprint, now, project_id, turn_id, expected_control_version),
+    ).rowcount != 1:
+        raise RuntimeError("runtime control changed after durable turn transition")
+    return runtime_control_for_turn(conn, project_id=project_id, turn_id=turn_id)
+
+
+def _delete_current_worker_lease(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    turn_id: str,
+    attempt_id: str,
+    worker_id: str,
+    lease_generation: int,
+    fencing_token: int,
+) -> bool:
+    """Close exactly the current worker identity; never delete a stale lease."""
+    return conn.execute(
+        """
+        DELETE FROM project_worker_leases
+        WHERE project_id = ? AND turn_id = ? AND lease_id = ? AND worker_id = ?
+          AND lease_generation = ? AND fencing_token = ?
+        """,
+        (project_id, turn_id, attempt_id, worker_id, lease_generation, fencing_token),
+    ).rowcount == 1
+
+
+def _link_approval_to_claimed_turn(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: str,
+    project_id: str,
+    turn_id: str,
+    now: int,
+) -> bool:
+    """Bind one newly-created approval to one claimed FIFO head atomically."""
+    if conn.execute(
+        """
+        UPDATE project_approvals SET turn_id = ?
+        WHERE approval_id = ? AND project_id = ? AND turn_id IS NULL
+        """,
+        (turn_id, approval_id, project_id),
+    ).rowcount != 1:
+        return False
+    if conn.execute(
+        """
+        UPDATE project_turns SET status = 'awaiting_approval', updated_at = ?
+        WHERE project_id = ? AND turn_id = ? AND status = 'claimed'
+        """,
+        (now, project_id, turn_id),
+    ).rowcount != 1:
+        raise RuntimeError("claimed turn changed while linking approval")
+    return True
 
 
 def _conversation_from_row(row: sqlite3.Row) -> ProjectConversation:

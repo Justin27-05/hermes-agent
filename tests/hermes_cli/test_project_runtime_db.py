@@ -852,6 +852,41 @@ def test_catalog_init_preserves_caller_transaction_rollback(runtime_conn):
     ).fetchone() is None
 
 
+def test_task4_store_refuses_an_illegal_turn_control_edge(runtime_conn):
+    _insert_project(runtime_conn, "p_illegal_edge")
+    _insert_turn(
+        runtime_conn,
+        turn_id="turn_illegal_edge",
+        project_id="p_illegal_edge",
+        sequence=1,
+        idempotency_key="edge-key",
+    )
+    runtime_conn.execute(
+        """INSERT INTO project_run_controls (
+            turn_id, project_id, control_state, control_version, updated_at
+        ) VALUES ('turn_illegal_edge', 'p_illegal_edge', 'running', 0, 1)"""
+    )
+    runtime_conn.commit()
+
+    with pytest.raises(ValueError):
+        with prdb.write_transaction(runtime_conn):
+            prdb._transition_runtime_turn_and_control(
+                runtime_conn,
+                project_id="p_illegal_edge",
+                turn_id="turn_illegal_edge",
+                expected_turn_status="queued",
+                next_turn_status="claimed",
+                expected_control_version=0,
+                next_control_state="running",
+                now=2,
+            )
+
+    row = runtime_conn.execute(
+        "SELECT status FROM project_turns WHERE turn_id = 'turn_illegal_edge'"
+    ).fetchone()
+    assert row[0] == "queued"
+
+
 def test_event_sequence_is_unique_within_each_project(runtime_conn):
     _insert_project(runtime_conn, "p_event_one")
     _insert_project(runtime_conn, "p_event_two")

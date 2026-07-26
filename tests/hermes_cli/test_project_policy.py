@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import MappingProxyType
 
 import pytest
 
@@ -23,6 +24,14 @@ PROJECT = ProjectPolicyView(
     lifecycle="active",
     roots=(ROOT,),
     approved_plan_ref="plans/project-1/v1",
+    delivery_bindings=(
+        ProjectBindingView(
+            binding_id="desktop-1",
+            surface="desktop",
+            owner_actor_id="owner-1",
+            project_id="project-1",
+        ),
+    ),
 )
 OWNER = ActorContext(
     actor_id="owner-1",
@@ -146,7 +155,7 @@ def test_critical_commands_require_their_stable_approval_class(
         ),
         (
             _command("status"),
-            ProjectPolicyView("project-1", "active", (ROOT,), None),
+            replace(PROJECT, approved_plan_ref=None),
             _contract("status"),
             OWNER,
             "policy.contract.unapproved",
@@ -220,6 +229,7 @@ def test_owner_bound_canonical_event_delivery_is_internal(surface):
                 binding_id=f"{surface}-1",
                 surface=surface,
                 owner_actor_id="owner-1",
+                project_id="project-1",
             ),
         ),
         canonical_event_ids=frozenset({"event-1"}),
@@ -269,3 +279,144 @@ def test_delivery_with_a_supplied_destination_is_denied():
 
     assert result.decision is Decision.DENY
     assert result.rule_id == "policy.command.ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("name", "action_class"),
+    [
+        ("publish", "status"),
+        ("status", "publish"),
+        ("event.deliver", "status"),
+        ("publish", "internal_delivery"),
+    ],
+)
+def test_canonical_action_name_cannot_disagree_with_action_class(
+    name, action_class
+):
+    command = _command(
+        action_class,
+        name=name,
+        targets=() if action_class in {"status", "internal_delivery"} else (f"{ROOT}/x",),
+    )
+
+    result = decide(command, PROJECT, _contract(action_class), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.command.ambiguous"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        r"C:\work\project\outside.txt",
+        r"C:/work/project/sub\..\..\outside.txt",
+        "work/project/file.py",
+        "C:/work/project/./file.py",
+        "C:/work/project/src/../file.py",
+        "C:work/project/file.py",
+        "C://work/project/file.py",
+        "//server/share/project/file.py",
+    ],
+)
+def test_noncanonical_paths_are_denied_before_scope_authorization(target):
+    command = _command("local_code_edit", targets=(target,))
+
+    result = decide(command, PROJECT, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.command.ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("root", "target"),
+    [
+        ("/", "/workspace/project/file.py"),
+        ("C:/", "c:/WORK/project/file.py"),
+        ("C:/Work/Project", "c:/work/project/SRC/file.py"),
+    ],
+)
+def test_component_containment_handles_drive_and_filesystem_roots(root, target):
+    project = replace(PROJECT, roots=(root,))
+    command = _command("local_code_edit", targets=(target,))
+
+    result = decide(command, project, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.ALLOW
+
+
+def test_component_containment_rejects_a_sibling_with_the_same_prefix():
+    command = _command(
+        "local_code_edit", targets=("C:/work/project-sibling/file.py",)
+    )
+
+    result = decide(command, PROJECT, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.scope.outside_root"
+
+
+def test_project_command_copies_and_freezes_authorization_metadata():
+    metadata = {"phase": "implementation"}
+    command = _command("status", metadata=metadata)
+
+    metadata["phase"] = "production"
+
+    assert command.metadata == {"phase": "implementation"}
+    assert isinstance(command.metadata, MappingProxyType)
+    with pytest.raises(TypeError):
+        command.metadata["phase"] = "production"
+
+
+@pytest.mark.parametrize("value", [["implementation"], {"nested": "value"}])
+def test_project_command_rejects_non_scalar_metadata(value):
+    with pytest.raises(TypeError):
+        _command("status", metadata={"phase": value})
+
+
+@pytest.mark.parametrize(
+    "actor",
+    [
+        ActorContext("attacker", "desktop", "desktop-1", True),
+        ActorContext("owner-1", "discord", "desktop-1", True),
+        ActorContext("owner-1", "desktop", "forged-binding", True),
+        ActorContext("owner-1", "system", "desktop-1", True),
+    ],
+)
+def test_routine_commands_require_exact_registered_project_owner_binding(actor):
+    registered_project = replace(
+        PROJECT,
+        delivery_bindings=(
+            ProjectBindingView(
+                "desktop-1", "desktop", "owner-1", "project-1"
+            ),
+        ),
+    )
+
+    result = decide(_command("status"), registered_project, _contract("status"), actor)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.actor.unknown"
+
+
+def test_bool_revision_is_not_an_integer_revision():
+    result = decide(
+        _command("status", revision=True),
+        PROJECT,
+        replace(_contract("status"), revision=True),
+        OWNER,
+    )
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.command.ambiguous"
+
+
+def test_targetless_critical_action_is_denied_before_approval():
+    result = decide(
+        _command("publish", targets=()),
+        PROJECT,
+        _contract("publish"),
+        OWNER,
+    )
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.scope.outside_root"

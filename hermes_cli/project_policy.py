@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from enum import Enum
+from string import ascii_letters
 from types import MappingProxyType
 from typing import Literal, Mapping
 
@@ -23,6 +23,9 @@ class PolicyDecision:
     approval_class: str | None = None
 
 
+_METADATA_SCALAR_TYPES = (str, int, bool, type(None))
+
+
 @dataclass(frozen=True)
 class ProjectCommand:
     name: str
@@ -34,14 +37,25 @@ class ProjectCommand:
     batch_items: tuple[str, ...]
     metadata: Mapping[str, object]
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("metadata must be a mapping")
+        copied: dict[str, object] = {}
+        for key, value in self.metadata.items():
+            if type(key) is not str or type(value) not in _METADATA_SCALAR_TYPES:
+                raise TypeError("metadata must contain string keys and scalar values")
+            copied[key] = value
+        object.__setattr__(self, "metadata", MappingProxyType(copied))
+
 
 @dataclass(frozen=True)
 class ProjectBindingView:
-    """A pre-registered owner-bound delivery surface, supplied by runtime state."""
+    """A durably registered owner binding scoped to one canonical project."""
 
     binding_id: str
     surface: Literal["desktop", "discord"]
     owner_actor_id: str
+    project_id: str
 
 
 @dataclass(frozen=True)
@@ -71,13 +85,91 @@ class ActorContext:
 
 
 @dataclass(frozen=True)
+class CanonicalPath:
+    """One validated forward-slash absolute path and its comparison identity."""
+
+    value: str
+    flavor: Literal["posix", "windows"]
+    anchor: str
+    components: tuple[str, ...]
+
+
+def parse_canonical_path(value: object) -> CanonicalPath | None:
+    """Parse a forward-slash POSIX or drive path without touching the filesystem."""
+    if type(value) is not str or not value or "\\" in value or "\x00" in value:
+        return None
+    if value.startswith("//"):  # UNC is deliberately unsupported in Task 2.
+        return None
+
+    if value.startswith("/"):
+        flavor: Literal["posix", "windows"] = "posix"
+        anchor = "/"
+        raw_components = value[1:]
+    elif (
+        len(value) >= 3
+        and value[0] in ascii_letters
+        and value[1:3] == ":/"
+    ):
+        flavor = "windows"
+        anchor = value[:2].casefold()
+        raw_components = value[3:]
+    else:
+        return None
+
+    if raw_components:
+        components = tuple(raw_components.split("/"))
+        if any(
+            not component or component in {".", ".."} or ":" in component
+            for component in components
+        ):
+            return None
+    else:
+        components = ()
+
+    if flavor == "windows":
+        components = tuple(component.casefold() for component in components)
+        canonical = f"{anchor}/" + "/".join(components)
+    else:
+        canonical = "/" + "/".join(components)
+    return CanonicalPath(canonical, flavor, anchor, components)
+
+
+def canonicalize_targets(targets: object) -> tuple[str, ...] | None:
+    """Return one semantic canonical target tuple, or ``None`` when malformed."""
+    if not isinstance(targets, tuple):
+        return None
+    parsed = tuple(parse_canonical_path(target) for target in targets)
+    if any(path is None for path in parsed):
+        return None
+    canonical = tuple(path.value for path in parsed if path is not None)
+    if len(set(canonical)) != len(canonical):
+        return None
+    return canonical
+
+
+def path_is_within(target: str, root: str) -> bool:
+    target_path = parse_canonical_path(target)
+    root_path = parse_canonical_path(root)
+    if target_path is None or root_path is None:
+        return False
+    if (
+        target_path.flavor != root_path.flavor
+        or target_path.anchor != root_path.anchor
+        or len(target_path.components) < len(root_path.components)
+    ):
+        return False
+    return (
+        target_path.components[: len(root_path.components)]
+        == root_path.components
+    )
+
+
+@dataclass(frozen=True)
 class _CriticalRule:
     rule_id: str
     approval_class: str
 
 
-# This is the only critical-action classification table.  Aliases resolve to
-# the same durable approval class instead of being inferred from command text.
 CRITICAL_ACTION_RULES: Mapping[str, _CriticalRule] = MappingProxyType(
     {
         "credentials": _CriticalRule(
@@ -106,7 +198,9 @@ CRITICAL_ACTION_RULES: Mapping[str, _CriticalRule] = MappingProxyType(
         "startup": _CriticalRule(
             "policy.approval.admin_service", "admin_service"
         ),
-        "destructive": _CriticalRule("policy.approval.destructive", "destructive"),
+        "destructive": _CriticalRule(
+            "policy.approval.destructive", "destructive"
+        ),
         "live_canary": _CriticalRule(
             "policy.approval.live_canary", "live_canary"
         ),
@@ -116,10 +210,22 @@ CRITICAL_ACTION_RULES: Mapping[str, _CriticalRule] = MappingProxyType(
     }
 )
 
+
+def approval_class_for_action(canonical_action: object) -> str | None:
+    """Return the closed critical approval class for one canonical action."""
+    if type(canonical_action) is not str:
+        return None
+    rule = CRITICAL_ACTION_RULES.get(canonical_action)
+    return rule.approval_class if rule is not None else None
+
 _ROUTINE_ACTIONS = frozenset({"status", "local_code_edit", "local_test"})
-_DELIVERY_ACTION = "internal_delivery"
-_CANONICAL_PATH = re.compile(
-    r"^(?:[A-Za-z]:/(?:[^/]+(?:/[^/]+)*)?|/(?:[^/]+(?:/[^/]+)*)?)$"
+_DELIVERY_CLASS = "internal_delivery"
+_CANONICAL_ACTION_CLASSES: Mapping[str, str] = MappingProxyType(
+    {
+        **{action: action for action in _ROUTINE_ACTIONS},
+        **{action: action for action in CRITICAL_ACTION_RULES},
+        "event.deliver": _DELIVERY_CLASS,
+    }
 )
 
 
@@ -128,62 +234,55 @@ def _deny(rule_id: str, reason: str) -> PolicyDecision:
 
 
 def _is_text(value: object) -> bool:
-    return isinstance(value, str) and bool(value)
-
-
-def _is_canonical_path(value: object) -> bool:
-    if not _is_text(value) or not _CANONICAL_PATH.fullmatch(value):
-        return False
-    path_parts = value[3:] if len(value) > 1 and value[1:3] == ":/" else value[1:]
-    return all(part not in {".", ".."} for part in path_parts.split("/"))
-
-
-def _targets_are_canonical(targets: object) -> bool:
-    return (
-        isinstance(targets, tuple)
-        and len(set(targets)) == len(targets)
-        and all(_is_canonical_path(target) for target in targets)
-    )
+    return type(value) is str and bool(value)
 
 
 def _items_are_canonical(items: object) -> bool:
     return (
         isinstance(items, tuple)
-        and len(items) > 0
+        and bool(items)
         and len(set(items)) == len(items)
         and all(_is_text(item) for item in items)
     )
 
 
-def _inside_project_roots(targets: tuple[str, ...], roots: tuple[str, ...]) -> bool:
-    for target in targets:
-        if not any(target == root or target.startswith(f"{root}/") for root in roots):
-            return False
-    return True
-
-
-def _valid_actor(actor: object) -> bool:
-    return (
+def _valid_actor_for_project(
+    actor: object, project: object
+) -> bool:
+    if not (
         isinstance(actor, ActorContext)
+        and isinstance(project, ProjectPolicyView)
         and _is_text(actor.actor_id)
-        and actor.surface in {"desktop", "discord", "system"}
+        and actor.surface in {"desktop", "discord"}
         and _is_text(actor.binding_id)
         and actor.is_owner is True
+        and isinstance(project.delivery_bindings, tuple)
+    ):
+        return False
+    matches = tuple(
+        binding
+        for binding in project.delivery_bindings
+        if isinstance(binding, ProjectBindingView)
+        and binding.project_id == project.project_id
+        and binding.binding_id == actor.binding_id
+        and binding.surface == actor.surface
+        and binding.owner_actor_id == actor.actor_id
     )
+    return len(matches) == 1
 
 
 def _valid_command_shape(command: object) -> bool:
     if not isinstance(command, ProjectCommand):
         return False
-    if not all(
-        (
-            _is_text(command.name),
-            _is_text(command.project_id),
-            isinstance(command.revision, int) and command.revision > 0,
-            _is_text(command.action_class),
-            _targets_are_canonical(command.targets),
-            isinstance(command.metadata, Mapping),
-        )
+    canonical_targets = canonicalize_targets(command.targets)
+    if not (
+        _is_text(command.name)
+        and _is_text(command.project_id)
+        and type(command.revision) is int
+        and command.revision > 0
+        and _is_text(command.action_class)
+        and canonical_targets is not None
+        and _CANONICAL_ACTION_CLASSES.get(command.name) == command.action_class
     ):
         return False
     if command.batch_id is None:
@@ -202,18 +301,21 @@ def _valid_scope(
         return "policy.project.mismatch"
     if command.project_id != project.project_id:
         return "policy.project.mismatch"
+    canonical_roots = canonicalize_targets(project.roots)
     if not (
         _is_text(project.project_id)
         and project.lifecycle in {"active", "awaiting_acceptance", "completed"}
-        and isinstance(project.roots, tuple)
-        and len(project.roots) > 0
-        and len(set(project.roots)) == len(project.roots)
-        and all(_is_canonical_path(root) for root in project.roots)
+        and canonical_roots is not None
+        and bool(canonical_roots)
         and _is_text(project.approved_plan_ref)
         and _is_text(contract.approved_plan_ref)
         and project.approved_plan_ref == contract.approved_plan_ref
-        and isinstance(contract.revision, int)
+        and type(contract.revision) is int
         and contract.revision == command.revision
+        and type(contract.allowed_action_classes) is frozenset
+        and all(_is_text(item) for item in contract.allowed_action_classes)
+        and type(contract.allowed_phases) is frozenset
+        and all(_is_text(item) for item in contract.allowed_phases)
         and command.action_class in contract.allowed_action_classes
     ):
         return "policy.contract.unapproved"
@@ -236,28 +338,14 @@ def _delivery_is_valid(
     contract: ContractPolicyView,
 ) -> bool:
     facts = command.metadata
-    if not (
-        isinstance(project.delivery_bindings, tuple)
-        and isinstance(project.canonical_event_ids, frozenset)
-        and all(
-            isinstance(binding, ProjectBindingView)
-            and _is_text(binding.binding_id)
-            and binding.surface in {"desktop", "discord"}
-            and _is_text(binding.owner_actor_id)
-            for binding in project.delivery_bindings
-        )
-    ):
-        return False
-    matching_bindings = tuple(
-        binding
-        for binding in project.delivery_bindings
-        if binding.binding_id == actor.binding_id
-    )
     return (
         command.name == "event.deliver"
+        and command.action_class == _DELIVERY_CLASS
         and command.targets == ()
         and command.batch_id is None
         and command.batch_items == ()
+        and type(project.canonical_event_ids) is frozenset
+        and all(_is_text(event_id) for event_id in project.canonical_event_ids)
         and set(facts)
         == {
             "phase",
@@ -268,16 +356,12 @@ def _delivery_is_valid(
             "binding_owner_actor_id",
         }
         and _is_text(facts["event_id"])
+        and facts["event_id"] in project.canonical_event_ids
         and facts["binding_id"] == actor.binding_id
         and facts["binding_project_id"] == project.project_id
         and facts["binding_surface"] == actor.surface
-        and facts["binding_surface"] in {"desktop", "discord"}
         and facts["binding_owner_actor_id"] == actor.actor_id
         and facts["phase"] in contract.allowed_phases
-        and len(matching_bindings) == 1
-        and matching_bindings[0].surface == actor.surface
-        and matching_bindings[0].owner_actor_id == actor.actor_id
-        and facts["event_id"] in project.canonical_event_ids
     )
 
 
@@ -287,9 +371,9 @@ def decide(
     contract: ContractPolicyView,
     actor: ActorContext,
 ) -> PolicyDecision:
-    """Return a deterministic authorization decision without any external I/O."""
-    if not _valid_actor(actor):
-        return _deny("policy.actor.unknown", "actor is not a registered owner")
+    """Return a deterministic authorization decision without external I/O."""
+    if not _valid_actor_for_project(actor, project):
+        return _deny("policy.actor.unknown", "actor binding is not a project owner")
     if not _valid_command_shape(command):
         return _deny("policy.command.ambiguous", "command facts are malformed")
     scope_error = _valid_scope(command, project, contract)
@@ -297,19 +381,33 @@ def decide(
         return _deny(scope_error, "project contract does not match this command")
     assert isinstance(project, ProjectPolicyView)
     assert isinstance(contract, ContractPolicyView)
-    if not _inside_project_roots(command.targets, project.roots):
+    if not all(
+        any(path_is_within(target, root) for root in project.roots)
+        for target in command.targets
+    ):
         return _deny("policy.scope.outside_root", "target is outside registered roots")
 
-    critical_rule = CRITICAL_ACTION_RULES.get(command.action_class)
-    if command.action_class == _DELIVERY_ACTION:
+    if command.action_class == _DELIVERY_CLASS:
         if not _delivery_is_valid(command, project, actor, contract):
-            return _deny("policy.command.ambiguous", "delivery is not a canonical projection")
+            return _deny(
+                "policy.command.ambiguous",
+                "delivery is not a canonical event projection",
+            )
     else:
         if set(command.metadata) != {"phase"}:
             return _deny("policy.command.ambiguous", "command facts are ambiguous")
         if not _phase_is_valid(command, contract):
             return _deny("policy.phase.invalid", "command phase is not approved")
 
+    if command.action_class == "status" and command.targets:
+        return _deny("policy.command.ambiguous", "status does not accept targets")
+    if command.action_class not in {"status", _DELIVERY_CLASS} and not command.targets:
+        return _deny(
+            "policy.scope.outside_root",
+            "non-status work requires an exact in-root target",
+        )
+
+    critical_rule = CRITICAL_ACTION_RULES.get(command.action_class)
     if critical_rule is not None:
         return PolicyDecision(
             Decision.REQUIRE_APPROVAL,
@@ -317,7 +415,7 @@ def decide(
             "critical action requires owner approval",
             critical_rule.approval_class,
         )
-    if command.action_class == _DELIVERY_ACTION:
+    if command.action_class == _DELIVERY_CLASS:
         return PolicyDecision(
             Decision.ALLOW,
             "policy.delivery.owner_bound_internal",
@@ -325,10 +423,6 @@ def decide(
         )
     if command.action_class not in _ROUTINE_ACTIONS:
         return _deny("policy.command.ambiguous", "action class is not approved")
-    if command.action_class == "status" and command.targets:
-        return _deny("policy.command.ambiguous", "status does not accept targets")
-    if command.action_class != "status" and not command.targets:
-        return _deny("policy.scope.outside_root", "local work requires an in-root target")
     return PolicyDecision(
         Decision.ALLOW,
         "policy.allow.routine_in_plan",

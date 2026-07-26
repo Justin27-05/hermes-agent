@@ -190,6 +190,16 @@ CREATE TABLE IF NOT EXISTS project_approvals (
         OR (
             status = 'expired'
             AND consumed_at IS NULL
+            AND (
+                (
+                    resolved_at IS NULL
+                    AND resolved_by_actor_id IS NULL
+                )
+                OR (
+                    resolved_at IS NOT NULL
+                    AND resolved_by_actor_id IS NOT NULL
+                )
+            )
         )
     ),
     UNIQUE (project_id, approval_id),

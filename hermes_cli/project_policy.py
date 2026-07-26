@@ -62,6 +62,7 @@ class ProjectBindingView:
 class ProjectPolicyView:
     project_id: str
     lifecycle: str
+    current_phase: str
     roots: tuple[str, ...]
     approved_plan_ref: str | None
     delivery_bindings: tuple[ProjectBindingView, ...] = ()
@@ -111,7 +112,7 @@ def parse_canonical_path(value: object) -> CanonicalPath | None:
         and value[1:3] == ":/"
     ):
         flavor = "windows"
-        anchor = value[:2].casefold()
+        anchor = value[:2].lower()
         raw_components = value[3:]
     else:
         return None
@@ -127,7 +128,6 @@ def parse_canonical_path(value: object) -> CanonicalPath | None:
         components = ()
 
     if flavor == "windows":
-        components = tuple(component.casefold() for component in components)
         canonical = f"{anchor}/" + "/".join(components)
     else:
         canonical = "/" + "/".join(components)
@@ -241,8 +241,8 @@ def _items_are_canonical(items: object) -> bool:
     return (
         isinstance(items, tuple)
         and bool(items)
-        and len(set(items)) == len(items)
         and all(_is_text(item) for item in items)
+        and len(set(items)) == len(items)
     )
 
 
@@ -304,7 +304,6 @@ def _valid_scope(
     canonical_roots = canonicalize_targets(project.roots)
     if not (
         _is_text(project.project_id)
-        and project.lifecycle in {"active", "awaiting_acceptance", "completed"}
         and canonical_roots is not None
         and bool(canonical_roots)
         and _is_text(project.approved_plan_ref)
@@ -322,20 +321,39 @@ def _valid_scope(
     return None
 
 
-def _phase_is_valid(command: ProjectCommand, contract: ContractPolicyView) -> bool:
+def _phase_is_valid(
+    command: ProjectCommand,
+    project: ProjectPolicyView,
+    contract: ContractPolicyView,
+) -> bool:
     phase = command.metadata.get("phase")
     return (
-        set(command.metadata) == {"phase"}
-        and _is_text(phase)
-        and phase in contract.allowed_phases
+        _is_text(project.current_phase)
+        and project.current_phase in contract.allowed_phases
+        and phase == project.current_phase
     )
+
+
+def _lifecycle_allows_action(
+    project: ProjectPolicyView, action_class: str
+) -> bool:
+    if project.lifecycle not in {
+        "active",
+        "awaiting_acceptance",
+        "completed",
+    }:
+        return False
+    if action_class in {"status", _DELIVERY_CLASS}:
+        return True
+    if action_class == "final_acceptance":
+        return project.lifecycle == "awaiting_acceptance"
+    return project.lifecycle == "active"
 
 
 def _delivery_is_valid(
     command: ProjectCommand,
     project: ProjectPolicyView,
     actor: ActorContext,
-    contract: ContractPolicyView,
 ) -> bool:
     facts = command.metadata
     return (
@@ -361,7 +379,6 @@ def _delivery_is_valid(
         and facts["binding_project_id"] == project.project_id
         and facts["binding_surface"] == actor.surface
         and facts["binding_owner_actor_id"] == actor.actor_id
-        and facts["phase"] in contract.allowed_phases
     )
 
 
@@ -388,7 +405,7 @@ def decide(
         return _deny("policy.scope.outside_root", "target is outside registered roots")
 
     if command.action_class == _DELIVERY_CLASS:
-        if not _delivery_is_valid(command, project, actor, contract):
+        if not _delivery_is_valid(command, project, actor):
             return _deny(
                 "policy.command.ambiguous",
                 "delivery is not a canonical event projection",
@@ -396,8 +413,13 @@ def decide(
     else:
         if set(command.metadata) != {"phase"}:
             return _deny("policy.command.ambiguous", "command facts are ambiguous")
-        if not _phase_is_valid(command, contract):
-            return _deny("policy.phase.invalid", "command phase is not approved")
+    if not _phase_is_valid(command, project, contract):
+        return _deny("policy.phase.invalid", "command phase is not current")
+    if not _lifecycle_allows_action(project, command.action_class):
+        return _deny(
+            "policy.phase.invalid",
+            "action is invalid for the current project lifecycle",
+        )
 
     if command.action_class == "status" and command.targets:
         return _deny("policy.command.ambiguous", "status does not accept targets")

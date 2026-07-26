@@ -22,6 +22,7 @@ ROOT = "C:/work/project"
 PROJECT = ProjectPolicyView(
     project_id="project-1",
     lifecycle="active",
+    current_phase="implementation",
     roots=(ROOT,),
     approved_plan_ref="plans/project-1/v1",
     delivery_bindings=(
@@ -73,6 +74,20 @@ def _command(
     )
 
 
+def _project_with_current_phase(
+    current_phase: object, *, lifecycle: str = "active"
+) -> ProjectPolicyView:
+    return ProjectPolicyView(
+        project_id=PROJECT.project_id,
+        lifecycle=lifecycle,
+        current_phase=current_phase,
+        roots=PROJECT.roots,
+        approved_plan_ref=PROJECT.approved_plan_ref,
+        delivery_bindings=PROJECT.delivery_bindings,
+        canonical_event_ids=PROJECT.canonical_event_ids,
+    )
+
+
 @pytest.mark.parametrize(
     ("command", "rule_id"),
     [
@@ -110,33 +125,56 @@ def test_routine_scope_accepts_a_canonical_posix_project_root():
 
 
 @pytest.mark.parametrize(
-    ("action_class", "rule_id", "approval_class"),
+    ("action_class", "rule_id", "approval_class", "lifecycle"),
     [
-        ("credentials", "policy.approval.credentials", "credentials"),
-        ("money_quota", "policy.approval.money_quota", "money_quota"),
+        ("credentials", "policy.approval.credentials", "credentials", "active"),
+        (
+            "money_quota",
+            "policy.approval.money_quota",
+            "money_quota",
+            "active",
+        ),
         (
             "external_communication",
             "policy.approval.external_communication",
             "external_communication",
+            "active",
         ),
-        ("publish", "policy.approval.publish", "publish"),
-        ("production", "policy.approval.production", "production"),
-        ("admin_service", "policy.approval.admin_service", "admin_service"),
-        ("destructive", "policy.approval.destructive", "destructive"),
-        ("live_canary", "policy.approval.live_canary", "live_canary"),
+        ("publish", "policy.approval.publish", "publish", "active"),
+        ("production", "policy.approval.production", "production", "active"),
+        (
+            "admin_service",
+            "policy.approval.admin_service",
+            "admin_service",
+            "active",
+        ),
+        (
+            "destructive",
+            "policy.approval.destructive",
+            "destructive",
+            "active",
+        ),
+        (
+            "live_canary",
+            "policy.approval.live_canary",
+            "live_canary",
+            "active",
+        ),
         (
             "final_acceptance",
             "policy.approval.final_acceptance",
             "final_acceptance",
+            "awaiting_acceptance",
         ),
     ],
 )
 def test_critical_commands_require_their_stable_approval_class(
-    action_class, rule_id, approval_class
+    action_class, rule_id, approval_class, lifecycle
 ):
     command = _command(action_class, targets=(f"{ROOT}/deployment",))
+    project = replace(PROJECT, lifecycle=lifecycle)
 
-    result = decide(command, PROJECT, _contract(action_class), OWNER)
+    result = decide(command, project, _contract(action_class), OWNER)
 
     assert result.decision is Decision.REQUIRE_APPROVAL
     assert result.rule_id == rule_id
@@ -206,8 +244,37 @@ def test_invalid_or_ambiguous_commands_are_denied_before_critical_rules(
     assert result.rule_id == rule_id
 
 
-@pytest.mark.parametrize("surface", ["desktop", "discord"])
-def test_owner_bound_canonical_event_delivery_is_internal(surface):
+@pytest.mark.parametrize(
+    "malformed_item",
+    [
+        pytest.param([], id="list"),
+        pytest.param({}, id="mapping"),
+        pytest.param(set(), id="set"),
+    ],
+)
+def test_unhashable_batch_items_are_denied_without_raising(malformed_item):
+    command = _command(
+        "local_code_edit",
+        targets=(f"{ROOT}/src/app.py",),
+        batch_id="batch-1",
+        batch_items=(malformed_item,),
+    )
+
+    result = decide(command, PROJECT, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.command.ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("surface", "lifecycle"),
+    [
+        pytest.param(surface, lifecycle, id=f"{surface}-{lifecycle}")
+        for surface in ("desktop", "discord")
+        for lifecycle in ("active", "awaiting_acceptance", "completed")
+    ],
+)
+def test_owner_bound_canonical_event_delivery_is_internal(surface, lifecycle):
     actor = ActorContext("owner-1", surface, f"{surface}-1", True)
     command = _command(
         "internal_delivery",
@@ -224,6 +291,7 @@ def test_owner_bound_canonical_event_delivery_is_internal(surface):
 
     registered_project = replace(
         PROJECT,
+        lifecycle=lifecycle,
         delivery_bindings=(
             ProjectBindingView(
                 binding_id=f"{surface}-1",
@@ -281,6 +349,131 @@ def test_delivery_with_a_supplied_destination_is_denied():
     assert result.rule_id == "policy.command.ambiguous"
 
 
+def test_delivery_phase_must_match_the_trusted_project_phase():
+    command = _command(
+        "internal_delivery",
+        name="event.deliver",
+        metadata={
+            "phase": "implementation",
+            "event_id": "event-1",
+            "binding_id": "desktop-1",
+            "binding_project_id": "project-1",
+            "binding_surface": "desktop",
+            "binding_owner_actor_id": "owner-1",
+        },
+    )
+    project = replace(
+        _project_with_current_phase("verification"),
+        canonical_event_ids=frozenset({"event-1"}),
+    )
+    contract = replace(
+        _contract("internal_delivery"),
+        allowed_phases=frozenset({"implementation", "verification"}),
+    )
+
+    result = decide(command, project, contract, OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.phase.invalid"
+
+
+def test_command_phase_must_match_the_trusted_project_phase():
+    project = _project_with_current_phase("verification")
+    contract = replace(
+        _contract("local_code_edit"),
+        allowed_phases=frozenset({"implementation", "verification"}),
+    )
+    command = _command(
+        "local_code_edit",
+        targets=(f"{ROOT}/src/app.py",),
+        metadata={"phase": "implementation"},
+    )
+
+    result = decide(command, project, contract, OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.phase.invalid"
+
+
+@pytest.mark.parametrize(
+    "current_phase",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("", id="empty"),
+        pytest.param(True, id="boolean"),
+        pytest.param("verification", id="not-approved-by-contract"),
+    ],
+)
+def test_trusted_project_phase_must_be_valid_and_contract_approved(current_phase):
+    project = _project_with_current_phase(current_phase)
+    command = _command(
+        "local_code_edit",
+        targets=(f"{ROOT}/src/app.py",),
+        metadata={"phase": current_phase},
+    )
+
+    result = decide(command, project, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.phase.invalid"
+
+
+@pytest.mark.parametrize(
+    "lifecycle", ["active", "awaiting_acceptance", "completed"]
+)
+def test_status_is_allowed_in_each_valid_lifecycle(lifecycle):
+    result = decide(
+        _command("status"),
+        replace(PROJECT, lifecycle=lifecycle),
+        _contract("status"),
+        OWNER,
+    )
+
+    assert result.decision is Decision.ALLOW
+    assert result.rule_id == "policy.allow.routine_in_plan"
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "action_class"),
+    [
+        ("awaiting_acceptance", "local_code_edit"),
+        ("completed", "local_code_edit"),
+        ("awaiting_acceptance", "local_test"),
+        ("completed", "local_test"),
+        ("awaiting_acceptance", "publish"),
+        ("completed", "publish"),
+        ("active", "final_acceptance"),
+        ("completed", "final_acceptance"),
+    ],
+)
+def test_lifecycle_matrix_denies_actions_outside_their_runtime_state(
+    lifecycle, action_class
+):
+    command = _command(action_class, targets=(f"{ROOT}/artifact",))
+
+    result = decide(
+        command,
+        replace(PROJECT, lifecycle=lifecycle),
+        _contract(action_class),
+        OWNER,
+    )
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.phase.invalid"
+
+
+def test_unknown_lifecycle_is_denied_with_the_stable_phase_rule():
+    result = decide(
+        _command("status"),
+        replace(PROJECT, lifecycle="archived"),
+        _contract("status"),
+        OWNER,
+    )
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.phase.invalid"
+
+
 @pytest.mark.parametrize(
     ("name", "action_class"),
     [
@@ -332,7 +525,7 @@ def test_noncanonical_paths_are_denied_before_scope_authorization(target):
     [
         ("/", "/workspace/project/file.py"),
         ("C:/", "c:/WORK/project/file.py"),
-        ("C:/Work/Project", "c:/work/project/SRC/file.py"),
+        ("C:/Work/Project", "c:/Work/Project/SRC/file.py"),
     ],
 )
 def test_component_containment_handles_drive_and_filesystem_roots(root, target):
@@ -342,6 +535,38 @@ def test_component_containment_handles_drive_and_filesystem_roots(root, target):
     result = decide(command, project, _contract("local_code_edit"), OWNER)
 
     assert result.decision is Decision.ALLOW
+
+
+@pytest.mark.parametrize(
+    ("root_component", "target_codepoint"),
+    [
+        pytest.param("ss", 0x00DF, id="eszett-does-not-equal-ss"),
+        pytest.param("ffi", 0xFB03, id="ligature-does-not-equal-ffi"),
+    ],
+)
+def test_windows_component_identity_never_uses_expanding_casefold(
+    root_component, target_codepoint
+):
+    project = replace(PROJECT, roots=(f"C:/work/{root_component}",))
+    target = f"C:/work/{chr(target_codepoint)}/outside.py"
+    command = _command("local_code_edit", targets=(target,))
+
+    result = decide(command, project, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.scope.outside_root"
+
+
+def test_windows_component_case_mismatch_is_outside_root():
+    project = replace(PROJECT, roots=("C:/Work/Project",))
+    command = _command(
+        "local_code_edit", targets=("c:/work/project/outside.py",)
+    )
+
+    result = decide(command, project, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.scope.outside_root"
 
 
 def test_component_containment_rejects_a_sibling_with_the_same_prefix():

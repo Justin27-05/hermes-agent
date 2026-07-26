@@ -891,6 +891,72 @@ def test_approval_never_authorizes_a_different_project_revision_or_batch(
     assert prdb.consume_approval_authorization(runtime_conn, **authorization) is False
 
 
+@pytest.mark.parametrize(
+    ("stored_component", "mismatched_codepoint"),
+    [
+        pytest.param("ss", 0x00DF, id="eszett-does-not-match-ss"),
+        pytest.param("ffi", 0xFB03, id="ligature-does-not-match-ffi"),
+    ],
+)
+def test_approval_target_identity_never_uses_expanding_casefold(
+    runtime_conn, stored_component, mismatched_codepoint
+):
+    _insert_project(runtime_conn, "p_approval")
+    _insert_owner_binding(runtime_conn)
+    request = dataclasses.replace(
+        _approval_request(),
+        targets=(
+            f"C:/work/{stored_component}/a.py",
+            f"C:/work/{stored_component}/b.py",
+        ),
+    )
+    created = prdb.create_approval_request(runtime_conn, request, now=10)
+    prdb.resolve_approval(
+        runtime_conn,
+        approval_id=created.approval_id,
+        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
+        outcome="approved",
+        now=11,
+    )
+    authorization = _authorization_args(created, now=12)
+    authorization["targets"] = (
+        f"C:/work/{chr(mismatched_codepoint)}/a.py",
+        f"C:/work/{stored_component}/b.py",
+    )
+
+    assert prdb.consume_approval_authorization(
+        runtime_conn, **authorization
+    ) is False
+
+
+def test_approval_target_component_case_mismatch_is_a_different_identity(
+    runtime_conn,
+):
+    _insert_project(runtime_conn, "p_approval")
+    _insert_owner_binding(runtime_conn)
+    request = dataclasses.replace(
+        _approval_request(),
+        targets=("C:/work/Project/a.py", "C:/work/Project/b.py"),
+    )
+    created = prdb.create_approval_request(runtime_conn, request, now=10)
+    prdb.resolve_approval(
+        runtime_conn,
+        approval_id=created.approval_id,
+        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
+        outcome="approved",
+        now=11,
+    )
+    authorization = _authorization_args(created, now=12)
+    authorization["targets"] = (
+        "C:/work/project/a.py",
+        "C:/work/Project/b.py",
+    )
+
+    assert prdb.consume_approval_authorization(
+        runtime_conn, **authorization
+    ) is False
+
+
 def test_non_owner_and_expired_approval_never_authorize(runtime_conn):
     _insert_project(runtime_conn, "p_approval")
     _insert_owner_binding(runtime_conn)
@@ -1251,6 +1317,81 @@ def test_new_schema_rejects_unknown_approval_status(runtime_conn):
             """
         )
     runtime_conn.rollback()
+
+
+def _insert_expired_approval_row(
+    conn, *, approval_id, resolved_at, resolved_by_actor_id
+):
+    conn.execute(
+        """
+        INSERT INTO project_approvals (
+            approval_id, project_id, actor_id, authorization_actor_id,
+            canonical_action, approval_class, command_revision,
+            targets_json, batch_boundary_json, status, expires_at,
+            resolved_at, resolved_by_actor_id, created_at
+        ) VALUES (
+            ?, 'p_approval', 'owner-1', 'owner-1', 'publish', 'publish', 7,
+            ?, '{}', 'expired', 100, ?, ?, 1
+        )
+        """,
+        (
+            approval_id,
+            f'["C:/work/project/{approval_id}"]',
+            resolved_at,
+            resolved_by_actor_id,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("resolved_at", "resolved_by_actor_id"),
+    [
+        pytest.param(None, "owner-1", id="resolver-without-timestamp"),
+        pytest.param(2, None, id="timestamp-without-resolver"),
+    ],
+)
+def test_new_schema_rejects_half_resolved_expired_approvals(
+    runtime_conn, resolved_at, resolved_by_actor_id
+):
+    _insert_project(runtime_conn, "p_approval")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_expired_approval_row(
+            runtime_conn,
+            approval_id="half-resolved",
+            resolved_at=resolved_at,
+            resolved_by_actor_id=resolved_by_actor_id,
+        )
+    runtime_conn.rollback()
+
+
+def test_new_schema_accepts_both_valid_expired_approval_origins(runtime_conn):
+    _insert_project(runtime_conn, "p_approval")
+
+    _insert_expired_approval_row(
+        runtime_conn,
+        approval_id="expired-from-pending",
+        resolved_at=None,
+        resolved_by_actor_id=None,
+    )
+    _insert_expired_approval_row(
+        runtime_conn,
+        approval_id="expired-from-approved",
+        resolved_at=2,
+        resolved_by_actor_id="owner-1",
+    )
+
+    rows = runtime_conn.execute(
+        """
+        SELECT approval_id, resolved_at, resolved_by_actor_id
+        FROM project_approvals
+        ORDER BY approval_id
+        """
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("expired-from-approved", 2, "owner-1"),
+        ("expired-from-pending", None, None),
+    ]
 
 
 def _create_task1_legacy_approval_db(db_path):

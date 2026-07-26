@@ -265,6 +265,53 @@ def test_migration_fails_closed_on_a_self_parented_legacy_child(tmp_path):
     conn.close()
 
 
+def test_migration_fails_closed_on_a_disconnected_parent_cycle(tmp_path):
+    conn = _create_db(tmp_path / "projects.db")
+    conn.execute("DROP INDEX idx_project_conversations_one_root")
+    _insert_project(conn, "p_one")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(
+        """
+        INSERT INTO project_conversations (
+            conversation_id, project_id, parent_conversation_id,
+            root_conversation_id, created_at
+        ) VALUES ('root', 'p_one', NULL, 'root', 1);
+        INSERT INTO project_conversations (
+            conversation_id, project_id, parent_conversation_id,
+            root_conversation_id, created_at
+        ) VALUES ('cycle-a', 'p_one', 'cycle-b', 'root', 2);
+        INSERT INTO project_conversations (
+            conversation_id, project_id, parent_conversation_id,
+            root_conversation_id, created_at
+        ) VALUES ('cycle-b', 'p_one', 'cycle-a', 'root', 3);
+        INSERT INTO project_runtime_state (
+            project_id, lifecycle, current_phase, version,
+            conversation_root_id, conversation_tip_id, updated_at
+        ) VALUES (
+            'p_one', 'active', 'implementation', 0,
+            'root', 'cycle-a', 4
+        );
+        """
+    )
+    conn.execute("PRAGMA foreign_keys=ON")
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    before = _state_snapshot(conn, "p_one")
+
+    with pytest.raises(prdb.LineageMigrationError):
+        prdb.ensure_schema(conn)
+
+    assert _state_snapshot(conn, "p_one") == before
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert conn.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'index'
+          AND name = 'idx_project_conversations_one_root'
+        """
+    ).fetchone() is None
+    conn.close()
+
+
 def test_two_connections_racing_adoption_have_exactly_one_winner(tmp_path):
     db_path = tmp_path / "projects.db"
     conn = _create_db(db_path)
@@ -505,6 +552,47 @@ def test_surface_bindings_are_immutable_idempotent_and_project_scoped(tmp_path):
     assert {binding.surface for binding in prdb.bindings_for_project(
         conn, project_id="p_one"
     )} == {"desktop", "discord"}
+    conn.close()
+
+
+def test_exact_surface_binding_retry_keeps_original_creation_metadata(tmp_path):
+    conn = _create_db(tmp_path / "projects.db")
+    _insert_project(conn, "p_one")
+    original = prdb.bind_surface(
+        conn,
+        binding_id="binding-desktop",
+        project_id="p_one",
+        surface="desktop",
+        external_binding_id="window-1",
+        actor_id="owner-1",
+        now=10,
+    )
+    before = tuple(conn.execute(
+        """
+        SELECT * FROM project_surface_bindings
+        WHERE binding_id = 'binding-desktop'
+        """
+    ).fetchone())
+
+    retried = prdb.bind_surface(
+        conn,
+        binding_id="binding-desktop",
+        project_id="p_one",
+        surface="desktop",
+        external_binding_id="window-1",
+        actor_id="owner-1",
+        now=99,
+    )
+
+    after = tuple(conn.execute(
+        """
+        SELECT * FROM project_surface_bindings
+        WHERE binding_id = 'binding-desktop'
+        """
+    ).fetchone())
+    assert retried == original
+    assert retried.created_at == 10
+    assert after == before
     conn.close()
 
 

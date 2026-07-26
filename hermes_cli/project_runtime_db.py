@@ -457,6 +457,41 @@ def _validate_existing_lineage(conn: sqlite3.Connection) -> None:
     if malformed_conversation is not None:
         raise LineageMigrationError("malformed project conversation lineage")
 
+    unreachable_conversation = conn.execute(
+        """
+        WITH RECURSIVE reachable (
+            project_id, conversation_id, root_conversation_id
+        ) AS (
+            SELECT project_id, conversation_id, root_conversation_id
+            FROM project_conversations
+            WHERE parent_conversation_id IS NULL
+              AND root_conversation_id = conversation_id
+            UNION
+            SELECT child.project_id,
+                   child.conversation_id,
+                   child.root_conversation_id
+            FROM project_conversations AS child
+            JOIN reachable AS parent
+              ON parent.project_id = child.project_id
+             AND parent.conversation_id = child.parent_conversation_id
+             AND parent.root_conversation_id = child.root_conversation_id
+        )
+        SELECT conversation.conversation_id
+        FROM project_conversations AS conversation
+        LEFT JOIN reachable
+          ON reachable.project_id = conversation.project_id
+         AND reachable.conversation_id = conversation.conversation_id
+         AND reachable.root_conversation_id
+             = conversation.root_conversation_id
+        WHERE reachable.conversation_id IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if unreachable_conversation is not None:
+        raise LineageMigrationError(
+            "project conversation is not reachable from its root"
+        )
+
     malformed_state = conn.execute(
         """
         SELECT state.project_id
@@ -790,6 +825,18 @@ def _binding_from_row(row: sqlite3.Row) -> SurfaceBinding:
     )
 
 
+def _same_binding_identity(
+    stored: SurfaceBinding, requested: SurfaceBinding
+) -> bool:
+    return (
+        stored.binding_id == requested.binding_id
+        and stored.project_id == requested.project_id
+        and stored.surface == requested.surface
+        and stored.external_binding_id == requested.external_binding_id
+        and stored.actor_id == requested.actor_id
+    )
+
+
 def binding_for_id(
     conn: sqlite3.Connection, *, project_id: str, binding_id: str
 ) -> SurfaceBinding | None:
@@ -861,7 +908,7 @@ def bind_surface(
     actor_id: str,
     now: int,
 ) -> SurfaceBinding:
-    """Insert-or-read one complete immutable Desktop/Discord binding tuple."""
+    """Insert-or-read one immutable Desktop/Discord binding identity."""
     binding = make_surface_binding(
         binding_id=binding_id,
         project_id=project_id,
@@ -900,11 +947,12 @@ def bind_surface(
                 binding.external_binding_id,
             ),
         ).fetchall()
-        if len(rows) != 1 or _binding_from_row(rows[0]) != binding:
+        stored = _binding_from_row(rows[0]) if len(rows) == 1 else None
+        if stored is None or not _same_binding_identity(stored, binding):
             raise BindingConflictError(
                 "binding id or external identity already has another tuple"
             )
-    return binding
+    return stored
 
 
 _ALLOWED_SOURCES_BY_TARGET: dict[Lifecycle, tuple[Lifecycle, ...]] = {

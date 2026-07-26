@@ -11,6 +11,7 @@ import pytest
 
 from hermes_cli import projects_db as pdb
 from hermes_cli import project_runtime_db as prdb
+from hermes_cli.project_policy import ActorContext
 
 
 RUNTIME_TABLES = {
@@ -761,3 +762,247 @@ def test_operation_idempotency_key_is_unique_within_each_project(runtime_conn):
         WHERE idempotency_key = 'shared-operation-key'
         """
     ).fetchone()[0] == 2
+
+
+def _approval_request(*, approval_id="approval-1", expires_at=100):
+    return prdb.ApprovalRequest(
+        approval_id=approval_id,
+        project_id="p_approval",
+        requester_actor_id="owner-1",
+        approval_class="publish",
+        command_revision=7,
+        targets=("C:/work/project/src/a.py", "C:/work/project/src/b.py"),
+        batch_id="batch-1",
+        batch_items=("operation-a", "operation-b"),
+        status="pending",
+        expires_at=expires_at,
+    )
+
+
+def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
+    runtime_conn,
+):
+    _insert_project(runtime_conn, "p_approval")
+    request = prdb.create_approval_request(
+        runtime_conn, _approval_request(), now=10
+    )
+
+    rejected = prdb.resolve_approval(
+        runtime_conn,
+        approval_id=request.approval_id,
+        resolver=ActorContext("other-owner", "desktop", "desktop-2", True),
+        outcome="approved",
+        now=11,
+    )
+    assert rejected is None
+
+    approved = prdb.resolve_approval(
+        runtime_conn,
+        approval_id=request.approval_id,
+        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
+        outcome="approved",
+        now=12,
+    )
+    assert approved is not None
+    assert approved.status == "approved"
+    assert approved.resolved_by_actor_id == "owner-1"
+
+    authorization = dict(
+        approval_id=request.approval_id,
+        project_id="p_approval",
+        approval_class="publish",
+        command_revision=7,
+        targets=("C:/work/project/src/a.py", "C:/work/project/src/b.py"),
+        batch_id="batch-1",
+        batch_items=("operation-a", "operation-b"),
+        now=13,
+    )
+    assert prdb.approval_authorizes(runtime_conn, **authorization) is True
+    assert prdb.consume_approval_authorization(runtime_conn, **authorization) is True
+    assert prdb.consume_approval_authorization(runtime_conn, **authorization) is False
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"project_id": "other-project"},
+        {"approval_class": "production"},
+        {"command_revision": 8},
+        {"targets": ("C:/work/project/src/a.py",)},
+        {
+            "targets": (
+                "C:/work/project/src/b.py",
+                "C:/work/project/src/a.py",
+            )
+        },
+        {"batch_id": "batch-2"},
+        {"batch_items": ("operation-a",)},
+        {"batch_items": ("operation-b", "operation-a")},
+    ],
+)
+def test_approval_never_authorizes_a_different_project_revision_or_batch(
+    runtime_conn, changed
+):
+    _insert_project(runtime_conn, "p_approval")
+    request = prdb.create_approval_request(
+        runtime_conn, _approval_request(), now=10
+    )
+    prdb.resolve_approval(
+        runtime_conn,
+        approval_id=request.approval_id,
+        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
+        outcome="approved",
+        now=11,
+    )
+    authorization = dict(
+        approval_id=request.approval_id,
+        project_id="p_approval",
+        approval_class="publish",
+        command_revision=7,
+        targets=("C:/work/project/src/a.py", "C:/work/project/src/b.py"),
+        batch_id="batch-1",
+        batch_items=("operation-a", "operation-b"),
+        now=12,
+    )
+    authorization.update(changed)
+
+    assert prdb.approval_authorizes(runtime_conn, **authorization) is False
+    assert prdb.consume_approval_authorization(runtime_conn, **authorization) is False
+
+
+def test_non_owner_and_expired_approval_never_authorize(runtime_conn):
+    _insert_project(runtime_conn, "p_approval")
+    request = prdb.create_approval_request(
+        runtime_conn, _approval_request(expires_at=20), now=10
+    )
+
+    assert prdb.resolve_approval(
+        runtime_conn,
+        approval_id=request.approval_id,
+        resolver=ActorContext("owner-1", "desktop", "desktop-1", False),
+        outcome="approved",
+        now=11,
+    ) is None
+    assert prdb.resolve_approval(
+        runtime_conn,
+        approval_id=request.approval_id,
+        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
+        outcome="approved",
+        now=20,
+    ) is None
+    assert prdb.approval_authorizes(
+        runtime_conn,
+        approval_id=request.approval_id,
+        project_id="p_approval",
+        approval_class="publish",
+        command_revision=7,
+        targets=("C:/work/project/src/a.py", "C:/work/project/src/b.py"),
+        batch_id="batch-1",
+        batch_items=("operation-a", "operation-b"),
+        now=20,
+    ) is False
+
+    denied = prdb.create_approval_request(
+        runtime_conn,
+        dataclasses.replace(
+            _approval_request(approval_id="approval-denied"), batch_id="batch-denied"
+        ),
+        now=21,
+    )
+    assert prdb.resolve_approval(
+        runtime_conn,
+        approval_id=denied.approval_id,
+        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
+        outcome="denied",
+        now=22,
+    ).status == "denied"
+    assert prdb.approval_authorizes(
+        runtime_conn,
+        approval_id=denied.approval_id,
+        project_id="p_approval",
+        approval_class="publish",
+        command_revision=7,
+        targets=("C:/work/project/src/a.py", "C:/work/project/src/b.py"),
+        batch_id="batch-denied",
+        batch_items=("operation-a", "operation-b"),
+        now=23,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        ("C:/work/project/src/a.py", "C:/work/project/src/a.py"),
+        ("C:/work/project/src/../secret.txt",),
+    ],
+)
+def test_approval_request_rejects_noncanonical_or_duplicate_targets(
+    runtime_conn, targets
+):
+    _insert_project(runtime_conn, "p_approval")
+    request = dataclasses.replace(_approval_request(), targets=targets)
+
+    with pytest.raises(ValueError):
+        prdb.create_approval_request(runtime_conn, request, now=10)
+
+
+def test_concurrent_consumers_cannot_replay_one_approval(tmp_path):
+    db_path = tmp_path / "projects.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+            created_at INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    prdb.ensure_schema(conn)
+    _insert_project(conn, "p_approval")
+    request = prdb.create_approval_request(conn, _approval_request(), now=10)
+    prdb.resolve_approval(
+        conn,
+        approval_id=request.approval_id,
+        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
+        outcome="approved",
+        now=11,
+    )
+    conn.close()
+
+    barrier = threading.Barrier(2)
+
+    def consume_once():
+        worker_conn = sqlite3.connect(db_path, timeout=10)
+        worker_conn.row_factory = sqlite3.Row
+        worker_conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            barrier.wait()
+            return prdb.consume_approval_authorization(
+                worker_conn,
+                approval_id=request.approval_id,
+                project_id="p_approval",
+                approval_class="publish",
+                command_revision=7,
+                targets=("C:/work/project/src/a.py", "C:/work/project/src/b.py"),
+                batch_id="batch-1",
+                batch_items=("operation-a", "operation-b"),
+                now=12,
+            )
+        finally:
+            worker_conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(lambda _: consume_once(), range(2))).count(True) == 1
+
+
+def test_approval_schema_migration_adds_resolver_and_consumption_columns(
+    runtime_conn,
+):
+    columns = {
+        row["name"]
+        for row in runtime_conn.execute("PRAGMA table_info(project_approvals)")
+    }
+
+    assert {"resolved_by_actor_id", "consumed_at"} <= columns

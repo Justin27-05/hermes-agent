@@ -7,11 +7,16 @@ delivery, worker, and provider behavior belong to later service layers.
 from __future__ import annotations
 
 import contextlib
+import json
+import re
 import sqlite3
 from dataclasses import dataclass
-from typing import Iterator, Literal, Optional
+from typing import TYPE_CHECKING, Iterator, Literal, Optional
 
 from hermes_cli.sqlite_util import write_txn
+
+if TYPE_CHECKING:
+    from hermes_cli.project_policy import ActorContext
 
 
 RUNTIME_SCHEMA_SQL = """
@@ -153,6 +158,8 @@ CREATE TABLE IF NOT EXISTS project_approvals (
     status              TEXT NOT NULL,
     expires_at          INTEGER NOT NULL,
     resolved_at         INTEGER,
+    resolved_by_actor_id TEXT,
+    consumed_at         INTEGER,
     created_at          INTEGER NOT NULL,
     UNIQUE (project_id, approval_id),
     UNIQUE (
@@ -225,6 +232,7 @@ CREATE TABLE IF NOT EXISTS project_worker_leases (
 
 
 Lifecycle = Literal["active", "awaiting_acceptance", "completed"]
+ApprovalStatus = Literal["pending", "approved", "denied", "expired"]
 
 
 @dataclass(frozen=True)
@@ -235,6 +243,25 @@ class RuntimeState:
     conversation_root_id: Optional[str]
     conversation_tip_id: Optional[str]
     updated_at: int
+
+
+@dataclass(frozen=True)
+class ApprovalRequest:
+    """A bounded, project-scoped approval for one exact command batch."""
+
+    approval_id: str
+    project_id: str
+    requester_actor_id: str
+    approval_class: str
+    command_revision: int
+    targets: tuple[str, ...]
+    batch_id: str
+    batch_items: tuple[str, ...]
+    status: ApprovalStatus
+    expires_at: int
+    resolved_by_actor_id: str | None = None
+    resolved_at: int | None = None
+    consumed_at: int | None = None
 
 
 def runtime_state_from_row(row: sqlite3.Row) -> RuntimeState:
@@ -282,6 +309,21 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create all additive ProjectRuntime tables without adopting projects."""
     conn.execute("PRAGMA foreign_keys=ON")
     execute_schema_statements(conn, RUNTIME_SCHEMA_SQL)
+    _ensure_approval_columns(conn)
+
+
+def _ensure_approval_columns(conn: sqlite3.Connection) -> None:
+    """Add Task-2 approval fields to a Task-1 database without data loss."""
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(project_approvals)")
+    }
+    for name, definition in (
+        ("resolved_by_actor_id", "TEXT"),
+        ("consumed_at", "INTEGER"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE project_approvals ADD COLUMN {name} {definition}")
 
 
 @contextlib.contextmanager
@@ -384,3 +426,286 @@ def transition_lifecycle(
     if cursor.rowcount != 1:
         return None
     return _runtime_state_for_project(conn, project_id)
+
+
+def _canonical_string_array(
+    values: object, *, field_name: str, require_items: bool
+) -> tuple[str, ...]:
+    if not isinstance(values, tuple) or (require_items and not values):
+        raise ValueError(f"{field_name} must be a non-empty tuple")
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError(f"{field_name} must contain non-empty strings")
+    if len(set(values)) != len(values):
+        raise ValueError(f"{field_name} must not contain duplicates")
+    if field_name == "targets" and any(
+        not _is_canonical_target(value) for value in values
+    ):
+        raise ValueError("targets must be canonical paths")
+    return values
+
+
+def _is_canonical_target(value: str) -> bool:
+    if not re.fullmatch(
+        r"(?:[A-Za-z]:/(?:[^/]+(?:/[^/]+)*)?|/(?:[^/]+(?:/[^/]+)*)?)", value
+    ):
+        return False
+    path_parts = value[3:] if len(value) > 1 and value[1:3] == ":/" else value[1:]
+    return all(part not in {".", ".."} for part in path_parts.split("/"))
+
+
+def _canonical_json_array(values: tuple[str, ...]) -> str:
+    return json.dumps(values, separators=(",", ":"), ensure_ascii=False)
+
+
+def _validate_approval_request(request: ApprovalRequest, now: int) -> None:
+    if not isinstance(request, ApprovalRequest):
+        raise ValueError("request must be an ApprovalRequest")
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            request.approval_id,
+            request.project_id,
+            request.requester_actor_id,
+            request.approval_class,
+            request.batch_id,
+        )
+    ):
+        raise ValueError("approval identity fields must be non-empty strings")
+    if not isinstance(request.command_revision, int) or request.command_revision <= 0:
+        raise ValueError("command_revision must be a positive integer")
+    if request.status != "pending":
+        raise ValueError("new approvals must be pending")
+    if not isinstance(request.expires_at, int) or request.expires_at <= now:
+        raise ValueError("approval expiry must be in the future")
+    _canonical_string_array(request.targets, field_name="targets", require_items=True)
+    _canonical_string_array(
+        request.batch_items, field_name="batch_items", require_items=True
+    )
+
+
+def _approval_from_row(row: sqlite3.Row) -> ApprovalRequest:
+    return ApprovalRequest(
+        approval_id=row["approval_id"],
+        project_id=row["project_id"],
+        requester_actor_id=row["actor_id"],
+        approval_class=row["approval_class"],
+        command_revision=row["command_revision"],
+        targets=tuple(json.loads(row["targets_json"])),
+        batch_id=json.loads(row["batch_boundary_json"])["batch_id"],
+        batch_items=tuple(json.loads(row["batch_boundary_json"])["batch_items"]),
+        status=row["status"],
+        expires_at=row["expires_at"],
+        resolved_by_actor_id=row["resolved_by_actor_id"],
+        resolved_at=row["resolved_at"],
+        consumed_at=row["consumed_at"],
+    )
+
+
+def create_approval_request(
+    conn: sqlite3.Connection, request: ApprovalRequest, *, now: int
+) -> ApprovalRequest:
+    """Persist one pending approval with its complete, ordered batch boundary."""
+    _validate_approval_request(request, now)
+    targets_json = _canonical_json_array(request.targets)
+    boundary_json = json.dumps(
+        {"batch_id": request.batch_id, "batch_items": request.batch_items},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    with write_transaction(conn):
+        conn.execute(
+            """
+            INSERT INTO project_approvals (
+                approval_id, project_id, actor_id, approval_class,
+                command_revision, targets_json, batch_boundary_json, status,
+                expires_at, resolved_at, resolved_by_actor_id, consumed_at,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, ?)
+            """,
+            (
+                request.approval_id,
+                request.project_id,
+                request.requester_actor_id,
+                request.approval_class,
+                request.command_revision,
+                targets_json,
+                boundary_json,
+                request.expires_at,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM project_approvals WHERE approval_id = ?",
+            (request.approval_id,),
+        ).fetchone()
+    assert row is not None
+    return _approval_from_row(row)
+
+
+def _expire_pending_approvals(conn: sqlite3.Connection, now: int) -> None:
+    conn.execute(
+        """
+        UPDATE project_approvals
+        SET status = 'expired'
+        WHERE status = 'pending' AND expires_at <= ?
+        """,
+        (now,),
+    )
+
+
+def resolve_approval(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: str,
+    resolver: "ActorContext",
+    outcome: Literal["approved", "denied"],
+    now: int,
+) -> ApprovalRequest | None:
+    """Resolve a pending approval once, only by its requesting project owner."""
+    if (
+        outcome not in {"approved", "denied"}
+        or not isinstance(approval_id, str)
+        or not approval_id
+        or getattr(resolver, "is_owner", False) is not True
+        or not isinstance(getattr(resolver, "actor_id", None), str)
+        or not resolver.actor_id
+    ):
+        return None
+    with write_transaction(conn):
+        _expire_pending_approvals(conn, now)
+        cursor = conn.execute(
+            """
+            UPDATE project_approvals
+            SET status = ?, resolved_at = ?, resolved_by_actor_id = ?
+            WHERE approval_id = ?
+              AND actor_id = ?
+              AND status = 'pending'
+              AND expires_at > ?
+            """,
+            (outcome, now, resolver.actor_id, approval_id, resolver.actor_id, now),
+        )
+        if cursor.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM project_approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+    assert row is not None
+    return _approval_from_row(row)
+
+
+def _approval_match_parameters(
+    *,
+    approval_id: str,
+    project_id: str,
+    approval_class: str,
+    command_revision: int,
+    targets: tuple[str, ...],
+    batch_id: str,
+    batch_items: tuple[str, ...],
+) -> tuple[object, ...] | None:
+    if not all(isinstance(value, str) and value for value in (approval_id, project_id, approval_class, batch_id)):
+        return None
+    if not isinstance(command_revision, int) or command_revision <= 0:
+        return None
+    try:
+        valid_targets = _canonical_string_array(
+            targets, field_name="targets", require_items=True
+        )
+        valid_items = _canonical_string_array(
+            batch_items, field_name="batch_items", require_items=True
+        )
+    except ValueError:
+        return None
+    boundary_json = json.dumps(
+        {"batch_id": batch_id, "batch_items": valid_items},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return (
+        approval_id,
+        project_id,
+        approval_class,
+        command_revision,
+        _canonical_json_array(valid_targets),
+        boundary_json,
+    )
+
+
+def approval_authorizes(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: str,
+    project_id: str,
+    approval_class: str,
+    command_revision: int,
+    targets: tuple[str, ...],
+    batch_id: str,
+    batch_items: tuple[str, ...],
+    now: int,
+) -> bool:
+    """Check whether an unconsumed approval exactly authorizes this batch."""
+    parameters = _approval_match_parameters(
+        approval_id=approval_id,
+        project_id=project_id,
+        approval_class=approval_class,
+        command_revision=command_revision,
+        targets=targets,
+        batch_id=batch_id,
+        batch_items=batch_items,
+    )
+    if parameters is None:
+        return False
+    with write_transaction(conn):
+        _expire_pending_approvals(conn, now)
+        row = conn.execute(
+            """
+            SELECT 1 FROM project_approvals
+            WHERE approval_id = ? AND project_id = ? AND approval_class = ?
+              AND command_revision = ? AND targets_json = ?
+              AND batch_boundary_json = ? AND status = 'approved'
+              AND expires_at > ? AND consumed_at IS NULL
+            """,
+            (*parameters, now),
+        ).fetchone()
+    return row is not None
+
+
+def consume_approval_authorization(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: str,
+    project_id: str,
+    approval_class: str,
+    command_revision: int,
+    targets: tuple[str, ...],
+    batch_id: str,
+    batch_items: tuple[str, ...],
+    now: int,
+) -> bool:
+    """Atomically consume exactly one approval bound to the supplied batch."""
+    parameters = _approval_match_parameters(
+        approval_id=approval_id,
+        project_id=project_id,
+        approval_class=approval_class,
+        command_revision=command_revision,
+        targets=targets,
+        batch_id=batch_id,
+        batch_items=batch_items,
+    )
+    if parameters is None:
+        return False
+    with write_transaction(conn):
+        _expire_pending_approvals(conn, now)
+        cursor = conn.execute(
+            """
+            UPDATE project_approvals
+            SET consumed_at = ?
+            WHERE approval_id = ? AND project_id = ? AND approval_class = ?
+              AND command_revision = ? AND targets_json = ?
+              AND batch_boundary_json = ? AND status = 'approved'
+              AND expires_at > ? AND consumed_at IS NULL
+            """,
+            (now, *parameters, now),
+        )
+    return cursor.rowcount == 1

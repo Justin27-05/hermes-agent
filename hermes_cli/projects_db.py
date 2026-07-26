@@ -185,7 +185,9 @@ def _apply_wal_with_retry(conn: sqlite3.Connection) -> str:
                     else ""
                 )
                 if mode == "wal":
-                    return "wal"
+                    if attempt + 1 == _JOURNAL_MODE_MAX_ATTEMPTS:
+                        raise
+                    continue
 
             if attempt + 1 == _JOURNAL_MODE_MAX_ATTEMPTS:
                 raise

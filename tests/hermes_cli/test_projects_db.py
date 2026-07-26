@@ -370,7 +370,7 @@ def test_connect_bounds_persistent_journal_mode_lock_retries(
     assert 1 < len(attempts) < 20
 
 
-def test_connect_reprobe_keeps_existing_wal_without_retrying_or_downgrading(
+def test_wal_reprobe_reenters_canonical_darwin_durability_path(
     tmp_path, monkeypatch
 ):
     import hermes_state
@@ -382,12 +382,64 @@ def test_connect_reprobe_keeps_existing_wal_without_retrying_or_downgrading(
     finally:
         seed.close()
 
+    real_apply_wal = hermes_state.apply_wal_with_fallback
+    attempts = []
+    sleeps = []
+
+    def locked_once_then_canonical(conn, *, db_label):
+        attempts.append(db_label)
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_apply_wal(conn, db_label=db_label)
+
+    monkeypatch.setattr(
+        hermes_state,
+        "apply_wal_with_fallback",
+        locked_once_then_canonical,
+    )
+    monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+    monkeypatch.setattr(pdb.time, "sleep", sleeps.append)
+
+    statements = []
+    conn = sqlite3.connect(db_path)
+    conn.set_trace_callback(statements.append)
+    try:
+        assert pdb._apply_wal_with_retry(conn) == "wal"
+    finally:
+        conn.close()
+
+    normalized = [
+        statement.lower().replace(" ", "")
+        for statement in statements
+    ]
+    assert "pragmacheckpoint_fullfsync=1" in normalized
+    assert "pragmasynchronous=full" in normalized
+    assert "pragmajournal_mode=delete" not in normalized
+    assert attempts == ["projects.db", "projects.db"]
+    assert sleeps == []
+
+
+def test_connect_reprobe_keeps_existing_wal_without_sleep_or_downgrade(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+
+    db_path = tmp_path / "projects.db"
+    seed = sqlite3.connect(db_path)
+    try:
+        assert seed.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    finally:
+        seed.close()
+
+    real_apply_wal = hermes_state.apply_wal_with_fallback
     attempts = []
     sleeps = []
 
     def collide_with_existing_wal(conn, *, db_label):
         attempts.append(db_label)
-        raise sqlite3.OperationalError("database is locked")
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_apply_wal(conn, db_label=db_label)
 
     monkeypatch.setattr(
         hermes_state,
@@ -410,7 +462,7 @@ def test_connect_reprobe_keeps_existing_wal_without_retrying_or_downgrading(
 
     assert mode == "wal"
     assert ALL_SCHEMA_TABLES <= tables
-    assert attempts == ["projects.db"]
+    assert attempts == ["projects.db", "projects.db"]
     assert sleeps == []
 
 

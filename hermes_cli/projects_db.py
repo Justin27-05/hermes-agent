@@ -149,17 +149,16 @@ def _normalize_path(path: str) -> str:
 # Connection management
 # ---------------------------------------------------------------------------
 
-_INITIALIZED_PATHS: set[str] = set()
-
-
 def init_schema(conn: sqlite3.Connection) -> None:
     """Initialize the catalog plus the additive ProjectRuntime schema."""
-    conn.executescript(SCHEMA_SQL)
-    _migrate_add_optional_columns(conn)
-
     # Local import keeps the catalog and runtime persistence modules acyclic.
-    from hermes_cli.project_runtime_db import ensure_schema
+    from hermes_cli.project_runtime_db import (
+        ensure_schema,
+        execute_schema_statements,
+    )
 
+    execute_schema_statements(conn, SCHEMA_SQL)
+    _migrate_add_optional_columns(conn)
     ensure_schema(conn)
 
 
@@ -168,11 +167,11 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
 
     WAL with DELETE fallback for network filesystems (shared helper from
     ``hermes_state``). Schema init is idempotent (``CREATE TABLE IF NOT
-    EXISTS`` + additive migrations) and cached per-path per-process.
+    EXISTS`` + additive migrations) and runs for each new connection so a
+    replaced database at the same path cannot bypass initialization.
     """
     path = db_path if db_path is not None else projects_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    resolved = str(path.resolve())
     conn = sqlite3.connect(str(path))
     try:
         conn.row_factory = sqlite3.Row
@@ -180,9 +179,7 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
 
         apply_wal_with_fallback(conn, db_label="projects.db")
         conn.execute("PRAGMA foreign_keys=ON")
-        if resolved not in _INITIALIZED_PATHS:
-            init_schema(conn)
-            _INITIALIZED_PATHS.add(resolved)
+        init_schema(conn)
     except Exception:
         conn.close()
         raise

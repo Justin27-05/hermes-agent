@@ -249,10 +249,28 @@ def runtime_state_from_row(row: sqlite3.Row) -> RuntimeState:
     )
 
 
+def execute_schema_statements(
+    conn: sqlite3.Connection, schema_sql: str
+) -> None:
+    """Execute a SQL schema without committing a caller-owned transaction."""
+    statement_lines: list[str] = []
+    for line in schema_sql.splitlines(keepends=True):
+        statement_lines.append(line)
+        statement = "".join(statement_lines)
+        if not sqlite3.complete_statement(statement):
+            continue
+        if statement.strip():
+            conn.execute(statement)
+        statement_lines.clear()
+
+    if "".join(statement_lines).strip():
+        raise ValueError("incomplete schema SQL")
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create all additive ProjectRuntime tables without adopting projects."""
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(RUNTIME_SCHEMA_SQL)
+    execute_schema_statements(conn, RUNTIME_SCHEMA_SQL)
 
 
 @contextlib.contextmanager

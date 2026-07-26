@@ -239,3 +239,42 @@ def test_connect_adds_runtime_schema_without_adopting_archived_project(conn):
         "SELECT 1 FROM project_runtime_state WHERE project_id = ?",
         (project_id,),
     ).fetchone() is None
+
+
+def test_connect_reinitializes_catalog_and_runtime_after_same_path_replacement(
+    tmp_path,
+):
+    db_path = tmp_path / "projects.db"
+    first = pdb.connect(db_path=db_path)
+    first.close()
+    db_path.unlink()
+
+    replacement = pdb.connect(db_path=db_path)
+    try:
+        tables = {
+            row["name"]
+            for row in replacement.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        replacement.close()
+
+    assert {
+        "projects",
+        "project_folders",
+        "project_meta",
+        "discovered_repos",
+        "project_contracts",
+        "project_runtime_state",
+        "project_conversations",
+        "project_surface_bindings",
+        "project_turns",
+        "project_run_controls",
+        "project_events",
+        "project_deliveries",
+        "project_approvals",
+        "project_artifacts",
+        "project_operations",
+        "project_worker_leases",
+    } <= tables

@@ -595,3 +595,119 @@ def test_write_transaction_rolls_back_turn_and_event_on_original_exception(
     assert runtime_conn.execute(
         "SELECT 1 FROM project_events WHERE event_id = 'event_rollback'"
     ).fetchone() is None
+
+
+def test_ensure_schema_preserves_caller_transaction_rollback(runtime_conn):
+    class TransactionFailure(Exception):
+        pass
+
+    with pytest.raises(TransactionFailure):
+        with prdb.write_transaction(runtime_conn):
+            runtime_conn.execute(
+                """
+                INSERT INTO projects (id, slug, name, created_at, archived)
+                VALUES ('p_runtime_init_rollback', 'runtime-init-rollback',
+                        'Runtime init rollback', 1, 0)
+                """
+            )
+            prdb.ensure_schema(runtime_conn)
+            raise TransactionFailure
+
+    assert runtime_conn.execute(
+        "SELECT 1 FROM projects WHERE id = 'p_runtime_init_rollback'"
+    ).fetchone() is None
+
+
+def test_catalog_init_preserves_caller_transaction_rollback(runtime_conn):
+    class TransactionFailure(Exception):
+        pass
+
+    with pytest.raises(TransactionFailure):
+        with prdb.write_transaction(runtime_conn):
+            runtime_conn.execute(
+                """
+                INSERT INTO projects (id, slug, name, created_at, archived)
+                VALUES ('p_catalog_init_rollback', 'catalog-init-rollback',
+                        'Catalog init rollback', 1, 0)
+                """
+            )
+            pdb.init_schema(runtime_conn)
+            raise TransactionFailure
+
+    assert runtime_conn.execute(
+        "SELECT 1 FROM projects WHERE id = 'p_catalog_init_rollback'"
+    ).fetchone() is None
+
+
+def test_event_sequence_is_unique_within_each_project(runtime_conn):
+    _insert_project(runtime_conn, "p_event_one")
+    _insert_project(runtime_conn, "p_event_two")
+    _insert_event(
+        runtime_conn,
+        event_id="event_sequence_one",
+        project_id="p_event_one",
+        sequence=7,
+    )
+    runtime_conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_event(
+            runtime_conn,
+            event_id="event_sequence_duplicate",
+            project_id="p_event_one",
+            sequence=7,
+        )
+    runtime_conn.rollback()
+
+    _insert_event(
+        runtime_conn,
+        event_id="event_sequence_other_project",
+        project_id="p_event_two",
+        sequence=7,
+    )
+    runtime_conn.commit()
+
+    assert runtime_conn.execute(
+        "SELECT COUNT(*) FROM project_events WHERE sequence = 7"
+    ).fetchone()[0] == 2
+
+
+def test_operation_idempotency_key_is_unique_within_each_project(runtime_conn):
+    _insert_project(runtime_conn, "p_operation_one")
+    _insert_project(runtime_conn, "p_operation_two")
+
+    def insert_operation(operation_id, project_id):
+        runtime_conn.execute(
+            """
+            INSERT INTO project_operations (
+                operation_id,
+                project_id,
+                idempotency_key,
+                command_revision,
+                targets_json,
+                payload_json,
+                status,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, 'shared-operation-key', 1, '[]', '{}', 'intent', 1, 1)
+            """,
+            (operation_id, project_id),
+        )
+
+    insert_operation("operation_one", "p_operation_one")
+    runtime_conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        insert_operation("operation_duplicate", "p_operation_one")
+    runtime_conn.rollback()
+
+    insert_operation("operation_other_project", "p_operation_two")
+    runtime_conn.commit()
+
+    assert runtime_conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM project_operations
+        WHERE idempotency_key = 'shared-operation-key'
+        """
+    ).fetchone()[0] == 2

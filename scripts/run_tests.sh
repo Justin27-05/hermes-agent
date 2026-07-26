@@ -100,6 +100,13 @@ fi
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
+PLATFORM_ENV=()
+for variable in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA; do
+  if [ -n "${!variable:-}" ]; then
+    PLATFORM_ENV+=("$variable=${!variable}")
+  fi
+done
+
 cd "$REPO_ROOT"
 
 # ── Pre-compile .pyc bytecode cache ─────────────────────────────────────────
@@ -118,6 +125,7 @@ exec env -i \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  "${PLATFORM_ENV[@]}" \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \

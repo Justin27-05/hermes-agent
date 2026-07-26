@@ -2730,3 +2730,101 @@ class TestGatewayRoutingTable:
         )
         assert entry.session_key not in rows
         restarted._db.close()
+
+
+class TestProjectRuntimeSessionContext:
+    @staticmethod
+    def _entry():
+        legacy_source = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="desktop-window",
+            chat_name="Desktop project",
+            user_id="owner-1",
+        )
+        now = datetime.now()
+        return SessionEntry(
+            session_key="agent:main:local:dm:owner-1",
+            session_id="legacy-route-session",
+            created_at=now,
+            updated_at=now,
+            origin=legacy_source,
+            display_name="Desktop project",
+            platform=Platform.LOCAL,
+        )
+
+    def test_alternating_turn_sources_share_the_explicit_canonical_session(self):
+        from gateway import session as session_module
+
+        config = GatewayConfig(platforms={})
+        entry = self._entry()
+        serialized_before = entry.to_dict()
+        desktop = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="desktop-window",
+            user_id="owner-1",
+        )
+        discord = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-42",
+            chat_name="Project channel",
+            chat_type="channel",
+            user_id="owner-1",
+        )
+
+        desktop_context = session_module.build_project_session_context(
+            desktop,
+            "canonical-root",
+            config,
+            entry,
+        )
+        discord_context = session_module.build_project_session_context(
+            discord,
+            "canonical-root",
+            config,
+            entry,
+        )
+
+        assert desktop_context.source is desktop
+        assert discord_context.source is discord
+        assert desktop_context.session_id == "canonical-root"
+        assert discord_context.session_id == "canonical-root"
+        assert desktop_context.session_key == entry.session_key
+        assert discord_context.session_key == entry.session_key
+        assert entry.session_id == "legacy-route-session"
+        assert entry.origin is not None
+        assert entry.origin.platform == Platform.LOCAL
+        assert entry.to_dict() == serialized_before
+
+    def test_context_without_a_route_entry_still_uses_the_canonical_id(self):
+        from gateway import session as session_module
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-42",
+            user_id="owner-1",
+        )
+
+        context = session_module.build_project_session_context(
+            source,
+            "canonical-root",
+            GatewayConfig(platforms={}),
+        )
+
+        assert context.source is source
+        assert context.session_id == "canonical-root"
+        assert context.session_key == ""
+
+    @pytest.mark.parametrize(
+        "canonical_id",
+        ["../escape", "/absolute", "\\absolute", "C:/windows", "", None, []],
+    )
+    def test_unsafe_or_malformed_canonical_id_is_rejected(self, canonical_id):
+        from gateway import session as session_module
+
+        with pytest.raises(ValueError):
+            session_module.build_project_session_context(
+                SessionSource(platform=Platform.LOCAL, chat_id="desktop"),
+                canonical_id,
+                GatewayConfig(platforms={}),
+                self._entry(),
+            )

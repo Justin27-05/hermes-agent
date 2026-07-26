@@ -340,7 +340,7 @@ def test_foreign_keys_and_project_scoped_uniqueness_are_enforced(runtime_conn):
             project_id="missing",
             current_phase="implementation",
             conversation_root_id="root",
-            conversation_tip_id="tip",
+            conversation_tip_id="root",
             updated_at=1,
         )
     runtime_conn.rollback()
@@ -474,7 +474,7 @@ def test_lifecycle_transition_graph_enforces_only_legal_edges(
             project_id=project_id,
             current_phase="implementation",
             conversation_root_id="root",
-            conversation_tip_id="tip",
+            conversation_tip_id="root",
             updated_at=10,
         )
         runtime_conn.execute(
@@ -516,7 +516,7 @@ def test_runtime_state_row_is_immutable(runtime_conn):
             project_id="p_immutable",
             current_phase="implementation",
             conversation_root_id="root",
-            conversation_tip_id="tip",
+            conversation_tip_id="root",
             updated_at=1,
         )
 
@@ -593,7 +593,7 @@ def test_runtime_adoption_requires_a_nonempty_text_phase(
             runtime_conn,
             project_id="p_invalid_adoption_phase",
             conversation_root_id="root",
-            conversation_tip_id="tip",
+            conversation_tip_id="root",
             updated_at=1,
             **phase_kwargs,
         )
@@ -686,7 +686,7 @@ def test_stale_expected_version_does_not_change_runtime_state(runtime_conn):
             project_id="p_stale",
             current_phase="implementation",
             conversation_root_id="root",
-            conversation_tip_id="tip",
+            conversation_tip_id="root",
             updated_at=1,
         )
 
@@ -736,7 +736,7 @@ def test_concurrent_accept_and_reopen_have_exactly_one_cas_winner(tmp_path):
             project_id="p_race",
             current_phase="implementation",
             conversation_root_id="root",
-            conversation_tip_id="tip",
+            conversation_tip_id="root",
             updated_at=1,
         )
         conn.execute(
@@ -959,7 +959,7 @@ def _insert_approval_project(
             project_id=project_id,
             current_phase=current_phase,
             conversation_root_id=f"root-{project_id}",
-            conversation_tip_id=f"tip-{project_id}",
+            conversation_tip_id=f"root-{project_id}",
             updated_at=1,
         )
 
@@ -2087,6 +2087,25 @@ def _create_task1_legacy_approval_db(db_path):
         );
         INSERT INTO project_runtime_state VALUES (
             'p_legacy', 'active', 4, 'root-legacy', 'tip-legacy', 7
+        );
+        CREATE TABLE project_conversations (
+            conversation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL
+                       REFERENCES projects(id) ON DELETE RESTRICT,
+            parent_conversation_id TEXT,
+            root_conversation_id TEXT,
+            created_at INTEGER NOT NULL,
+            UNIQUE (project_id, conversation_id),
+            FOREIGN KEY (project_id, parent_conversation_id)
+                REFERENCES project_conversations(project_id, conversation_id),
+            FOREIGN KEY (project_id, root_conversation_id)
+                REFERENCES project_conversations(project_id, conversation_id)
+        );
+        INSERT INTO project_conversations VALUES (
+            'root-legacy', 'p_legacy', NULL, 'root-legacy', 1
+        );
+        INSERT INTO project_conversations VALUES (
+            'tip-legacy', 'p_legacy', 'root-legacy', 'root-legacy', 2
         );
         CREATE TABLE project_approvals (
             approval_id TEXT PRIMARY KEY,

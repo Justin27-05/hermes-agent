@@ -1129,6 +1129,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
+    project_id TEXT,
     source TEXT NOT NULL,
     user_id TEXT,
     session_key TEXT,
@@ -3829,6 +3830,41 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def set_session_project_id(
+        self, session_id: str, project_id: str | None
+    ) -> bool:
+        """Set the recoverable project projection once, without inference."""
+        if not (
+            type(session_id) is str
+            and bool(session_id)
+            and type(project_id) is str
+            and bool(project_id)
+        ):
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT project_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["project_id"] == project_id:
+                return True
+            if row["project_id"] is not None:
+                return False
+            cursor = conn.execute(
+                """
+                UPDATE sessions
+                SET project_id = ?
+                WHERE id = ? AND project_id IS NULL
+                """,
+                (project_id, session_id),
+            )
+            return cursor.rowcount == 1
+
+        return self._execute_write(_do)
 
     def record_gateway_session_peer(
         self,

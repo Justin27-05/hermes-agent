@@ -17,6 +17,13 @@ from hermes_cli.project_policy import (
     approval_class_for_action,
     canonicalize_targets,
 )
+from hermes_cli.project_lineage import (
+    ProjectConversation,
+    SurfaceBinding,
+    make_child_conversation,
+    make_root_conversation,
+    make_surface_binding,
+)
 from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 
 
@@ -288,6 +295,12 @@ CREATE TABLE IF NOT EXISTS project_worker_leases (
 );
 """
 
+LINEAGE_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_conversations_one_root
+ON project_conversations(project_id)
+WHERE parent_conversation_id IS NULL;
+"""
+
 
 Lifecycle = Literal["active", "awaiting_acceptance", "completed"]
 ApprovalStatus = Literal["pending", "approved", "denied", "expired"]
@@ -330,6 +343,22 @@ class ApprovalRequest:
 
 class ApprovalConflictError(ValueError):
     """An approval id or immutable batch boundary conflicts with stored state."""
+
+
+class LineageConflictError(ValueError):
+    """A project already has lineage or the requested lineage conflicts."""
+
+
+class LineageMigrationError(RuntimeError):
+    """Persisted lineage is malformed and cannot be selected or repaired."""
+
+
+class BindingConflictError(ValueError):
+    """A binding identity collides with a different immutable tuple."""
+
+
+class _StaleConversationTip(RuntimeError):
+    """Internal rollback sentinel for a failed child-tip compare-and-swap."""
 
 
 def runtime_state_from_row(row: sqlite3.Row) -> RuntimeState:
@@ -380,6 +409,76 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     execute_schema_statements(conn, RUNTIME_SCHEMA_SQL)
     _ensure_runtime_state_columns(conn)
     _ensure_approval_columns(conn)
+    _validate_existing_lineage(conn)
+    try:
+        execute_schema_statements(conn, LINEAGE_INDEX_SQL)
+    except sqlite3.IntegrityError as exc:
+        raise LineageMigrationError(
+            "multiple conversation roots exist for one project"
+        ) from exc
+
+
+def _validate_existing_lineage(conn: sqlite3.Connection) -> None:
+    """Fail closed when additive migration encounters malformed lineage."""
+    malformed_conversation = conn.execute(
+        """
+        SELECT conversation.conversation_id
+        FROM project_conversations AS conversation
+        LEFT JOIN project_conversations AS root
+          ON root.project_id = conversation.project_id
+         AND root.conversation_id = conversation.root_conversation_id
+         AND root.parent_conversation_id IS NULL
+         AND root.root_conversation_id = root.conversation_id
+        LEFT JOIN project_conversations AS parent
+          ON parent.project_id = conversation.project_id
+         AND parent.conversation_id = conversation.parent_conversation_id
+         AND parent.root_conversation_id = conversation.root_conversation_id
+        WHERE (
+                conversation.parent_conversation_id IS NULL
+                AND (
+                    conversation.root_conversation_id IS NULL
+                    OR conversation.root_conversation_id
+                       <> conversation.conversation_id
+                )
+              )
+           OR (
+                conversation.parent_conversation_id IS NOT NULL
+                AND (
+                    conversation.conversation_id
+                       = conversation.parent_conversation_id
+                    OR conversation.root_conversation_id IS NULL
+                    OR root.conversation_id IS NULL
+                    OR parent.conversation_id IS NULL
+                )
+              )
+        LIMIT 1
+        """
+    ).fetchone()
+    if malformed_conversation is not None:
+        raise LineageMigrationError("malformed project conversation lineage")
+
+    malformed_state = conn.execute(
+        """
+        SELECT state.project_id
+        FROM project_runtime_state AS state
+        LEFT JOIN project_conversations AS root
+          ON root.project_id = state.project_id
+         AND root.conversation_id = state.conversation_root_id
+         AND root.parent_conversation_id IS NULL
+         AND root.root_conversation_id = root.conversation_id
+        LEFT JOIN project_conversations AS tip
+          ON tip.project_id = state.project_id
+         AND tip.conversation_id = state.conversation_tip_id
+         AND tip.root_conversation_id = state.conversation_root_id
+        WHERE state.conversation_root_id IS NULL
+           OR state.conversation_tip_id IS NULL
+           OR root.conversation_id IS NULL
+           OR tip.conversation_id IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if malformed_state is not None:
+        raise LineageMigrationError("runtime state has dangling project lineage")
 
 
 def _ensure_runtime_state_columns(conn: sqlite3.Connection) -> None:
@@ -451,6 +550,103 @@ def runtime_state_for_project(
     return _runtime_state_for_project(conn, project_id)
 
 
+def _conversation_from_row(row: sqlite3.Row) -> ProjectConversation:
+    if row["parent_conversation_id"] is None:
+        conversation = make_root_conversation(
+            project_id=row["project_id"],
+            conversation_id=row["conversation_id"],
+            created_at=row["created_at"],
+        )
+    else:
+        conversation = make_child_conversation(
+            project_id=row["project_id"],
+            conversation_id=row["conversation_id"],
+            parent_conversation_id=row["parent_conversation_id"],
+            root_conversation_id=row["root_conversation_id"],
+            created_at=row["created_at"],
+        )
+    if conversation.root_conversation_id != row["root_conversation_id"]:
+        raise LineageMigrationError("stored root is not a canonical self-root")
+    return conversation
+
+
+def lineage_for_project(
+    conn: sqlite3.Connection, *, project_id: str
+) -> tuple[ProjectConversation, ...]:
+    """Read one project's validated lineage as immutable records."""
+    if type(project_id) is not str or not project_id:
+        raise ValueError("project_id must be a non-empty string")
+    rows = conn.execute(
+        """
+        SELECT * FROM project_conversations
+        WHERE project_id = ?
+        ORDER BY created_at, conversation_id
+        """,
+        (project_id,),
+    ).fetchall()
+    return tuple(_conversation_from_row(row) for row in rows)
+
+
+def create_project_conversation(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    conversation_id: str,
+    current_phase: str,
+    now: int,
+) -> ProjectConversation:
+    """Atomically adopt a project with exactly one self-root conversation."""
+    root = make_root_conversation(
+        project_id=project_id,
+        conversation_id=conversation_id,
+        created_at=now,
+    )
+    if type(current_phase) is not str or not current_phase:
+        raise ValueError("current_phase must be a non-empty string")
+    with write_transaction(conn):
+        if _runtime_state_for_project(conn, project_id) is not None:
+            raise LineageConflictError("project runtime state already exists")
+        if conn.execute(
+            """
+            SELECT 1 FROM project_conversations
+            WHERE project_id = ?
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone() is not None:
+            raise LineageConflictError("project conversation lineage already exists")
+        conn.execute(
+            """
+            INSERT INTO project_conversations (
+                conversation_id, project_id, parent_conversation_id,
+                root_conversation_id, created_at
+            ) VALUES (?, ?, NULL, ?, ?)
+            """,
+            (
+                root.conversation_id,
+                root.project_id,
+                root.root_conversation_id,
+                root.created_at,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_runtime_state (
+                project_id, lifecycle, current_phase, version,
+                conversation_root_id, conversation_tip_id, updated_at
+            ) VALUES (?, 'active', ?, 0, ?, ?, ?)
+            """,
+            (
+                root.project_id,
+                current_phase,
+                root.conversation_id,
+                root.conversation_id,
+                now,
+            ),
+        )
+    return root
+
+
 def create_runtime_state(
     conn: sqlite3.Connection,
     *,
@@ -460,32 +656,255 @@ def create_runtime_state(
     conversation_tip_id: str,
     updated_at: int,
 ) -> RuntimeState:
-    """Explicitly adopt a catalog project into the active runtime lifecycle."""
-    if type(current_phase) is not str or not current_phase:
-        raise ValueError("current_phase must be a non-empty string")
-    conn.execute(
-        """
-        INSERT INTO project_runtime_state (
-            project_id,
-            lifecycle,
-            current_phase,
-            version,
-            conversation_root_id,
-            conversation_tip_id,
-            updated_at
-        ) VALUES (?, 'active', ?, 0, ?, ?, ?)
-        """,
-        (
-            project_id,
-            current_phase,
-            conversation_root_id,
-            conversation_tip_id,
-            updated_at,
-        ),
+    """Compatibility wrapper for canonical self-root project adoption."""
+    if not (
+        type(conversation_root_id) is str
+        and conversation_root_id
+        and type(conversation_tip_id) is str
+        and conversation_tip_id
+        and conversation_root_id == conversation_tip_id
+    ):
+        raise ValueError(
+            "conversation root and tip must be the same non-empty string"
+        )
+    create_project_conversation(
+        conn,
+        project_id=project_id,
+        conversation_id=conversation_root_id,
+        current_phase=current_phase,
+        now=updated_at,
     )
     state = _runtime_state_for_project(conn, project_id)
     assert state is not None
     return state
+
+
+def advance_conversation_tip(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    expected_tip_id: str,
+    child_conversation_id: str,
+    now: int,
+) -> ProjectConversation | None:
+    """Publish one compression child and atomically move only the current tip."""
+    if not (
+        type(project_id) is str
+        and project_id
+        and type(expected_tip_id) is str
+        and expected_tip_id
+    ):
+        raise ValueError("project_id and expected_tip_id must be non-empty strings")
+    try:
+        with write_transaction(conn):
+            state = _runtime_state_for_project(conn, project_id)
+            if not (
+                state is not None
+                and state.lifecycle == "active"
+                and type(state.current_phase) is str
+                and bool(state.current_phase)
+                and type(state.conversation_root_id) is str
+                and bool(state.conversation_root_id)
+                and state.conversation_tip_id == expected_tip_id
+            ):
+                return None
+            expected = conn.execute(
+                """
+                SELECT * FROM project_conversations
+                WHERE project_id = ?
+                  AND conversation_id = ?
+                  AND root_conversation_id = ?
+                """,
+                (
+                    project_id,
+                    expected_tip_id,
+                    state.conversation_root_id,
+                ),
+            ).fetchone()
+            if expected is None:
+                return None
+            _conversation_from_row(expected)
+            child = make_child_conversation(
+                project_id=project_id,
+                conversation_id=child_conversation_id,
+                parent_conversation_id=expected_tip_id,
+                root_conversation_id=state.conversation_root_id,
+                created_at=now,
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO project_conversations (
+                        conversation_id, project_id, parent_conversation_id,
+                        root_conversation_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        child.conversation_id,
+                        child.project_id,
+                        child.parent_conversation_id,
+                        child.root_conversation_id,
+                        child.created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise LineageConflictError(
+                    "child conversation identity already exists"
+                ) from exc
+            cursor = conn.execute(
+                """
+                UPDATE project_runtime_state
+                SET conversation_tip_id = ?,
+                    version = version + 1,
+                    updated_at = ?
+                WHERE project_id = ?
+                  AND lifecycle = 'active'
+                  AND conversation_root_id = ?
+                  AND conversation_tip_id = ?
+                  AND version = ?
+                """,
+                (
+                    child.conversation_id,
+                    now,
+                    project_id,
+                    state.conversation_root_id,
+                    expected_tip_id,
+                    state.version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise _StaleConversationTip
+        return child
+    except _StaleConversationTip:
+        return None
+
+
+def _binding_from_row(row: sqlite3.Row) -> SurfaceBinding:
+    return make_surface_binding(
+        binding_id=row["binding_id"],
+        project_id=row["project_id"],
+        surface=row["surface"],
+        external_binding_id=row["external_binding_id"],
+        actor_id=row["actor_id"],
+        created_at=row["created_at"],
+    )
+
+
+def binding_for_id(
+    conn: sqlite3.Connection, *, project_id: str, binding_id: str
+) -> SurfaceBinding | None:
+    """Read a binding only through its owning project scope."""
+    if not all(type(value) is str and value for value in (project_id, binding_id)):
+        raise ValueError("project_id and binding_id must be non-empty strings")
+    row = conn.execute(
+        """
+        SELECT * FROM project_surface_bindings
+        WHERE project_id = ? AND binding_id = ?
+        """,
+        (project_id, binding_id),
+    ).fetchone()
+    return _binding_from_row(row) if row is not None else None
+
+
+def binding_for_external_identity(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    surface: str,
+    external_binding_id: str,
+) -> SurfaceBinding | None:
+    """Read an external binding only within the expected project scope."""
+    probe = make_surface_binding(
+        binding_id="probe",
+        project_id=project_id,
+        surface=surface,
+        external_binding_id=external_binding_id,
+        actor_id="probe",
+        created_at=0,
+    )
+    row = conn.execute(
+        """
+        SELECT * FROM project_surface_bindings
+        WHERE project_id = ?
+          AND surface = ?
+          AND external_binding_id = ?
+        """,
+        (probe.project_id, probe.surface, probe.external_binding_id),
+    ).fetchone()
+    return _binding_from_row(row) if row is not None else None
+
+
+def bindings_for_project(
+    conn: sqlite3.Connection, *, project_id: str
+) -> tuple[SurfaceBinding, ...]:
+    """Read all immutable surface identities for one project."""
+    if type(project_id) is not str or not project_id:
+        raise ValueError("project_id must be a non-empty string")
+    rows = conn.execute(
+        """
+        SELECT * FROM project_surface_bindings
+        WHERE project_id = ?
+        ORDER BY created_at, binding_id
+        """,
+        (project_id,),
+    ).fetchall()
+    return tuple(_binding_from_row(row) for row in rows)
+
+
+def bind_surface(
+    conn: sqlite3.Connection,
+    *,
+    binding_id: str,
+    project_id: str,
+    surface: str,
+    external_binding_id: str,
+    actor_id: str,
+    now: int,
+) -> SurfaceBinding:
+    """Insert-or-read one complete immutable Desktop/Discord binding tuple."""
+    binding = make_surface_binding(
+        binding_id=binding_id,
+        project_id=project_id,
+        surface=surface,
+        external_binding_id=external_binding_id,
+        actor_id=actor_id,
+        created_at=now,
+    )
+    with write_transaction(conn):
+        conn.execute(
+            """
+            INSERT INTO project_surface_bindings (
+                binding_id, project_id, surface, external_binding_id,
+                actor_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                binding.binding_id,
+                binding.project_id,
+                binding.surface,
+                binding.external_binding_id,
+                binding.actor_id,
+                binding.created_at,
+            ),
+        )
+        rows = conn.execute(
+            """
+            SELECT * FROM project_surface_bindings
+            WHERE binding_id = ?
+               OR (surface = ? AND external_binding_id = ?)
+            """,
+            (
+                binding.binding_id,
+                binding.surface,
+                binding.external_binding_id,
+            ),
+        ).fetchall()
+        if len(rows) != 1 or _binding_from_row(rows[0]) != binding:
+            raise BindingConflictError(
+                "binding id or external identity already has another tuple"
+            )
+    return binding
 
 
 _ALLOWED_SOURCES_BY_TARGET: dict[Lifecycle, tuple[Lifecycle, ...]] = {

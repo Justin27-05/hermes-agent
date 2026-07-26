@@ -3305,3 +3305,28 @@ def build_session_context(
         context.updated_at = session_entry.updated_at
     
     return context
+
+
+def build_project_session_context(
+    source: SessionSource,
+    canonical_session_id: str,
+    config: GatewayConfig,
+    route_entry: Optional[SessionEntry] = None,
+) -> SessionContext:
+    """Build per-turn context for an explicitly resolved project session.
+
+    ``route_entry`` contributes only stable route metadata. Its legacy
+    session identity and singular origin remain unchanged and do not decide
+    the current turn's source.
+    """
+    if not isinstance(source, SessionSource):
+        raise ValueError("source must be a SessionSource")
+    if (
+        type(canonical_session_id) is not str
+        or not canonical_session_id
+        or _is_path_unsafe(canonical_session_id)
+    ):
+        raise ValueError("Invalid canonical session_id")
+    context = build_session_context(source, config, route_entry)
+    context.session_id = canonical_session_id
+    return context

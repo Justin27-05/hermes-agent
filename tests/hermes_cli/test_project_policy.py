@@ -40,6 +40,11 @@ OWNER = ActorContext(
     binding_id="desktop-1",
     is_owner=True,
 )
+UNHASHABLE_ENUM_VALUES = (
+    pytest.param([], id="list"),
+    pytest.param({}, id="dict"),
+    pytest.param(set(), id="set"),
+)
 WINDOWS_RESERVED_DEVICE_BASENAMES = (
     "CON",
     "PRN",
@@ -491,6 +496,32 @@ def test_unknown_lifecycle_is_denied_with_the_stable_phase_rule():
     assert result.rule_id == "policy.phase.invalid"
 
 
+@pytest.mark.parametrize("malformed_lifecycle", UNHASHABLE_ENUM_VALUES)
+def test_unhashable_project_lifecycle_is_denied(malformed_lifecycle):
+    result = decide(
+        _command("status"),
+        replace(PROJECT, lifecycle=malformed_lifecycle),
+        _contract("status"),
+        OWNER,
+    )
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.phase.invalid"
+
+
+@pytest.mark.parametrize("malformed_surface", UNHASHABLE_ENUM_VALUES)
+def test_unhashable_actor_surface_is_denied(malformed_surface):
+    result = decide(
+        _command("status"),
+        PROJECT,
+        _contract("status"),
+        replace(OWNER, surface=malformed_surface),
+    )
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.actor.unknown"
+
+
 @pytest.mark.parametrize(
     ("name", "action_class"),
     [
@@ -585,6 +616,11 @@ def test_windows_reserved_device_components_are_not_command_targets(component):
         pytest.param("cOm¹.bin", id="mixed-case-superscript"),
         pytest.param("ordinary.", id="trailing-dot"),
         pytest.param("ordinary ", id="trailing-space"),
+        pytest.param(" secret.txt", id="leading-space"),
+        pytest.param(" NUL", id="leading-space-device"),
+        pytest.param("NUL .txt", id="device-one-pre-extension-space"),
+        pytest.param("cOm1  .LoG", id="device-multiple-pre-extension-spaces"),
+        pytest.param("lPt9 .cfg", id="lpt-pre-extension-space"),
         *[
             pytest.param(f"bad{character}name", id=f"forbidden-{ord(character):02x}")
             for character in '<>:"|?*\\'
@@ -614,6 +650,11 @@ def test_windows_components_with_nonliteral_win32_identity_are_denied(component)
         pytest.param("ordinary.", id="trailing-dot"),
         pytest.param("bad|name", id="forbidden-character"),
         pytest.param("bad\x1fname", id="control-character"),
+        pytest.param(" secret.txt", id="leading-space"),
+        pytest.param(" NUL", id="leading-space-device"),
+        pytest.param("NUL .txt", id="device-one-pre-extension-space"),
+        pytest.param("cOm1  .LoG", id="device-multiple-pre-extension-spaces"),
+        pytest.param("lPt9 .cfg", id="lpt-pre-extension-space"),
     ],
 )
 def test_windows_roots_with_nonliteral_win32_identity_are_unapproved(component):
@@ -629,11 +670,22 @@ def test_windows_roots_with_nonliteral_win32_identity_are_unapproved(component):
     assert result.rule_id == "policy.contract.unapproved"
 
 
-def test_posix_reserved_device_spelling_remains_an_ordinary_component():
-    project = replace(PROJECT, roots=("/workspace/COM1",))
+@pytest.mark.parametrize(
+    "component",
+    [
+        pytest.param("COM1", id="reserved-spelling"),
+        pytest.param(" secret.txt", id="leading-space"),
+        pytest.param(" NUL", id="leading-space-device-spelling"),
+        pytest.param("NUL .txt", id="device-one-pre-extension-space"),
+        pytest.param("cOm1  .LoG", id="device-multiple-pre-extension-spaces"),
+        pytest.param("lPt9 .cfg", id="lpt-pre-extension-space"),
+    ],
+)
+def test_posix_win32_alias_spellings_remain_ordinary_components(component):
+    project = replace(PROJECT, roots=(f"/workspace/{component}",))
     command = _command(
         "local_code_edit",
-        targets=("/workspace/COM1/file.py",),
+        targets=(f"/workspace/{component}/file.py",),
     )
 
     result = decide(command, project, _contract("local_code_edit"), OWNER)

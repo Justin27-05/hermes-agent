@@ -504,6 +504,8 @@ def transition_lifecycle(
     updated_at: int,
 ) -> Optional[RuntimeState]:
     """Apply one legal lifecycle edge with optimistic compare-and-swap."""
+    if type(lifecycle) is not str or not lifecycle:
+        return None
     allowed_sources = _ALLOWED_SOURCES_BY_TARGET.get(lifecycle)
     if allowed_sources is None:
         return None
@@ -643,11 +645,15 @@ def _approval_storage_values(
         or request.expected_runtime_version < 0
     ):
         raise ValueError("expected_runtime_version must be a non-negative integer")
-    if request.expected_lifecycle not in {
-        "active",
-        "awaiting_acceptance",
-        "completed",
-    }:
+    if (
+        type(request.expected_lifecycle) is not str
+        or not request.expected_lifecycle
+        or request.expected_lifecycle not in {
+            "active",
+            "awaiting_acceptance",
+            "completed",
+        }
+    ):
         raise ValueError("expected_lifecycle must be a valid lifecycle")
     if type(request.expected_phase) is not str or not request.expected_phase:
         raise ValueError("expected_phase must be a non-empty string")
@@ -826,6 +832,8 @@ def resolve_approval(
     """Resolve once through an exact durable Desktop/Discord owner binding."""
     if not (
         isinstance(resolver, ActorContext)
+        and type(resolver.surface) is str
+        and bool(resolver.surface)
         and resolver.surface in {"desktop", "discord"}
         and resolver.is_owner is True
         and type(resolver.actor_id) is str
@@ -834,6 +842,8 @@ def resolve_approval(
         and bool(resolver.binding_id)
         and type(approval_id) is str
         and bool(approval_id)
+        and type(outcome) is str
+        and bool(outcome)
         and outcome in {"approved", "denied"}
         and type(now) is int
     ):
@@ -922,6 +932,8 @@ def _approval_match_parameters(
     if (
         type(expected_runtime_version) is not int
         or expected_runtime_version < 0
+        or type(expected_lifecycle) is not str
+        or not expected_lifecycle
         or expected_lifecycle not in {
             "active",
             "awaiting_acceptance",

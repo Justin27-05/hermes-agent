@@ -29,6 +29,11 @@ RUNTIME_TABLES = {
     "project_operations",
     "project_worker_leases",
 }
+UNHASHABLE_ENUM_VALUES = (
+    pytest.param([], id="list"),
+    pytest.param({}, id="dict"),
+    pytest.param(set(), id="set"),
+)
 
 
 def _connect_db(db_path):
@@ -698,6 +703,29 @@ def test_stale_expected_version_does_not_change_runtime_state(runtime_conn):
     assert prdb.runtime_state_for_project(runtime_conn, "p_stale") == original
 
 
+@pytest.mark.parametrize("malformed_lifecycle", UNHASHABLE_ENUM_VALUES)
+def test_lifecycle_transition_rejects_unhashable_target_without_mutation(
+    runtime_conn, malformed_lifecycle
+):
+    original = _insert_approval_project(
+        runtime_conn, project_id="p_malformed_lifecycle"
+    )
+
+    result = prdb.transition_lifecycle(
+        runtime_conn,
+        project_id=original.project_id,
+        expected_version=original.version,
+        lifecycle=malformed_lifecycle,
+        updated_at=2,
+    )
+
+    assert result is None
+    assert (
+        prdb.runtime_state_for_project(runtime_conn, original.project_id)
+        == original
+    )
+
+
 def test_concurrent_accept_and_reopen_have_exactly_one_cas_winner(tmp_path):
     db_path = tmp_path / "projects.db"
     conn = _create_runtime_db(db_path)
@@ -1189,6 +1217,23 @@ def test_create_approval_rejects_invalid_or_stale_runtime_snapshot(
     ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("expected_lifecycle", UNHASHABLE_ENUM_VALUES)
+def test_create_approval_rejects_unhashable_lifecycle_without_a_row(
+    runtime_conn, expected_lifecycle
+):
+    _insert_approval_project(runtime_conn)
+    request = dataclasses.replace(
+        _approval_request(), expected_lifecycle=expected_lifecycle
+    )
+
+    with pytest.raises(ValueError):
+        prdb.create_approval_request(runtime_conn, request, now=10)
+
+    assert runtime_conn.execute(
+        "SELECT COUNT(*) FROM project_approvals"
+    ).fetchone()[0] == 0
+
+
 def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
     runtime_conn,
 ):
@@ -1221,6 +1266,43 @@ def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
     authorization = _authorization_args(request)
     assert prdb.consume_approval_authorization(runtime_conn, **authorization) is True
     assert prdb.consume_approval_authorization(runtime_conn, **authorization) is False
+
+
+@pytest.mark.parametrize("malformed_value", UNHASHABLE_ENUM_VALUES)
+@pytest.mark.parametrize("field", ["resolver.surface", "outcome"])
+def test_resolve_rejects_unhashable_enum_inputs_without_mutation(
+    runtime_conn, field, malformed_value
+):
+    _insert_approval_project(runtime_conn)
+    _insert_owner_binding(runtime_conn)
+    request = prdb.create_approval_request(
+        runtime_conn, _approval_request(), now=10
+    )
+    resolver = OWNER_RESOLVER
+    outcome = "approved"
+    if field == "resolver.surface":
+        resolver = dataclasses.replace(resolver, surface=malformed_value)
+    else:
+        outcome = malformed_value
+
+    resolved = prdb.resolve_approval(
+        runtime_conn,
+        approval_id=request.approval_id,
+        resolver=resolver,
+        outcome=outcome,
+        now=11,
+    )
+
+    row = runtime_conn.execute(
+        """
+        SELECT status, resolved_at, resolved_by_actor_id
+        FROM project_approvals
+        WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    ).fetchone()
+    assert resolved is None
+    assert tuple(row) == ("pending", None, None)
 
 
 @pytest.mark.parametrize("drift", ["lifecycle", "phase"])
@@ -1378,6 +1460,21 @@ def test_approval_never_authorizes_a_different_project_revision_or_batch(
     assert prdb.consume_approval_authorization(runtime_conn, **authorization) is False
 
 
+@pytest.mark.parametrize("expected_lifecycle", UNHASHABLE_ENUM_VALUES)
+def test_consume_rejects_unhashable_lifecycle_without_consuming(
+    runtime_conn, expected_lifecycle
+):
+    _insert_approval_project(runtime_conn)
+    request = _create_approved_request(runtime_conn)
+    authorization = _authorization_args(request, now=12)
+    authorization["expected_lifecycle"] = expected_lifecycle
+
+    assert prdb.consume_approval_authorization(
+        runtime_conn, **authorization
+    ) is False
+    assert _consumed_at(runtime_conn, request) is None
+
+
 @pytest.mark.parametrize(
     ("stored_component", "mismatched_codepoint"),
     [
@@ -1501,6 +1598,11 @@ def test_approval_request_rejects_noncanonical_or_duplicate_targets(
         pytest.param("cOm¹.bin", id="reserved-superscript-extension"),
         pytest.param("ordinary.", id="trailing-dot"),
         pytest.param("ordinary ", id="trailing-space"),
+        pytest.param(" secret.txt", id="leading-space"),
+        pytest.param(" NUL", id="leading-space-device"),
+        pytest.param("NUL .txt", id="device-one-pre-extension-space"),
+        pytest.param("cOm1  .LoG", id="device-multiple-pre-extension-spaces"),
+        pytest.param("lPt9 .cfg", id="lpt-pre-extension-space"),
         *[
             pytest.param(f"bad{character}name", id=f"forbidden-{ord(character):02x}")
             for character in '<>:"|?*\\'
@@ -1523,17 +1625,32 @@ def test_approval_request_rejects_nonliteral_win32_target_identity(
     with pytest.raises(ValueError):
         prdb.create_approval_request(runtime_conn, request, now=10)
 
+    assert runtime_conn.execute(
+        "SELECT COUNT(*) FROM project_approvals"
+    ).fetchone()[0] == 0
 
-def test_approval_request_accepts_posix_reserved_device_spelling(runtime_conn):
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        pytest.param("COM1", id="reserved-spelling"),
+        pytest.param(" secret.txt", id="leading-space"),
+        pytest.param(" NUL", id="leading-space-device-spelling"),
+        pytest.param("NUL .txt", id="device-one-pre-extension-space"),
+        pytest.param("cOm1  .LoG", id="device-multiple-pre-extension-spaces"),
+        pytest.param("lPt9 .cfg", id="lpt-pre-extension-space"),
+    ],
+)
+def test_approval_accepts_posix_win32_alias_spelling(runtime_conn, component):
     _insert_approval_project(runtime_conn)
     request = dataclasses.replace(
         _approval_request(),
-        targets=("/workspace/COM1/file.py",),
+        targets=(f"/workspace/{component}",),
     )
 
     created = prdb.create_approval_request(runtime_conn, request, now=10)
 
-    assert created.targets == ("/workspace/COM1/file.py",)
+    assert created.targets == (f"/workspace/{component}",)
 
 
 def test_concurrent_consumers_cannot_replay_one_approval(tmp_path):

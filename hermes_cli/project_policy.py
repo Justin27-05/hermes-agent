@@ -48,7 +48,7 @@ _WINDOWS_RESERVED_DEVICE_BASENAMES = frozenset(
 
 
 def _windows_component_is_valid(component: str) -> bool:
-    if component.endswith((" ", ".")):
+    if component.startswith(" ") or component.endswith((" ", ".")):
         return False
     if any(
         ord(character) <= 0x1F
@@ -56,7 +56,8 @@ def _windows_component_is_valid(component: str) -> bool:
         for character in component
     ):
         return False
-    basename = component.split(".", 1)[0].translate(_ASCII_UPPER_TRANSLATION)
+    basename = component.partition(".")[0].rstrip(" ")
+    basename = basename.translate(_ASCII_UPPER_TRANSLATION)
     return basename not in _WINDOWS_RESERVED_DEVICE_BASENAMES
 
 
@@ -292,6 +293,7 @@ def _valid_actor_for_project(
         isinstance(actor, ActorContext)
         and isinstance(project, ProjectPolicyView)
         and _is_text(actor.actor_id)
+        and _is_text(actor.surface)
         and actor.surface in {"desktop", "discord"}
         and _is_text(actor.binding_id)
         and actor.is_owner is True
@@ -376,7 +378,7 @@ def _phase_is_valid(
 def _lifecycle_allows_action(
     project: ProjectPolicyView, action_class: str
 ) -> bool:
-    if project.lifecycle not in {
+    if not _is_text(project.lifecycle) or project.lifecycle not in {
         "active",
         "awaiting_acceptance",
         "completed",

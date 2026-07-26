@@ -40,6 +40,23 @@ OWNER = ActorContext(
     binding_id="desktop-1",
     is_owner=True,
 )
+WINDOWS_RESERVED_DEVICE_BASENAMES = (
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CLOCK$",
+    "CONIN$",
+    "CONOUT$",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+    "COM¹",
+    "COM²",
+    "COM³",
+    "LPT¹",
+    "LPT²",
+    "LPT³",
+)
 
 
 def _contract(*action_classes: str) -> ContractPolicyView:
@@ -531,6 +548,93 @@ def test_noncanonical_paths_are_denied_before_scope_authorization(target):
 def test_component_containment_handles_drive_and_filesystem_roots(root, target):
     project = replace(PROJECT, roots=(root,))
     command = _command("local_code_edit", targets=(target,))
+
+    result = decide(command, project, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.ALLOW
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        pytest.param(
+            f"{basename}{suffix}",
+            id=f"device-{index}-{suffix or 'bare'}",
+        )
+        for index, basename in enumerate(WINDOWS_RESERVED_DEVICE_BASENAMES)
+        for suffix in ("", ".txt")
+    ],
+)
+def test_windows_reserved_device_components_are_not_command_targets(component):
+    command = _command(
+        "local_code_edit",
+        targets=(f"{ROOT}/{component}",),
+    )
+
+    result = decide(command, PROJECT, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.command.ambiguous"
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        pytest.param("cOn.TxT", id="mixed-case-extension"),
+        pytest.param("cLoCk$.log", id="mixed-case-clock"),
+        pytest.param("cOm¹.bin", id="mixed-case-superscript"),
+        pytest.param("ordinary.", id="trailing-dot"),
+        pytest.param("ordinary ", id="trailing-space"),
+        *[
+            pytest.param(f"bad{character}name", id=f"forbidden-{ord(character):02x}")
+            for character in '<>:"|?*\\'
+        ],
+        *[
+            pytest.param(f"bad{chr(codepoint)}name", id=f"control-{codepoint:02x}")
+            for codepoint in range(0x20)
+        ],
+    ],
+)
+def test_windows_components_with_nonliteral_win32_identity_are_denied(component):
+    command = _command(
+        "local_code_edit",
+        targets=(f"{ROOT}/{component}",),
+    )
+
+    result = decide(command, PROJECT, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.command.ambiguous"
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        pytest.param("NUL.txt", id="reserved-device"),
+        pytest.param("ordinary.", id="trailing-dot"),
+        pytest.param("bad|name", id="forbidden-character"),
+        pytest.param("bad\x1fname", id="control-character"),
+    ],
+)
+def test_windows_roots_with_nonliteral_win32_identity_are_unapproved(component):
+    project = replace(PROJECT, roots=(f"C:/work/{component}",))
+    command = _command(
+        "local_code_edit",
+        targets=(f"{ROOT}/file.py",),
+    )
+
+    result = decide(command, project, _contract("local_code_edit"), OWNER)
+
+    assert result.decision is Decision.DENY
+    assert result.rule_id == "policy.contract.unapproved"
+
+
+def test_posix_reserved_device_spelling_remains_an_ordinary_component():
+    project = replace(PROJECT, roots=("/workspace/COM1",))
+    command = _command(
+        "local_code_edit",
+        targets=("/workspace/COM1/file.py",),
+    )
 
     result = decide(command, project, _contract("local_code_edit"), OWNER)
 

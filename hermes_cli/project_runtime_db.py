@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS project_runtime_state (
                                     'completed'
                                 )
                             ),
+    current_phase           TEXT NOT NULL
+                            CHECK (length(current_phase) > 0),
     version                 INTEGER NOT NULL,
     conversation_root_id    TEXT,
     conversation_tip_id     TEXT,
@@ -156,6 +158,21 @@ CREATE TABLE IF NOT EXISTS project_approvals (
     canonical_action    TEXT NOT NULL,
     approval_class      TEXT NOT NULL,
     command_revision    INTEGER NOT NULL,
+    expected_runtime_version INTEGER NOT NULL
+                        CHECK (
+                            typeof(expected_runtime_version) = 'integer'
+                            AND expected_runtime_version >= 0
+                        ),
+    expected_lifecycle  TEXT NOT NULL
+                        CHECK (
+                            expected_lifecycle IN (
+                                'active',
+                                'awaiting_acceptance',
+                                'completed'
+                            )
+                        ),
+    expected_phase      TEXT NOT NULL
+                        CHECK (length(expected_phase) > 0),
     targets_json        TEXT NOT NULL,
     batch_boundary_json TEXT NOT NULL,
     status              TEXT NOT NULL
@@ -280,6 +297,7 @@ ApprovalStatus = Literal["pending", "approved", "denied", "expired"]
 class RuntimeState:
     project_id: str
     lifecycle: Lifecycle
+    current_phase: str | None
     version: int
     conversation_root_id: Optional[str]
     conversation_tip_id: Optional[str]
@@ -297,6 +315,9 @@ class ApprovalRequest:
     canonical_action: str
     approval_class: str
     command_revision: int
+    expected_runtime_version: int | None
+    expected_lifecycle: Lifecycle | None
+    expected_phase: str | None
     targets: tuple[str, ...]
     batch_id: str
     batch_items: tuple[str, ...]
@@ -316,6 +337,7 @@ def runtime_state_from_row(row: sqlite3.Row) -> RuntimeState:
     return RuntimeState(
         project_id=row["project_id"],
         lifecycle=row["lifecycle"],
+        current_phase=row["current_phase"],
         version=row["version"],
         conversation_root_id=row["conversation_root_id"],
         conversation_tip_id=row["conversation_tip_id"],
@@ -356,7 +378,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create all additive ProjectRuntime tables without adopting projects."""
     conn.execute("PRAGMA foreign_keys=ON")
     execute_schema_statements(conn, RUNTIME_SCHEMA_SQL)
+    _ensure_runtime_state_columns(conn)
     _ensure_approval_columns(conn)
+
+
+def _ensure_runtime_state_columns(conn: sqlite3.Connection) -> None:
+    """Expose phase authority on legacy state rows without inferring a value."""
+    add_column_if_missing(
+        conn,
+        "project_runtime_state",
+        "current_phase",
+        "current_phase TEXT",
+    )
 
 
 def _ensure_approval_columns(conn: sqlite3.Connection) -> None:
@@ -366,6 +399,9 @@ def _ensure_approval_columns(conn: sqlite3.Connection) -> None:
         ("canonical_action", "canonical_action TEXT"),
         ("resolved_by_actor_id", "resolved_by_actor_id TEXT"),
         ("consumed_at", "consumed_at INTEGER"),
+        ("expected_runtime_version", "expected_runtime_version INTEGER"),
+        ("expected_lifecycle", "expected_lifecycle TEXT"),
+        ("expected_phase", "expected_phase TEXT"),
     ):
         add_column_if_missing(
             conn,
@@ -419,24 +455,29 @@ def create_runtime_state(
     conn: sqlite3.Connection,
     *,
     project_id: str,
+    current_phase: str,
     conversation_root_id: str,
     conversation_tip_id: str,
     updated_at: int,
 ) -> RuntimeState:
     """Explicitly adopt a catalog project into the active runtime lifecycle."""
+    if type(current_phase) is not str or not current_phase:
+        raise ValueError("current_phase must be a non-empty string")
     conn.execute(
         """
         INSERT INTO project_runtime_state (
             project_id,
             lifecycle,
+            current_phase,
             version,
             conversation_root_id,
             conversation_tip_id,
             updated_at
-        ) VALUES (?, 'active', 0, ?, ?, ?)
+        ) VALUES (?, 'active', ?, 0, ?, ?, ?)
         """,
         (
             project_id,
+            current_phase,
             conversation_root_id,
             conversation_tip_id,
             updated_at,
@@ -488,6 +529,47 @@ def transition_lifecycle(
     return _runtime_state_for_project(conn, project_id)
 
 
+def transition_current_phase(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    expected_version: int,
+    current_phase: str,
+    updated_at: int,
+) -> Optional[RuntimeState]:
+    """Initialize or change the durable phase through an exact version CAS."""
+    if not (
+        type(project_id) is str
+        and bool(project_id)
+        and type(expected_version) is int
+        and expected_version >= 0
+        and type(current_phase) is str
+        and bool(current_phase)
+        and type(updated_at) is int
+    ):
+        return None
+    with write_transaction(conn):
+        cursor = conn.execute(
+            """
+            UPDATE project_runtime_state
+            SET current_phase = ?, version = version + 1, updated_at = ?
+            WHERE project_id = ?
+              AND version = ?
+              AND (current_phase IS NULL OR current_phase <> ?)
+            """,
+            (
+                current_phase,
+                updated_at,
+                project_id,
+                expected_version,
+                current_phase,
+            ),
+        )
+        if cursor.rowcount != 1:
+            return None
+        return _runtime_state_for_project(conn, project_id)
+
+
 def _canonical_items(values: object, *, field_name: str) -> tuple[str, ...]:
     if not isinstance(values, tuple) or not values:
         raise ValueError(f"{field_name} must be a non-empty tuple")
@@ -508,6 +590,9 @@ def _canonical_boundary_json(
     canonical_action: str,
     batch_id: str,
     batch_items: tuple[str, ...],
+    expected_runtime_version: int,
+    expected_lifecycle: Lifecycle,
+    expected_phase: str,
 ) -> str:
     return json.dumps(
         {
@@ -515,6 +600,9 @@ def _canonical_boundary_json(
             "canonical_action": canonical_action,
             "batch_id": batch_id,
             "batch_items": batch_items,
+            "expected_runtime_version": expected_runtime_version,
+            "expected_lifecycle": expected_lifecycle,
+            "expected_phase": expected_phase,
         },
         separators=(",", ":"),
         ensure_ascii=False,
@@ -550,6 +638,19 @@ def _approval_storage_values(
         raise ValueError("canonical action and approval class do not match")
     if type(request.command_revision) is not int or request.command_revision <= 0:
         raise ValueError("command_revision must be a positive integer")
+    if (
+        type(request.expected_runtime_version) is not int
+        or request.expected_runtime_version < 0
+    ):
+        raise ValueError("expected_runtime_version must be a non-negative integer")
+    if request.expected_lifecycle not in {
+        "active",
+        "awaiting_acceptance",
+        "completed",
+    }:
+        raise ValueError("expected_lifecycle must be a valid lifecycle")
+    if type(request.expected_phase) is not str or not request.expected_phase:
+        raise ValueError("expected_phase must be a non-empty string")
     if request.status != "pending":
         raise ValueError("new approvals must be pending")
     if any(
@@ -575,6 +676,9 @@ def _approval_storage_values(
             canonical_action=request.canonical_action,
             batch_id=request.batch_id,
             batch_items=batch_items,
+            expected_runtime_version=request.expected_runtime_version,
+            expected_lifecycle=request.expected_lifecycle,
+            expected_phase=request.expected_phase,
         ),
     )
 
@@ -589,6 +693,9 @@ def _approval_from_row(row: sqlite3.Row) -> ApprovalRequest:
         canonical_action=row["canonical_action"],
         approval_class=row["approval_class"],
         command_revision=row["command_revision"],
+        expected_runtime_version=row["expected_runtime_version"],
+        expected_lifecycle=row["expected_lifecycle"],
+        expected_phase=row["expected_phase"],
         targets=tuple(json.loads(row["targets_json"])),
         batch_id=boundary["batch_id"],
         batch_items=tuple(boundary["batch_items"]),
@@ -615,6 +722,9 @@ def _row_matches_immutable_request(
         and row["canonical_action"] == request.canonical_action
         and row["approval_class"] == request.approval_class
         and row["command_revision"] == request.command_revision
+        and row["expected_runtime_version"] == request.expected_runtime_version
+        and row["expected_lifecycle"] == request.expected_lifecycle
+        and row["expected_phase"] == request.expected_phase
         and row["targets_json"] == targets_json
         and row["batch_boundary_json"] == boundary_json
         and row["expires_at"] == request.expires_at
@@ -629,16 +739,28 @@ def create_approval_request(
         request, now
     )
     with write_transaction(conn):
+        state = _runtime_state_for_project(conn, request.project_id)
+        if not (
+            state is not None
+            and state.version == request.expected_runtime_version
+            and state.lifecycle == request.expected_lifecycle
+            and state.current_phase == request.expected_phase
+        ):
+            raise ApprovalConflictError(
+                "runtime state does not match approval snapshot"
+            )
         try:
             conn.execute(
                 """
                 INSERT INTO project_approvals (
                     approval_id, project_id, actor_id, authorization_actor_id,
                     canonical_action, approval_class, command_revision,
+                    expected_runtime_version, expected_lifecycle, expected_phase,
                     targets_json, batch_boundary_json, status, expires_at,
                     resolved_at, resolved_by_actor_id, consumed_at, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?,
+                    NULL, NULL, NULL, ?
                 )
                 ON CONFLICT DO NOTHING
                 """,
@@ -650,6 +772,9 @@ def create_approval_request(
                     request.canonical_action,
                     request.approval_class,
                     request.command_revision,
+                    request.expected_runtime_version,
+                    request.expected_lifecycle,
+                    request.expected_phase,
                     targets_json,
                     boundary_json,
                     request.expires_at,
@@ -727,6 +852,14 @@ def resolve_approval(
               AND expires_at > ?
               AND EXISTS (
                   SELECT 1
+                  FROM project_runtime_state AS state
+                  WHERE state.project_id = approval.project_id
+                    AND state.version = approval.expected_runtime_version
+                    AND state.lifecycle = approval.expected_lifecycle
+                    AND state.current_phase = approval.expected_phase
+              )
+              AND EXISTS (
+                  SELECT 1
                   FROM project_surface_bindings AS binding
                   WHERE binding.project_id = approval.project_id
                     AND binding.binding_id = ?
@@ -765,6 +898,9 @@ def _approval_match_parameters(
     canonical_action: str,
     approval_class: str,
     command_revision: int,
+    expected_runtime_version: int,
+    expected_lifecycle: Lifecycle,
+    expected_phase: str,
     targets: tuple[str, ...],
     batch_id: str,
     batch_items: tuple[str, ...],
@@ -783,6 +919,18 @@ def _approval_match_parameters(
         return None
     if type(command_revision) is not int or command_revision <= 0:
         return None
+    if (
+        type(expected_runtime_version) is not int
+        or expected_runtime_version < 0
+        or expected_lifecycle not in {
+            "active",
+            "awaiting_acceptance",
+            "completed",
+        }
+        or type(expected_phase) is not str
+        or not expected_phase
+    ):
+        return None
     canonical_targets = canonicalize_targets(targets)
     if canonical_targets is None or not canonical_targets:
         return None
@@ -797,12 +945,18 @@ def _approval_match_parameters(
         canonical_action,
         approval_class,
         command_revision,
+        expected_runtime_version,
+        expected_lifecycle,
+        expected_phase,
         _canonical_json_array(canonical_targets),
         _canonical_boundary_json(
             authorization_actor_id=authorization_actor_id,
             canonical_action=canonical_action,
             batch_id=batch_id,
             batch_items=valid_items,
+            expected_runtime_version=expected_runtime_version,
+            expected_lifecycle=expected_lifecycle,
+            expected_phase=expected_phase,
         ),
     )
 
@@ -816,6 +970,9 @@ def consume_approval_authorization(
     canonical_action: str,
     approval_class: str,
     command_revision: int,
+    expected_runtime_version: int,
+    expected_lifecycle: Lifecycle,
+    expected_phase: str,
     targets: tuple[str, ...],
     batch_id: str,
     batch_items: tuple[str, ...],
@@ -831,6 +988,9 @@ def consume_approval_authorization(
         canonical_action=canonical_action,
         approval_class=approval_class,
         command_revision=command_revision,
+        expected_runtime_version=expected_runtime_version,
+        expected_lifecycle=expected_lifecycle,
+        expected_phase=expected_phase,
         targets=targets,
         batch_id=batch_id,
         batch_items=batch_items,
@@ -841,7 +1001,7 @@ def consume_approval_authorization(
         _expire_approvals(conn, now)
         cursor = conn.execute(
             """
-            UPDATE project_approvals
+            UPDATE project_approvals AS approval
             SET consumed_at = ?
             WHERE approval_id = ?
               AND project_id = ?
@@ -849,12 +1009,30 @@ def consume_approval_authorization(
               AND canonical_action = ?
               AND approval_class = ?
               AND command_revision = ?
+              AND expected_runtime_version = ?
+              AND expected_lifecycle = ?
+              AND expected_phase = ?
               AND targets_json = ?
               AND batch_boundary_json = ?
               AND status = 'approved'
               AND expires_at > ?
               AND consumed_at IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM project_runtime_state AS state
+                  WHERE state.project_id = approval.project_id
+                    AND state.version = ?
+                    AND state.lifecycle = ?
+                    AND state.current_phase = ?
+              )
             """,
-            (now, *parameters, now),
+            (
+                now,
+                *parameters,
+                now,
+                expected_runtime_version,
+                expected_lifecycle,
+                expected_phase,
+            ),
         )
     return cursor.rowcount == 1

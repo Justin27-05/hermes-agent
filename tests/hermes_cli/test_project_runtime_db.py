@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -30,11 +31,15 @@ RUNTIME_TABLES = {
 }
 
 
-@pytest.fixture
-def runtime_conn(tmp_path):
-    conn = sqlite3.connect(tmp_path / "projects.db")
+def _connect_db(db_path):
+    conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _create_runtime_db(db_path):
+    conn = _connect_db(db_path)
     conn.execute(
         """
         CREATE TABLE projects (
@@ -47,6 +52,12 @@ def runtime_conn(tmp_path):
         """
     )
     prdb.ensure_schema(conn)
+    return conn
+
+
+@pytest.fixture
+def runtime_conn(tmp_path):
+    conn = _create_runtime_db(tmp_path / "projects.db")
     try:
         yield conn
     finally:
@@ -104,8 +115,7 @@ def _insert_event(
 
 def test_migrates_existing_projects_without_changing_catalog_records(tmp_path):
     db_path = tmp_path / "projects.db"
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    conn = _connect_db(db_path)
     conn.executescript(
         """
         CREATE TABLE projects (
@@ -323,6 +333,7 @@ def test_foreign_keys_and_project_scoped_uniqueness_are_enforced(runtime_conn):
         prdb.create_runtime_state(
             runtime_conn,
             project_id="missing",
+            current_phase="implementation",
             conversation_root_id="root",
             conversation_tip_id="tip",
             updated_at=1,
@@ -456,6 +467,7 @@ def test_lifecycle_transition_graph_enforces_only_legal_edges(
         prdb.create_runtime_state(
             runtime_conn,
             project_id=project_id,
+            current_phase="implementation",
             conversation_root_id="root",
             conversation_tip_id="tip",
             updated_at=10,
@@ -497,6 +509,7 @@ def test_runtime_state_row_is_immutable(runtime_conn):
         state = prdb.create_runtime_state(
             runtime_conn,
             project_id="p_immutable",
+            current_phase="implementation",
             conversation_root_id="root",
             conversation_tip_id="tip",
             updated_at=1,
@@ -515,14 +528,149 @@ def test_runtime_state_rejects_lifecycle_outside_domain(runtime_conn):
             INSERT INTO project_runtime_state (
                 project_id,
                 lifecycle,
+                current_phase,
                 version,
                 conversation_root_id,
                 conversation_tip_id,
                 updated_at
-            ) VALUES ('p_invalid_lifecycle', 'archived', 0, 'root', 'tip', 1)
+            ) VALUES (
+                'p_invalid_lifecycle', 'archived', 'implementation',
+                0, 'root', 'tip', 1
+            )
             """
         )
     runtime_conn.rollback()
+
+
+def test_fresh_runtime_state_schema_requires_nonempty_current_phase(runtime_conn):
+    columns = {
+        row["name"]: row
+        for row in runtime_conn.execute(
+            "PRAGMA table_info(project_runtime_state)"
+        )
+    }
+
+    assert "current_phase" in columns
+    assert columns["current_phase"]["type"] == "TEXT"
+    assert columns["current_phase"]["notnull"] == 1
+
+    _insert_project(runtime_conn, "p_invalid_phase")
+    with pytest.raises(sqlite3.IntegrityError):
+        runtime_conn.execute(
+            """
+            INSERT INTO project_runtime_state (
+                project_id, lifecycle, current_phase, version,
+                conversation_root_id, conversation_tip_id, updated_at
+            ) VALUES (
+                'p_invalid_phase', 'active', '', 0, 'root', 'tip', 1
+            )
+            """
+        )
+    runtime_conn.rollback()
+
+
+@pytest.mark.parametrize(
+    ("phase_kwargs", "error"),
+    [
+        pytest.param({}, TypeError, id="missing"),
+        pytest.param({"current_phase": None}, ValueError, id="none"),
+        pytest.param({"current_phase": ""}, ValueError, id="empty"),
+        pytest.param({"current_phase": True}, ValueError, id="boolean"),
+    ],
+)
+def test_runtime_adoption_requires_a_nonempty_text_phase(
+    runtime_conn, phase_kwargs, error
+):
+    _insert_project(runtime_conn, "p_invalid_adoption_phase")
+
+    with pytest.raises(error):
+        prdb.create_runtime_state(
+            runtime_conn,
+            project_id="p_invalid_adoption_phase",
+            conversation_root_id="root",
+            conversation_tip_id="tip",
+            updated_at=1,
+            **phase_kwargs,
+        )
+
+
+def test_runtime_state_exposes_the_explicit_current_phase(runtime_conn):
+    state = _insert_approval_project(
+        runtime_conn, project_id="p_phase"
+    )
+
+    assert state.current_phase == "implementation"
+    assert state.version == 0
+
+
+def test_current_phase_cas_changes_phase_and_increments_version(runtime_conn):
+    original = _insert_approval_project(
+        runtime_conn, project_id="p_phase_cas"
+    )
+
+    changed = prdb.transition_current_phase(
+        runtime_conn,
+        project_id="p_phase_cas",
+        expected_version=original.version,
+        current_phase="verification",
+        updated_at=2,
+    )
+
+    assert changed is not None
+    assert changed.current_phase == "verification"
+    assert changed.version == 1
+    assert changed.updated_at == 2
+
+
+@pytest.mark.parametrize(
+    ("expected_version", "current_phase", "updated_at"),
+    [
+        pytest.param(99, "verification", 2, id="stale-version"),
+        pytest.param(0, "", 2, id="empty-phase"),
+        pytest.param(0, True, 2, id="boolean-phase"),
+        pytest.param(True, "verification", 2, id="boolean-version"),
+        pytest.param(0, "verification", True, id="boolean-timestamp"),
+        pytest.param(0, "implementation", 2, id="no-op"),
+    ],
+)
+def test_current_phase_cas_rejects_stale_invalid_and_noop_updates(
+    runtime_conn, expected_version, current_phase, updated_at
+):
+    original = _insert_approval_project(
+        runtime_conn, project_id="p_phase_rejected"
+    )
+
+    result = prdb.transition_current_phase(
+        runtime_conn,
+        project_id="p_phase_rejected",
+        expected_version=expected_version,
+        current_phase=current_phase,
+        updated_at=updated_at,
+    )
+
+    assert result is None
+    assert (
+        prdb.runtime_state_for_project(runtime_conn, "p_phase_rejected")
+        == original
+    )
+
+
+def test_lifecycle_transition_preserves_current_phase(runtime_conn):
+    original = _insert_approval_project(
+        runtime_conn, project_id="p_lifecycle_phase", current_phase="verification"
+    )
+
+    transitioned = prdb.transition_lifecycle(
+        runtime_conn,
+        project_id="p_lifecycle_phase",
+        expected_version=original.version,
+        lifecycle="awaiting_acceptance",
+        updated_at=2,
+    )
+
+    assert transitioned is not None
+    assert transitioned.current_phase == "verification"
+    assert transitioned.version == 1
 
 
 def test_stale_expected_version_does_not_change_runtime_state(runtime_conn):
@@ -531,6 +679,7 @@ def test_stale_expected_version_does_not_change_runtime_state(runtime_conn):
         original = prdb.create_runtime_state(
             runtime_conn,
             project_id="p_stale",
+            current_phase="implementation",
             conversation_root_id="root",
             conversation_tip_id="tip",
             updated_at=1,
@@ -551,26 +700,13 @@ def test_stale_expected_version_does_not_change_runtime_state(runtime_conn):
 
 def test_concurrent_accept_and_reopen_have_exactly_one_cas_winner(tmp_path):
     db_path = tmp_path / "projects.db"
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY,
-            slug TEXT NOT NULL UNIQUE,
-            name TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            archived INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    prdb.ensure_schema(conn)
+    conn = _create_runtime_db(db_path)
     _insert_project(conn, "p_race")
     with prdb.write_transaction(conn):
         prdb.create_runtime_state(
             conn,
             project_id="p_race",
+            current_phase="implementation",
             conversation_root_id="root",
             conversation_tip_id="tip",
             updated_at=1,
@@ -587,9 +723,7 @@ def test_concurrent_accept_and_reopen_have_exactly_one_cas_winner(tmp_path):
     barrier = threading.Barrier(2)
 
     def attempt(target):
-        worker_conn = sqlite3.connect(db_path, timeout=10)
-        worker_conn.row_factory = sqlite3.Row
-        worker_conn.execute("PRAGMA foreign_keys=ON")
+        worker_conn = _connect_db(db_path)
         try:
             barrier.wait()
             with prdb.write_transaction(worker_conn):
@@ -773,12 +907,33 @@ def _approval_request(*, approval_id="approval-1", expires_at=100):
         canonical_action="publish",
         approval_class="publish",
         command_revision=7,
+        expected_runtime_version=0,
+        expected_lifecycle="active",
+        expected_phase="implementation",
         targets=("C:/work/project/src/a.py", "C:/work/project/src/b.py"),
         batch_id="batch-1",
         batch_items=("operation-a", "operation-b"),
         status="pending",
         expires_at=expires_at,
     )
+
+
+def _insert_approval_project(
+    conn,
+    *,
+    project_id="p_approval",
+    current_phase="implementation",
+):
+    _insert_project(conn, project_id)
+    with prdb.write_transaction(conn):
+        return prdb.create_runtime_state(
+            conn,
+            project_id=project_id,
+            current_phase=current_phase,
+            conversation_root_id=f"root-{project_id}",
+            conversation_tip_id=f"tip-{project_id}",
+            updated_at=1,
+        )
 
 
 def _insert_owner_binding(
@@ -802,24 +957,242 @@ def _insert_owner_binding(
 
 
 def _authorization_args(request, *, now=13):
-    return dict(
+    arguments = dataclasses.asdict(request)
+    for field in (
+        "requester_actor_id",
+        "status",
+        "expires_at",
+        "resolved_by_actor_id",
+        "resolved_at",
+        "consumed_at",
+    ):
+        arguments.pop(field)
+    arguments["now"] = now
+    return arguments
+
+
+OWNER_RESOLVER = ActorContext("owner-1", "desktop", "desktop-1", True)
+
+
+def _resolve_as_owner(conn, request, *, outcome="approved", now=11):
+    return prdb.resolve_approval(
+        conn,
         approval_id=request.approval_id,
-        project_id=request.project_id,
-        authorization_actor_id=request.authorization_actor_id,
-        canonical_action=request.canonical_action,
-        approval_class=request.approval_class,
-        command_revision=request.command_revision,
-        targets=request.targets,
-        batch_id=request.batch_id,
-        batch_items=request.batch_items,
+        resolver=OWNER_RESOLVER,
+        outcome=outcome,
         now=now,
     )
+
+
+def _create_approved_request(conn, request=None):
+    _insert_owner_binding(conn)
+    created = prdb.create_approval_request(
+        conn,
+        request if request is not None else _approval_request(),
+        now=10,
+    )
+    assert _resolve_as_owner(conn, created) is not None
+    return created
+
+
+def _consumed_at(conn, request):
+    return conn.execute(
+        "SELECT consumed_at FROM project_approvals WHERE approval_id = ?",
+        (request.approval_id,),
+    ).fetchone()[0]
+
+
+def _insert_completed_operation(conn, operation_id):
+    conn.execute(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, idempotency_key, approval_id,
+            command_revision, targets_json, payload_json, status,
+            created_at, updated_at
+        ) VALUES (?, 'p_approval', ?, 'approval-1', 7,
+                  '["c:/work/project/src/a.py"]', '{}', 'completed', 12, 12)
+        """,
+        (operation_id, operation_id),
+    )
+
+
+def _insert_raw_approval(
+    conn,
+    *,
+    approval_id,
+    expected_runtime_version=0,
+    expected_lifecycle="active",
+    expected_phase="implementation",
+    status="pending",
+    resolved_at=None,
+    resolved_by_actor_id=None,
+):
+    conn.execute(
+        """
+        INSERT INTO project_approvals (
+            approval_id, project_id, actor_id, authorization_actor_id,
+            canonical_action, approval_class, command_revision,
+            expected_runtime_version, expected_lifecycle, expected_phase,
+            targets_json, batch_boundary_json, status, expires_at,
+            resolved_at, resolved_by_actor_id, created_at
+        ) VALUES (
+            ?, 'p_approval', 'owner-1', 'owner-1', 'publish', 'publish', 7,
+            ?, ?, ?, ?, '{}', ?, 100, ?, ?, 1
+        )
+        """,
+        (
+            approval_id,
+            expected_runtime_version,
+            expected_lifecycle,
+            expected_phase,
+            f'["C:/work/project/{approval_id}"]',
+            status,
+            resolved_at,
+            resolved_by_actor_id,
+        ),
+    )
+
+
+def test_fresh_approval_schema_requires_runtime_snapshot_columns(runtime_conn):
+    columns = {
+        row["name"]: row
+        for row in runtime_conn.execute("PRAGMA table_info(project_approvals)")
+    }
+
+    assert {
+        "expected_runtime_version",
+        "expected_lifecycle",
+        "expected_phase",
+    } <= columns.keys()
+    assert columns["expected_runtime_version"]["notnull"] == 1
+    assert columns["expected_lifecycle"]["notnull"] == 1
+    assert columns["expected_phase"]["notnull"] == 1
+
+
+@pytest.mark.parametrize(
+    ("expected_runtime_version", "expected_lifecycle", "expected_phase"),
+    [
+        pytest.param(-1, "active", "implementation", id="negative-version"),
+        pytest.param(0, "archived", "implementation", id="unknown-lifecycle"),
+        pytest.param(0, "active", "", id="empty-phase"),
+    ],
+)
+def test_fresh_approval_schema_rejects_invalid_runtime_snapshot(
+    runtime_conn,
+    expected_runtime_version,
+    expected_lifecycle,
+    expected_phase,
+):
+    _insert_project(runtime_conn, "p_approval")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_raw_approval(
+            runtime_conn,
+            approval_id="invalid-snapshot",
+            expected_runtime_version=expected_runtime_version,
+            expected_lifecycle=expected_lifecycle,
+            expected_phase=expected_phase,
+        )
+    runtime_conn.rollback()
+
+
+def test_create_approval_persists_the_exact_live_runtime_snapshot(runtime_conn):
+    _insert_approval_project(runtime_conn)
+    request = _approval_request()
+
+    created = prdb.create_approval_request(runtime_conn, request, now=10)
+
+    row = runtime_conn.execute(
+        """
+        SELECT expected_runtime_version, expected_lifecycle, expected_phase,
+               batch_boundary_json
+        FROM project_approvals
+        WHERE approval_id = ?
+        """,
+        (created.approval_id,),
+    ).fetchone()
+    assert created.expected_runtime_version == 0
+    assert created.expected_lifecycle == "active"
+    assert created.expected_phase == "implementation"
+    assert tuple(row)[:3] == (0, "active", "implementation")
+    assert json.loads(row["batch_boundary_json"]) == {
+        "authorization_actor_id": "owner-1",
+        "canonical_action": "publish",
+        "batch_id": "batch-1",
+        "batch_items": ["operation-a", "operation-b"],
+        "expected_runtime_version": 0,
+        "expected_lifecycle": "active",
+        "expected_phase": "implementation",
+    }
+
+
+def test_create_approval_requires_an_existing_runtime_state(runtime_conn):
+    _insert_project(runtime_conn, "p_approval")
+
+    with pytest.raises(prdb.ApprovalConflictError):
+        prdb.create_approval_request(runtime_conn, _approval_request(), now=10)
+
+    assert runtime_conn.execute(
+        "SELECT COUNT(*) FROM project_approvals"
+    ).fetchone()[0] == 0
+
+
+def test_create_approval_rejects_a_stale_runtime_snapshot_without_a_row(
+    runtime_conn,
+):
+    _insert_approval_project(runtime_conn)
+    request = dataclasses.replace(
+        _approval_request(), expected_runtime_version=1
+    )
+
+    with pytest.raises(prdb.ApprovalConflictError):
+        prdb.create_approval_request(runtime_conn, request, now=10)
+
+    assert runtime_conn.execute(
+        "SELECT COUNT(*) FROM project_approvals"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        pytest.param({"expected_runtime_version": True}, ValueError, id="bool-version"),
+        pytest.param({"expected_runtime_version": -1}, ValueError, id="negative"),
+        pytest.param({"expected_lifecycle": None}, ValueError, id="no-lifecycle"),
+        pytest.param({"expected_lifecycle": "archived"}, ValueError, id="lifecycle"),
+        pytest.param({"expected_phase": None}, ValueError, id="missing-phase"),
+        pytest.param({"expected_phase": ""}, ValueError, id="empty-phase"),
+        pytest.param({"expected_phase": True}, ValueError, id="boolean-phase"),
+        pytest.param(
+            {"expected_lifecycle": "awaiting_acceptance"},
+            prdb.ApprovalConflictError,
+            id="stale-lifecycle",
+        ),
+        pytest.param(
+            {"expected_phase": "verification"},
+            prdb.ApprovalConflictError,
+            id="stale-phase",
+        ),
+    ],
+)
+def test_create_approval_rejects_invalid_or_stale_runtime_snapshot(
+    runtime_conn, changes, error
+):
+    _insert_approval_project(runtime_conn)
+    request = dataclasses.replace(_approval_request(), **changes)
+
+    with pytest.raises(error):
+        prdb.create_approval_request(runtime_conn, request, now=10)
+
+    assert runtime_conn.execute(
+        "SELECT COUNT(*) FROM project_approvals"
+    ).fetchone()[0] == 0
 
 
 def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
     runtime_conn,
 ):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
     _insert_owner_binding(runtime_conn)
     request = prdb.create_approval_request(
         runtime_conn, _approval_request(), now=10
@@ -837,7 +1210,7 @@ def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
     approved = prdb.resolve_approval(
         runtime_conn,
         approval_id=request.approval_id,
-        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
+        resolver=OWNER_RESOLVER,
         outcome="approved",
         now=12,
     )
@@ -850,6 +1223,127 @@ def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
     assert prdb.consume_approval_authorization(runtime_conn, **authorization) is False
 
 
+@pytest.mark.parametrize("drift", ["lifecycle", "phase"])
+def test_resolve_leaves_approval_pending_after_runtime_snapshot_drift(
+    runtime_conn, drift
+):
+    state = _insert_approval_project(runtime_conn)
+    _insert_owner_binding(runtime_conn)
+    request = prdb.create_approval_request(
+        runtime_conn, _approval_request(), now=10
+    )
+    if drift == "lifecycle":
+        changed = prdb.transition_lifecycle(
+            runtime_conn,
+            project_id="p_approval",
+            expected_version=state.version,
+            lifecycle="awaiting_acceptance",
+            updated_at=11,
+        )
+    else:
+        changed = prdb.transition_current_phase(
+            runtime_conn,
+            project_id="p_approval",
+            expected_version=state.version,
+            current_phase="verification",
+            updated_at=11,
+        )
+    assert changed is not None
+
+    resolved = _resolve_as_owner(runtime_conn, request, now=12)
+
+    row = runtime_conn.execute(
+        """
+        SELECT status, resolved_at, resolved_by_actor_id
+        FROM project_approvals WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    ).fetchone()
+    assert resolved is None
+    assert tuple(row) == ("pending", None, None)
+
+
+@pytest.mark.parametrize(
+    ("action", "initial_lifecycle", "drifts"),
+    [
+        ("publish", None, (("lifecycle", "awaiting_acceptance"),)),
+        (
+            "publish",
+            None,
+            (("lifecycle", "awaiting_acceptance"), ("lifecycle", "completed")),
+        ),
+        (
+            "publish",
+            None,
+            (("lifecycle", "awaiting_acceptance"), ("lifecycle", "active")),
+        ),
+        ("final_acceptance", "awaiting_acceptance", (("lifecycle", "active"),)),
+        ("publish", None, (("phase", "verification"),)),
+        ("publish", None, (("delete", None),)),
+    ],
+    ids=[
+        "to-awaiting",
+        "to-completed",
+        "version-only",
+        "reopen",
+        "phase",
+        "missing-state",
+    ],
+)
+def test_approved_request_cannot_consume_after_runtime_snapshot_drift(
+    runtime_conn, action, initial_lifecycle, drifts
+):
+    state = _insert_approval_project(runtime_conn)
+    if initial_lifecycle is not None:
+        state = prdb.transition_lifecycle(
+            runtime_conn,
+            project_id="p_approval",
+            expected_version=state.version,
+            lifecycle=initial_lifecycle,
+            updated_at=2,
+        )
+        assert state is not None
+    request = _approval_request()
+    if action == "final_acceptance":
+        request = dataclasses.replace(
+            request,
+            canonical_action=action,
+            approval_class=action,
+            expected_runtime_version=state.version,
+            expected_lifecycle=state.lifecycle,
+        )
+    request = _create_approved_request(runtime_conn, request)
+
+    for offset, (kind, value) in enumerate(drifts):
+        if kind == "delete":
+            runtime_conn.execute(
+                "DELETE FROM project_runtime_state WHERE project_id = 'p_approval'"
+            )
+        elif kind == "lifecycle":
+            state = prdb.transition_lifecycle(
+                runtime_conn,
+                project_id="p_approval",
+                expected_version=state.version,
+                lifecycle=value,
+                updated_at=12 + offset,
+            )
+            assert state is not None
+        else:
+            state = prdb.transition_current_phase(
+                runtime_conn,
+                project_id="p_approval",
+                expected_version=state.version,
+                current_phase=value,
+                updated_at=12,
+            )
+            assert state is not None
+
+    assert prdb.consume_approval_authorization(
+        runtime_conn, **_authorization_args(request, now=14)
+    ) is False
+    assert _consumed_at(runtime_conn, request) is None
+
+
 @pytest.mark.parametrize(
     "changed",
     [
@@ -858,6 +1352,9 @@ def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
         {"canonical_action": "release"},
         {"approval_class": "production"},
         {"command_revision": 8},
+        {"expected_runtime_version": 1},
+        {"expected_lifecycle": "completed"},
+        {"expected_phase": "verification"},
         {"targets": ("C:/work/project/src/a.py",)},
         {
             "targets": (
@@ -873,18 +1370,8 @@ def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
 def test_approval_never_authorizes_a_different_project_revision_or_batch(
     runtime_conn, changed
 ):
-    _insert_project(runtime_conn, "p_approval")
-    _insert_owner_binding(runtime_conn)
-    request = prdb.create_approval_request(
-        runtime_conn, _approval_request(), now=10
-    )
-    prdb.resolve_approval(
-        runtime_conn,
-        approval_id=request.approval_id,
-        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
-        outcome="approved",
-        now=11,
-    )
+    _insert_approval_project(runtime_conn)
+    request = _create_approved_request(runtime_conn)
     authorization = _authorization_args(request, now=12)
     authorization.update(changed)
 
@@ -901,8 +1388,7 @@ def test_approval_never_authorizes_a_different_project_revision_or_batch(
 def test_approval_target_identity_never_uses_expanding_casefold(
     runtime_conn, stored_component, mismatched_codepoint
 ):
-    _insert_project(runtime_conn, "p_approval")
-    _insert_owner_binding(runtime_conn)
+    _insert_approval_project(runtime_conn)
     request = dataclasses.replace(
         _approval_request(),
         targets=(
@@ -910,14 +1396,7 @@ def test_approval_target_identity_never_uses_expanding_casefold(
             f"C:/work/{stored_component}/b.py",
         ),
     )
-    created = prdb.create_approval_request(runtime_conn, request, now=10)
-    prdb.resolve_approval(
-        runtime_conn,
-        approval_id=created.approval_id,
-        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
-        outcome="approved",
-        now=11,
-    )
+    created = _create_approved_request(runtime_conn, request)
     authorization = _authorization_args(created, now=12)
     authorization["targets"] = (
         f"C:/work/{chr(mismatched_codepoint)}/a.py",
@@ -932,20 +1411,12 @@ def test_approval_target_identity_never_uses_expanding_casefold(
 def test_approval_target_component_case_mismatch_is_a_different_identity(
     runtime_conn,
 ):
-    _insert_project(runtime_conn, "p_approval")
-    _insert_owner_binding(runtime_conn)
+    _insert_approval_project(runtime_conn)
     request = dataclasses.replace(
         _approval_request(),
         targets=("C:/work/Project/a.py", "C:/work/Project/b.py"),
     )
-    created = prdb.create_approval_request(runtime_conn, request, now=10)
-    prdb.resolve_approval(
-        runtime_conn,
-        approval_id=created.approval_id,
-        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
-        outcome="approved",
-        now=11,
-    )
+    created = _create_approved_request(runtime_conn, request)
     authorization = _authorization_args(created, now=12)
     authorization["targets"] = (
         "C:/work/project/a.py",
@@ -958,7 +1429,7 @@ def test_approval_target_component_case_mismatch_is_a_different_identity(
 
 
 def test_non_owner_and_expired_approval_never_authorize(runtime_conn):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
     _insert_owner_binding(runtime_conn)
     request = prdb.create_approval_request(
         runtime_conn, _approval_request(expires_at=20), now=10
@@ -1014,45 +1485,68 @@ def test_non_owner_and_expired_approval_never_authorize(runtime_conn):
 def test_approval_request_rejects_noncanonical_or_duplicate_targets(
     runtime_conn, targets
 ):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
     request = dataclasses.replace(_approval_request(), targets=targets)
 
     with pytest.raises(ValueError):
         prdb.create_approval_request(runtime_conn, request, now=10)
 
 
+@pytest.mark.parametrize(
+    "component",
+    [
+        pytest.param("CON", id="reserved-bare"),
+        pytest.param("nUl.txt", id="reserved-mixed-case-extension"),
+        pytest.param("CLOCK$.log", id="reserved-clock-extension"),
+        pytest.param("cOm¹.bin", id="reserved-superscript-extension"),
+        pytest.param("ordinary.", id="trailing-dot"),
+        pytest.param("ordinary ", id="trailing-space"),
+        *[
+            pytest.param(f"bad{character}name", id=f"forbidden-{ord(character):02x}")
+            for character in '<>:"|?*\\'
+        ],
+        *[
+            pytest.param(f"bad{chr(codepoint)}name", id=f"control-{codepoint:02x}")
+            for codepoint in range(0x20)
+        ],
+    ],
+)
+def test_approval_request_rejects_nonliteral_win32_target_identity(
+    runtime_conn, component
+):
+    _insert_approval_project(runtime_conn)
+    request = dataclasses.replace(
+        _approval_request(),
+        targets=(f"C:/work/project/{component}",),
+    )
+
+    with pytest.raises(ValueError):
+        prdb.create_approval_request(runtime_conn, request, now=10)
+
+
+def test_approval_request_accepts_posix_reserved_device_spelling(runtime_conn):
+    _insert_approval_project(runtime_conn)
+    request = dataclasses.replace(
+        _approval_request(),
+        targets=("/workspace/COM1/file.py",),
+    )
+
+    created = prdb.create_approval_request(runtime_conn, request, now=10)
+
+    assert created.targets == ("/workspace/COM1/file.py",)
+
+
 def test_concurrent_consumers_cannot_replay_one_approval(tmp_path):
     db_path = tmp_path / "projects.db"
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-            created_at INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    prdb.ensure_schema(conn)
-    _insert_project(conn, "p_approval")
-    _insert_owner_binding(conn)
-    request = prdb.create_approval_request(conn, _approval_request(), now=10)
-    prdb.resolve_approval(
-        conn,
-        approval_id=request.approval_id,
-        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
-        outcome="approved",
-        now=11,
-    )
+    conn = _create_runtime_db(db_path)
+    _insert_approval_project(conn)
+    request = _create_approved_request(conn)
     conn.close()
 
     barrier = threading.Barrier(2)
 
     def consume_once():
-        worker_conn = sqlite3.connect(db_path, timeout=10)
-        worker_conn.row_factory = sqlite3.Row
-        worker_conn.execute("PRAGMA foreign_keys=ON")
+        worker_conn = _connect_db(db_path)
         try:
             barrier.wait()
             return prdb.consume_approval_authorization(
@@ -1084,7 +1578,7 @@ def test_approval_schema_migration_adds_resolver_and_consumption_columns(
 def test_create_approval_is_idempotent_but_payload_collisions_fail_closed(
     runtime_conn,
 ):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
     request = _approval_request()
 
     first = prdb.create_approval_request(runtime_conn, request, now=10)
@@ -1105,6 +1599,27 @@ def test_create_approval_is_idempotent_but_payload_collisions_fail_closed(
         )
 
 
+def test_idempotent_approval_retry_requires_the_same_live_snapshot(runtime_conn):
+    state = _insert_approval_project(runtime_conn)
+    request = _approval_request()
+    first = prdb.create_approval_request(runtime_conn, request, now=10)
+    assert prdb.transition_current_phase(
+        runtime_conn,
+        project_id="p_approval",
+        expected_version=state.version,
+        current_phase="verification",
+        updated_at=11,
+    ) is not None
+
+    with pytest.raises(prdb.ApprovalConflictError):
+        prdb.create_approval_request(runtime_conn, request, now=12)
+
+    assert runtime_conn.execute(
+        "SELECT COUNT(*) FROM project_approvals"
+    ).fetchone()[0] == 1
+    assert first.expected_phase == "implementation"
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -1117,7 +1632,7 @@ def test_create_approval_is_idempotent_but_payload_collisions_fail_closed(
 def test_create_rejects_noncanonical_action_or_prepopulated_state(
     runtime_conn, changes
 ):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
     request = dataclasses.replace(_approval_request(), **changes)
 
     with pytest.raises(ValueError):
@@ -1127,7 +1642,7 @@ def test_create_rejects_noncanonical_action_or_prepopulated_state(
 def test_same_boundary_distinguishes_authorization_actor_and_canonical_action(
     runtime_conn,
 ):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
     first = _approval_request()
     second = dataclasses.replace(
         first,
@@ -1146,16 +1661,10 @@ def test_same_boundary_distinguishes_authorization_actor_and_canonical_action(
 
 
 def test_terminal_boundary_requires_a_new_revision_or_batch(runtime_conn):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
     _insert_owner_binding(runtime_conn)
     first = prdb.create_approval_request(runtime_conn, _approval_request(), now=10)
-    prdb.resolve_approval(
-        runtime_conn,
-        approval_id=first.approval_id,
-        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
-        outcome="denied",
-        now=11,
-    )
+    _resolve_as_owner(runtime_conn, first, outcome="denied")
 
     with pytest.raises(prdb.ApprovalConflictError):
         prdb.create_approval_request(
@@ -1178,8 +1687,41 @@ def test_terminal_boundary_requires_a_new_revision_or_batch(runtime_conn):
     assert replacement.batch_id == "batch-2"
 
 
+def test_new_runtime_version_can_use_a_new_exact_approval_boundary(runtime_conn):
+    state = _insert_approval_project(runtime_conn)
+    _insert_owner_binding(runtime_conn)
+    first = prdb.create_approval_request(runtime_conn, _approval_request(), now=10)
+    assert _resolve_as_owner(
+        runtime_conn, first, outcome="denied"
+    ) is not None
+    changed = prdb.transition_current_phase(
+        runtime_conn,
+        project_id="p_approval",
+        expected_version=state.version,
+        current_phase="verification",
+        updated_at=12,
+    )
+    assert changed is not None
+
+    second = prdb.create_approval_request(
+        runtime_conn,
+        dataclasses.replace(
+            _approval_request(approval_id="approval-version-1"),
+            expected_runtime_version=changed.version,
+            expected_phase="verification",
+        ),
+        now=13,
+    )
+
+    assert second.expected_runtime_version == 1
+    assert second.expected_phase == "verification"
+    assert runtime_conn.execute(
+        "SELECT COUNT(*) FROM project_approvals"
+    ).fetchone()[0] == 2
+
+
 def test_resolver_must_be_concrete_and_match_durable_project_binding(runtime_conn):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
     _insert_owner_binding(runtime_conn)
     request = prdb.create_approval_request(runtime_conn, _approval_request(), now=10)
 
@@ -1219,7 +1761,7 @@ def test_resolver_must_be_concrete_and_match_durable_project_binding(runtime_con
 def test_approval_rejects_boolean_revisions_and_timestamps(
     runtime_conn, field, value, now
 ):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
     request = _approval_request()
     if field is not None:
         request = dataclasses.replace(request, **{field: value})
@@ -1229,17 +1771,9 @@ def test_approval_rejects_boolean_revisions_and_timestamps(
 
 
 def test_approved_unconsumed_approval_becomes_expired_at_boundary(runtime_conn):
-    _insert_project(runtime_conn, "p_approval")
-    _insert_owner_binding(runtime_conn)
-    request = prdb.create_approval_request(
-        runtime_conn, _approval_request(expires_at=20), now=10
-    )
-    prdb.resolve_approval(
-        runtime_conn,
-        approval_id=request.approval_id,
-        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
-        outcome="approved",
-        now=11,
+    _insert_approval_project(runtime_conn)
+    request = _create_approved_request(
+        runtime_conn, _approval_request(expires_at=20)
     )
 
     assert prdb.consume_approval_authorization(
@@ -1252,7 +1786,7 @@ def test_approved_unconsumed_approval_becomes_expired_at_boundary(runtime_conn):
 
 
 def test_nested_write_transaction_rolls_back_caught_inner_failure(runtime_conn):
-    _insert_project(runtime_conn, "p_approval")
+    _insert_approval_project(runtime_conn)
 
     with prdb.write_transaction(runtime_conn):
         try:
@@ -1276,16 +1810,8 @@ def test_nested_write_transaction_rolls_back_caught_inner_failure(runtime_conn):
 
 
 def test_consume_composes_with_caller_owned_operation_transaction(runtime_conn):
-    _insert_project(runtime_conn, "p_approval")
-    _insert_owner_binding(runtime_conn)
-    request = prdb.create_approval_request(runtime_conn, _approval_request(), now=10)
-    prdb.resolve_approval(
-        runtime_conn,
-        approval_id=request.approval_id,
-        resolver=ActorContext("owner-1", "desktop", "desktop-1", True),
-        outcome="approved",
-        now=11,
-    )
+    _insert_approval_project(runtime_conn)
+    request = _create_approved_request(runtime_conn)
 
     with pytest.raises(RuntimeError):
         with prdb.write_transaction(runtime_conn):
@@ -1294,53 +1820,77 @@ def test_consume_composes_with_caller_owned_operation_transaction(runtime_conn):
             ) is True
             raise RuntimeError("operation did not commit")
 
+    assert _consumed_at(runtime_conn, request) is None
+
+
+def test_consume_lifecycle_and_operation_commit_in_one_outer_transaction(
+    runtime_conn,
+):
+    state = _insert_approval_project(runtime_conn)
+    request = _create_approved_request(runtime_conn)
+
+    with prdb.write_transaction(runtime_conn):
+        assert prdb.consume_approval_authorization(
+            runtime_conn, **_authorization_args(request, now=12)
+        ) is True
+        transitioned = prdb.transition_lifecycle(
+            runtime_conn,
+            project_id="p_approval",
+            expected_version=state.version,
+            lifecycle="awaiting_acceptance",
+            updated_at=12,
+        )
+        assert transitioned is not None
+        _insert_completed_operation(runtime_conn, "operation-approved")
+
+    stored = prdb.runtime_state_for_project(runtime_conn, "p_approval")
+    assert stored is not None
+    assert stored.lifecycle == "awaiting_acceptance"
+    assert stored.current_phase == "implementation"
+    assert stored.version == 1
+    assert _consumed_at(runtime_conn, request) == 12
     assert runtime_conn.execute(
-        "SELECT consumed_at FROM project_approvals WHERE approval_id = ?",
-        (request.approval_id,),
-    ).fetchone()[0] is None
+        "SELECT COUNT(*) FROM project_operations"
+    ).fetchone()[0] == 1
+
+
+def test_outer_rollback_restores_consume_phase_and_operation(runtime_conn):
+    state = _insert_approval_project(runtime_conn)
+    request = _create_approved_request(runtime_conn)
+
+    with pytest.raises(RuntimeError):
+        with prdb.write_transaction(runtime_conn):
+            assert prdb.consume_approval_authorization(
+                runtime_conn, **_authorization_args(request, now=12)
+            ) is True
+            assert prdb.transition_current_phase(
+                runtime_conn,
+                project_id="p_approval",
+                expected_version=state.version,
+                current_phase="verification",
+                updated_at=12,
+            ) is not None
+            _insert_completed_operation(runtime_conn, "operation-rollback")
+            raise RuntimeError("operation did not commit")
+
+    stored = prdb.runtime_state_for_project(runtime_conn, "p_approval")
+    assert stored == state
+    assert _consumed_at(runtime_conn, request) is None
+    assert runtime_conn.execute(
+        "SELECT COUNT(*) FROM project_operations"
+    ).fetchone()[0] == 0
 
 
 def test_new_schema_rejects_unknown_approval_status(runtime_conn):
     _insert_project(runtime_conn, "p_approval")
 
     with pytest.raises(sqlite3.IntegrityError):
-        runtime_conn.execute(
-            """
-            INSERT INTO project_approvals (
-                approval_id, project_id, actor_id, authorization_actor_id,
-                canonical_action, approval_class, command_revision,
-                targets_json, batch_boundary_json, status, expires_at, created_at
-            ) VALUES (
-                'invalid-status', 'p_approval', 'owner-1', 'owner-1', 'publish',
-                'publish', 7, '["C:/work/project/a"]', '{}', 'unknown', 100, 1
-            )
-            """
+        _insert_raw_approval(
+            runtime_conn,
+            approval_id="invalid-status",
+            status="unknown",
         )
     runtime_conn.rollback()
-
-
-def _insert_expired_approval_row(
-    conn, *, approval_id, resolved_at, resolved_by_actor_id
-):
-    conn.execute(
-        """
-        INSERT INTO project_approvals (
-            approval_id, project_id, actor_id, authorization_actor_id,
-            canonical_action, approval_class, command_revision,
-            targets_json, batch_boundary_json, status, expires_at,
-            resolved_at, resolved_by_actor_id, created_at
-        ) VALUES (
-            ?, 'p_approval', 'owner-1', 'owner-1', 'publish', 'publish', 7,
-            ?, '{}', 'expired', 100, ?, ?, 1
-        )
-        """,
-        (
-            approval_id,
-            f'["C:/work/project/{approval_id}"]',
-            resolved_at,
-            resolved_by_actor_id,
-        ),
-    )
 
 
 @pytest.mark.parametrize(
@@ -1356,9 +1906,10 @@ def test_new_schema_rejects_half_resolved_expired_approvals(
     _insert_project(runtime_conn, "p_approval")
 
     with pytest.raises(sqlite3.IntegrityError):
-        _insert_expired_approval_row(
+        _insert_raw_approval(
             runtime_conn,
             approval_id="half-resolved",
+            status="expired",
             resolved_at=resolved_at,
             resolved_by_actor_id=resolved_by_actor_id,
         )
@@ -1368,15 +1919,17 @@ def test_new_schema_rejects_half_resolved_expired_approvals(
 def test_new_schema_accepts_both_valid_expired_approval_origins(runtime_conn):
     _insert_project(runtime_conn, "p_approval")
 
-    _insert_expired_approval_row(
+    _insert_raw_approval(
         runtime_conn,
         approval_id="expired-from-pending",
+        status="expired",
         resolved_at=None,
         resolved_by_actor_id=None,
     )
-    _insert_expired_approval_row(
+    _insert_raw_approval(
         runtime_conn,
         approval_id="expired-from-approved",
+        status="expired",
         resolved_at=2,
         resolved_by_actor_id="owner-1",
     )
@@ -1395,9 +1948,7 @@ def test_new_schema_accepts_both_valid_expired_approval_origins(runtime_conn):
 
 
 def _create_task1_legacy_approval_db(db_path):
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = _connect_db(db_path)
     conn.executescript(
         """
         CREATE TABLE projects (
@@ -1408,6 +1959,18 @@ def _create_task1_legacy_approval_db(db_path):
             archived INTEGER NOT NULL DEFAULT 0
         );
         INSERT INTO projects VALUES ('p_legacy', 'legacy', 'Legacy', 1, 0);
+        CREATE TABLE project_runtime_state (
+            project_id TEXT PRIMARY KEY
+                       REFERENCES projects(id) ON DELETE RESTRICT,
+            lifecycle TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            conversation_root_id TEXT,
+            conversation_tip_id TEXT,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO project_runtime_state VALUES (
+            'p_legacy', 'active', 4, 'root-legacy', 'tip-legacy', 7
+        );
         CREATE TABLE project_approvals (
             approval_id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
@@ -1440,6 +2003,55 @@ def _create_task1_legacy_approval_db(db_path):
     return conn
 
 
+def test_task1_legacy_phase_is_fail_closed_until_explicit_version_cas(tmp_path):
+    conn = _create_task1_legacy_approval_db(tmp_path / "projects.db")
+    prdb.ensure_schema(conn)
+
+    column = next(
+        row
+        for row in conn.execute("PRAGMA table_info(project_runtime_state)")
+        if row["name"] == "current_phase"
+    )
+    state = prdb.runtime_state_for_project(conn, "p_legacy")
+    assert column["notnull"] == 0
+    assert state is not None
+    assert state.current_phase is None
+    assert state.lifecycle == "active"
+    assert state.version == 4
+    request = dataclasses.replace(
+        _approval_request(approval_id="approval-new"),
+        project_id="p_legacy",
+        requester_actor_id="owner-legacy",
+        authorization_actor_id="owner-legacy",
+        command_revision=3,
+        expected_runtime_version=4,
+        targets=("C:/legacy/new",),
+        batch_id="legacy-new",
+        batch_items=("new",),
+    )
+
+    with pytest.raises(prdb.ApprovalConflictError):
+        prdb.create_approval_request(conn, request, now=20)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM project_approvals"
+    ).fetchone()[0] == 1
+
+    initialized = prdb.transition_current_phase(
+        conn,
+        project_id="p_legacy",
+        expected_version=4,
+        current_phase="implementation",
+        updated_at=8,
+    )
+
+    assert initialized is not None
+    assert initialized.current_phase == "implementation"
+    assert initialized.version == 5
+    assert initialized.updated_at == 8
+    conn.close()
+
+
 def test_task1_legacy_approval_rows_survive_additive_migration(tmp_path):
     conn = _create_task1_legacy_approval_db(tmp_path / "projects.db")
     old_columns = (
@@ -1459,12 +2071,105 @@ def test_task1_legacy_approval_rows_survive_additive_migration(tmp_path):
     migrated = conn.execute(
         """
         SELECT canonical_action, authorization_actor_id,
-               resolved_by_actor_id, consumed_at
+               resolved_by_actor_id, consumed_at,
+               expected_runtime_version, expected_lifecycle, expected_phase
         FROM project_approvals WHERE approval_id = 'legacy-approval'
         """
     ).fetchone()
     assert after == before
-    assert tuple(migrated) == (None, None, None, None)
+    assert tuple(migrated) == (None, None, None, None, None, None, None)
+    conn.close()
+
+
+def test_legacy_null_approval_snapshot_never_resolves_or_consumes(tmp_path):
+    conn = _create_task1_legacy_approval_db(tmp_path / "projects.db")
+    prdb.ensure_schema(conn)
+    state = prdb.transition_current_phase(
+        conn,
+        project_id="p_legacy",
+        expected_version=4,
+        current_phase="implementation",
+        updated_at=8,
+    )
+    assert state is not None
+    conn.execute(
+        """
+        INSERT INTO project_surface_bindings (
+            binding_id, project_id, surface, external_binding_id, actor_id,
+            created_at
+        ) VALUES (
+            'desktop-legacy', 'p_legacy', 'desktop', 'external-legacy',
+            'owner-legacy', 8
+        )
+        """
+    )
+    boundary = (
+        '{"authorization_actor_id":"owner-legacy",'
+        '"canonical_action":"publish","batch_id":"legacy-batch",'
+        '"batch_items":["a"],"expected_runtime_version":5,'
+        '"expected_lifecycle":"active","expected_phase":"implementation"}'
+    )
+    conn.execute(
+        """
+        UPDATE project_approvals
+        SET status = 'pending',
+            authorization_actor_id = 'owner-legacy',
+            canonical_action = 'publish',
+            targets_json = '["c:/legacy/a"]',
+            batch_boundary_json = ?,
+            resolved_at = NULL,
+            resolved_by_actor_id = NULL
+        WHERE approval_id = 'legacy-approval'
+        """,
+        (boundary,),
+    )
+    conn.commit()
+
+    assert prdb.resolve_approval(
+        conn,
+        approval_id="legacy-approval",
+        resolver=ActorContext(
+            "owner-legacy", "desktop", "desktop-legacy", True
+        ),
+        outcome="approved",
+        now=20,
+    ) is None
+    assert conn.execute(
+        "SELECT status FROM project_approvals WHERE approval_id = 'legacy-approval'"
+    ).fetchone()[0] == "pending"
+
+    conn.execute(
+        """
+        UPDATE project_approvals
+        SET status = 'approved', resolved_at = 21,
+            resolved_by_actor_id = 'owner-legacy'
+        WHERE approval_id = 'legacy-approval'
+        """
+    )
+    conn.commit()
+    assert prdb.consume_approval_authorization(
+        conn,
+        approval_id="legacy-approval",
+        project_id="p_legacy",
+        authorization_actor_id="owner-legacy",
+        canonical_action="publish",
+        approval_class="publish",
+        command_revision=3,
+        expected_runtime_version=5,
+        expected_lifecycle="active",
+        expected_phase="implementation",
+        targets=("C:/legacy/a",),
+        batch_id="legacy-batch",
+        batch_items=("a",),
+        now=22,
+    ) is False
+    assert conn.execute(
+        """
+        SELECT consumed_at
+        FROM project_approvals
+        WHERE approval_id = 'legacy-approval'
+        """
+    ).fetchone()[0] is None
     conn.close()
 
 
@@ -1474,8 +2179,7 @@ def test_two_connections_can_race_task1_approval_migration(tmp_path):
     barrier = threading.Barrier(2)
 
     def migrate():
-        conn = sqlite3.connect(db_path, timeout=10)
-        conn.row_factory = sqlite3.Row
+        conn = _connect_db(db_path)
         try:
             barrier.wait()
             prdb.ensure_schema(conn)
@@ -1493,30 +2197,94 @@ def test_two_connections_can_race_task1_approval_migration(tmp_path):
     expected = {
         "canonical_action", "authorization_actor_id",
         "resolved_by_actor_id", "consumed_at",
+        "expected_runtime_version", "expected_lifecycle", "expected_phase",
     }
     assert all(expected <= columns for columns in results)
+    conn = sqlite3.connect(db_path)
+    try:
+        runtime_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(project_runtime_state)")
+        }
+    finally:
+        conn.close()
+    assert "current_phase" in runtime_columns
+
+
+def test_approval_create_and_phase_cas_serialize_across_connections(tmp_path):
+    db_path = tmp_path / "projects.db"
+    conn = _create_runtime_db(db_path)
+    _insert_approval_project(conn)
+    _insert_owner_binding(conn)
+    conn.close()
+    barrier = threading.Barrier(2)
+
+    def create_from_version_zero():
+        worker = _connect_db(db_path)
+        try:
+            barrier.wait()
+            try:
+                prdb.create_approval_request(
+                    worker, _approval_request(), now=10
+                )
+            except prdb.ApprovalConflictError:
+                return "stale"
+            return "created"
+        finally:
+            worker.close()
+
+    def change_phase():
+        worker = _connect_db(db_path)
+        try:
+            barrier.wait()
+            changed = prdb.transition_current_phase(
+                worker,
+                project_id="p_approval",
+                expected_version=0,
+                current_phase="verification",
+                updated_at=11,
+            )
+            return changed.version if changed is not None else None
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        create_future = pool.submit(create_from_version_zero)
+        phase_future = pool.submit(change_phase)
+        create_outcome = create_future.result()
+        phase_version = phase_future.result()
+
+    assert create_outcome in {"created", "stale"}
+    assert phase_version == 1
+    conn = _connect_db(db_path)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM project_approvals"
+        ).fetchone()[0]
+        assert count == (1 if create_outcome == "created" else 0)
+        if count:
+            assert prdb.resolve_approval(
+                conn,
+                approval_id="approval-1",
+                resolver=ActorContext(
+                    "owner-1", "desktop", "desktop-1", True
+                ),
+                outcome="approved",
+                now=12,
+            ) is None
+    finally:
+        conn.close()
 
 
 def test_concurrent_exact_create_returns_one_logical_approval(tmp_path):
     db_path = tmp_path / "projects.db"
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """
-        CREATE TABLE projects (
-            id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-            created_at INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    prdb.ensure_schema(conn)
-    _insert_project(conn, "p_approval")
+    conn = _create_runtime_db(db_path)
+    _insert_approval_project(conn)
     conn.close()
     barrier = threading.Barrier(2)
 
     def create():
-        worker_conn = sqlite3.connect(db_path, timeout=10)
-        worker_conn.row_factory = sqlite3.Row
+        worker_conn = _connect_db(db_path)
         try:
             barrier.wait()
             return prdb.create_approval_request(
@@ -1529,6 +2297,6 @@ def test_concurrent_exact_create_returns_one_logical_approval(tmp_path):
         results = list(pool.map(lambda _: create(), range(2)))
 
     assert results[0] == results[1]
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     assert conn.execute("SELECT COUNT(*) FROM project_approvals").fetchone()[0] == 1
     conn.close()

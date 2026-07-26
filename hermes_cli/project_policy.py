@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from string import ascii_letters
+from string import ascii_letters, ascii_lowercase, ascii_uppercase
 from types import MappingProxyType
 from typing import Literal, Mapping
 
@@ -24,6 +24,40 @@ class PolicyDecision:
 
 
 _METADATA_SCALAR_TYPES = (str, int, bool, type(None))
+_ASCII_UPPER_TRANSLATION = str.maketrans(ascii_lowercase, ascii_uppercase)
+_WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*\\')
+_WINDOWS_RESERVED_DEVICE_BASENAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CLOCK$",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+        "COM¹",
+        "COM²",
+        "COM³",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
+    }
+)
+
+
+def _windows_component_is_valid(component: str) -> bool:
+    if component.endswith((" ", ".")):
+        return False
+    if any(
+        ord(character) <= 0x1F
+        or character in _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS
+        for character in component
+    ):
+        return False
+    basename = component.split(".", 1)[0].translate(_ASCII_UPPER_TRANSLATION)
+    return basename not in _WINDOWS_RESERVED_DEVICE_BASENAMES
 
 
 @dataclass(frozen=True)
@@ -126,6 +160,11 @@ def parse_canonical_path(value: object) -> CanonicalPath | None:
             return None
     else:
         components = ()
+
+    if flavor == "windows" and any(
+        not _windows_component_is_valid(component) for component in components
+    ):
+        return None
 
     if flavor == "windows":
         canonical = f"{anchor}/" + "/".join(components)

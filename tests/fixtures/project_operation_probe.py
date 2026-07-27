@@ -53,40 +53,29 @@ def _config(raw: str) -> dict[str, object]:
     return value
 
 
-def _operation_claim(
+def _claim_for_turn(
     conn: sqlite3.Connection,
-    operation_id: str,
-    explicit: object = None,
+    *,
+    project_id: str,
+    turn_id: str,
 ) -> TurnClaim:
-    if type(explicit) is dict:
-        return TurnClaim(**explicit)
-    row = conn.execute(
-        """
-        SELECT project_id, turn_id
-        FROM project_operations
-        WHERE operation_id = ?
-        """,
-        (operation_id,),
-    ).fetchone()
-    if row is None:
-        raise RuntimeError("probe operation is missing")
     state = runtime_db.runtime_state_for_project(
-        conn, row["project_id"]
+        conn, project_id
     )
     turn = runtime_db._runtime_turn_for_project(
         conn,
-        project_id=row["project_id"],
-        turn_id=row["turn_id"],
+        project_id=project_id,
+        turn_id=turn_id,
     )
     control = runtime_db._runtime_control_for_turn(
         conn,
-        project_id=row["project_id"],
-        turn_id=row["turn_id"],
+        project_id=project_id,
+        turn_id=turn_id,
     )
     lease = runtime_db._current_worker_lease_for_turn(
         conn,
-        project_id=row["project_id"],
-        turn_id=row["turn_id"],
+        project_id=project_id,
+        turn_id=turn_id,
     )
     if (
         state is None
@@ -110,56 +99,47 @@ def _operation_claim(
     )
 
 
+def _operation_claim(
+    conn: sqlite3.Connection,
+    operation_id: str,
+    explicit: object = None,
+) -> TurnClaim:
+    if type(explicit) is dict:
+        return TurnClaim(**explicit)
+    row = conn.execute(
+        """
+        SELECT project_id, turn_id
+        FROM project_operations
+        WHERE operation_id = ?
+        """,
+        (operation_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("probe operation is missing")
+    return _claim_for_turn(
+        conn,
+        project_id=row["project_id"],
+        turn_id=row["turn_id"],
+    )
+
+
 def _live_turn_claim(conn: sqlite3.Connection) -> TurnClaim:
     row = conn.execute(
         """
         SELECT project_id, turn_id
         FROM project_turns
         WHERE attempt_id IS NOT NULL
-          AND status IN ('claimed', 'started', 'awaiting_approval')
+          AND status IN ('claimed', 'awaiting_approval')
         ORDER BY project_id, sequence, turn_id
         LIMIT 1
         """
     ).fetchone()
     if row is None:
         raise RuntimeError("probe live turn is missing")
-    state = runtime_db.runtime_state_for_project(
-        conn, row["project_id"]
-    )
-    turn = runtime_db._runtime_turn_for_project(
+    return _claim_for_turn(
         conn,
         project_id=row["project_id"],
         turn_id=row["turn_id"],
-    )
-    control = runtime_db._runtime_control_for_turn(
-        conn,
-        project_id=row["project_id"],
-        turn_id=row["turn_id"],
-    )
-    lease = runtime_db._current_worker_lease_for_turn(
-        conn,
-        project_id=row["project_id"],
-        turn_id=row["turn_id"],
-    )
-    if (
-        state is None
-        or turn is None
-        or control is None
-        or lease is None
-        or turn.attempt_id is None
-        or control.claim_worker_id is None
-    ):
-        raise RuntimeError("probe live claim is incomplete")
-    return TurnClaim(
-        turn_id=turn.turn_id,
-        project_id=turn.project_id,
-        sequence=turn.sequence,
-        worker_id=control.claim_worker_id,
-        attempt_id=turn.attempt_id,
-        lease_generation=turn.lease_generation,
-        fencing_token=turn.fencing_token,
-        lease_expires_at=lease.expires_at,
-        canonical_session_id=state.conversation_tip_id,
     )
 
 

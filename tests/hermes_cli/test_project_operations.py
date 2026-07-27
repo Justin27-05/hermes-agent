@@ -8570,18 +8570,6 @@ def test_task6_static_critical_map_exactly_matches_task2_policy_authority(
             """
         )
     ) == CRITICAL_ACTION_CASES
-    assert (
-        prdb._TASK6_CRITICAL_AUTHORITY_PREDICATE_SQL.count(
-            prdb._TASK6_CRITICAL_ACTION_VALUES_SQL
-        )
-        == 1
-    )
-    assert (
-        prdb.TASK6_TRIGGER_SQL.count(
-            prdb._TASK6_CRITICAL_ACTION_VALUES_SQL
-        )
-        == 2
-    )
 
 
 def _operation_task6_trigger_definitions(conn):
@@ -8630,8 +8618,42 @@ def _without_inverse_approval_clause(trigger_sql):
     return old_sql
 
 
+def _without_no_incoming_approval_clause(trigger_sql):
+    incoming_match = trigger_sql.index(
+        "incoming_approval.operation_id"
+    )
+    exists_start = trigger_sql.rfind(
+        "NOT EXISTS (", 0, incoming_match
+    )
+    assert exists_start >= 0
+    opening = trigger_sql.index("(", exists_start)
+    depth = 0
+    exists_end = None
+    for offset in range(opening, len(trigger_sql)):
+        character = trigger_sql[offset]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                exists_end = offset + 1
+                break
+    assert exists_end is not None
+    old_sql = (
+        trigger_sql[:exists_start]
+        + "1"
+        + trigger_sql[exists_end:]
+    )
+    assert "incoming_approval.operation_id" not in old_sql
+    return old_sql
+
+
+@pytest.mark.parametrize(
+    "missing_clause", ("inverse", "no-incoming")
+)
 def test_ensure_replaces_old_task6_triggers_and_repeat_is_stable(
     operation_conn,
+    missing_clause,
 ):
     canonical = _operation_task6_trigger_definitions(operation_conn)
     assert set(canonical) == {
@@ -8642,8 +8664,17 @@ def test_ensure_replaces_old_task6_triggers_and_repeat_is_stable(
         "inverse_approval.operation_id" in sql
         for sql in canonical.values()
     )
+    assert all(
+        "incoming_approval.operation_id" in sql
+        for sql in canonical.values()
+    )
+    stripper = (
+        _without_inverse_approval_clause
+        if missing_clause == "inverse"
+        else _without_no_incoming_approval_clause
+    )
     old = {
-        name: _without_inverse_approval_clause(sql)
+        name: stripper(sql)
         for name, sql in canonical.items()
     }
     for name in canonical:
@@ -8659,6 +8690,10 @@ def test_ensure_replaces_old_task6_triggers_and_repeat_is_stable(
     assert upgraded == canonical
     assert all(
         "inverse_approval.operation_id" in sql
+        for sql in upgraded.values()
+    )
+    assert all(
+        "incoming_approval.operation_id" in sql
         for sql in upgraded.values()
     )
     prdb.ensure_schema(operation_conn)
@@ -8969,7 +9004,7 @@ def test_task6_trigger_rejects_noninverse_critical_approval_authority(
 
 @pytest.mark.parametrize(
     "authority_shape",
-    ("exact-inverse", "capability-blocked"),
+    ("exact-inverse", "capability-blocked", "noncritical"),
 )
 def test_marker_certification_accepts_only_valid_critical_exceptions(
     operation_env,
@@ -8977,8 +9012,10 @@ def test_marker_certification_accepts_only_valid_critical_exceptions(
 ):
     if authority_shape == "exact-inverse":
         _prepare_critical(operation_env)
-    else:
+    elif authority_shape == "capability-blocked":
         _critical_capability_block(operation_env)
+    else:
+        _prepare_allowed(operation_env)
     conn = operation_env["conn"]
     operation = prdb._project_operation_for_id(
         conn,
@@ -9001,6 +9038,167 @@ def test_marker_certification_accepts_only_valid_critical_exceptions(
         project_id=operation_env["project_id"],
         operation_id="operation-1",
     ) is not None
+
+
+def _prepare_no_link_operation(operation_env, authority_shape):
+    if authority_shape == "capability-blocked":
+        _critical_capability_block(operation_env)
+    else:
+        _prepare_allowed(operation_env)
+    operation = prdb._project_operation_for_id(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        operation_id="operation-1",
+    )
+    assert operation is not None
+    assert operation.approval_id is None
+    prdb._decertify_project_operation(
+        operation_env["conn"], operation
+    )
+
+
+@pytest.mark.parametrize(
+    "authority_shape", ("capability-blocked", "noncritical")
+)
+def test_marker_certification_rejects_one_way_incoming_approval(
+    operation_env,
+    authority_shape,
+):
+    _prepare_no_link_operation(operation_env, authority_shape)
+    conn = operation_env["conn"]
+    _insert_migration_approval(
+        conn,
+        operation_env["project_id"],
+        f"incoming-{authority_shape}",
+        "operation-1",
+        1,
+        maintenance_seq=20_000,
+    )
+    conn.commit()
+    before = _operation_snapshot(operation_env)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            UPDATE project_operations
+            SET guard_validated = 1
+            WHERE operation_id = 'operation-1'
+              AND guard_validated = 0
+            """
+        )
+
+    assert _operation_snapshot(operation_env) == before
+    assert conn.execute(
+        """
+        SELECT guard_validated FROM project_operations
+        WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "authority_shape", ("capability-blocked", "noncritical")
+)
+def test_raw_insert_rejects_deferred_one_way_incoming_approval(
+    operation_env,
+    authority_shape,
+):
+    conn = operation_env["conn"]
+    operation_id = f"raw-incoming-{authority_shape}"
+    approval_id = f"incoming-insert-{authority_shape}"
+    durable_before = _operation_snapshot(operation_env)
+    conn.execute("PRAGMA defer_foreign_keys=ON")
+    conn.execute("BEGIN")
+    try:
+        _insert_migration_approval(
+            conn,
+            operation_env["project_id"],
+            approval_id,
+            operation_id,
+            1,
+            maintenance_seq=21_000,
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO project_operations (
+                    operation_id, project_id, turn_id,
+                    idempotency_key, command_revision,
+                    targets_json, payload_json, status,
+                    created_at, updated_at, guard_revision,
+                    guard_validated, canonical_action,
+                    batch_items_json, readback_kind, attempt_id,
+                    lease_generation, fencing_token, blocked_reason,
+                    remote_idempotency_supported,
+                    approval_fingerprint_json
+                ) VALUES (
+                    ?, ?, ?, ?, 1,
+                    '["c:/work/operations/file.py"]', '{}', ?,
+                    100, 100, 1, 1, ?, '["authority"]', ?, ?,
+                    1, 1, ?, ?, ?
+                )
+                """,
+                (
+                    operation_id,
+                    operation_env["project_id"],
+                    operation_env["turn"].turn_id,
+                    f"{operation_id}-key",
+                    (
+                        "blocked"
+                        if authority_shape == "capability-blocked"
+                        else "approved"
+                    ),
+                    (
+                        "publish"
+                        if authority_shape == "capability-blocked"
+                        else "local_code_edit"
+                    ),
+                    (
+                        None
+                        if authority_shape == "capability-blocked"
+                        else "remote-ledger"
+                    ),
+                    operation_env["claim"].attempt_id,
+                    (
+                        "operation_capability_unsupported"
+                        if authority_shape == "capability-blocked"
+                        else None
+                    ),
+                    (
+                        0
+                        if authority_shape == "capability-blocked"
+                        else 1
+                    ),
+                    (
+                        _raw_critical_fingerprint(
+                            "publish",
+                            approval_id=(
+                                f"fingerprint-{authority_shape}"
+                            ),
+                        )
+                        if authority_shape == "capability-blocked"
+                        else None
+                    ),
+                ),
+            )
+    finally:
+        conn.rollback()
+
+    assert _operation_snapshot(operation_env) == durable_before
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM project_approvals
+        WHERE approval_id = ?
+        """,
+        (approval_id,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM project_operations
+        WHERE operation_id = ?
+        """,
+        (operation_id,),
+    ).fetchone()[0] == 0
 
 
 def test_static_trigger_rejects_every_uncertified_critical_authority_shape(

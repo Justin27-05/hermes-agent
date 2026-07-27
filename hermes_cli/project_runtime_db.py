@@ -64,6 +64,15 @@ _TASK6_CRITICAL_ACTION_VALUES_SQL = ",\n".join(
     for action, approval_class
     in TASK6_CRITICAL_ACTION_APPROVAL_CLASSES
 )
+
+_TASK6_NO_INCOMING_APPROVAL_LINK_SQL = """
+NOT EXISTS (
+    SELECT 1
+    FROM project_approvals AS incoming_approval
+    WHERE incoming_approval.project_id = NEW.project_id
+      AND incoming_approval.operation_id = NEW.operation_id
+)
+"""
 _TASK6_CRITICAL_APPROVAL_CLASS_BY_ACTION = dict(
     TASK6_CRITICAL_ACTION_APPROVAL_CLASSES
 )
@@ -584,6 +593,7 @@ WHERE status = 'pending' AND operation_id IS NOT NULL;
 """
 
 _TASK6_CRITICAL_AUTHORITY_PREDICATE_SQL = """
+(
 COALESCE(
     (
         SELECT
@@ -700,9 +710,17 @@ __TASK6_CRITICAL_ACTION_VALUES__
         AND NEW.approval_id IS NULL
     )
 )
+AND (
+    NEW.approval_id IS NOT NULL
+    OR (__TASK6_NO_INCOMING_APPROVAL_LINK__)
+)
+)
 """.replace(
     "__TASK6_CRITICAL_ACTION_VALUES__",
     _TASK6_CRITICAL_ACTION_VALUES_SQL,
+).replace(
+    "__TASK6_NO_INCOMING_APPROVAL_LINK__",
+    _TASK6_NO_INCOMING_APPROVAL_LINK_SQL,
 )
 
 TASK6_TRIGGER_SQL = """
@@ -2570,6 +2588,8 @@ def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
                 not in trigger["sql"]
                 or "critical.column2" not in trigger["sql"]
                 or "inverse_approval.operation_id"
+                not in trigger["sql"]
+                or "incoming_approval.operation_id"
                 not in trigger["sql"]
             ):
                 conn.execute(f"DROP TRIGGER {trigger_name}")

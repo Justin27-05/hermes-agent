@@ -1036,12 +1036,19 @@ WHEN NOT (
            AND length(NEW.operation_id) > 0
            AND typeof(NEW.operation_maintenance_seq) = 'integer'
            AND NEW.operation_maintenance_seq > 0
+           AND EXISTS (
+               SELECT 1
+               FROM project_operations AS operation
+               WHERE operation.project_id = NEW.project_id
+                 AND operation.operation_id = NEW.operation_id
+                 AND operation.guard_validated = 0
+           )
        )
 )
 BEGIN
     SELECT RAISE(
         ABORT,
-        'linked project approval requires positive maintenance sequence'
+        'linked approval requires positive sequence and decertified operation'
     );
 END;
 

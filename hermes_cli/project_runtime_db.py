@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from typing import Iterator, Literal, Optional
 
@@ -109,6 +110,12 @@ CREATE TABLE IF NOT EXISTS project_turns (
                       CHECK (
                           terminal_result_id IS NULL
                           OR length(terminal_result_id) > 0
+                      ),
+    recovery_block_key TEXT
+                      REFERENCES project_events(event_id)
+                      CHECK (
+                          recovery_block_key IS NULL
+                          OR length(recovery_block_key) > 0
                       ),
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
@@ -350,6 +357,66 @@ ON project_worker_leases(expires_at, project_id, turn_id);
 
 CREATE INDEX IF NOT EXISTS idx_project_turns_project_sequence
 ON project_turns(project_id, sequence, turn_id);
+
+CREATE INDEX IF NOT EXISTS idx_project_turns_actionable_recovery
+ON project_turns(project_id, sequence, turn_id)
+WHERE status = 'reconciling' AND recovery_block_key IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_events_recovery_block_attempt
+ON project_events(
+    project_id,
+    turn_id,
+    json_array(
+        json_extract(payload_json, '$.attempt_id'),
+        json_extract(payload_json, '$.lease_generation'),
+        json_extract(payload_json, '$.fencing_token')
+    )
+)
+WHERE kind = 'turn.recovery_blocked';
+"""
+
+_RECOVERY_EXPIRED_LEASES_SQL = """
+SELECT turn.project_id, turn.turn_id, turn.sequence
+FROM project_worker_leases AS lease
+     INDEXED BY idx_project_worker_leases_expiry
+JOIN project_turns AS turn
+  ON turn.project_id = lease.project_id
+ AND turn.turn_id = lease.turn_id
+WHERE lease.expires_at <= ?
+  AND turn.status IN ('claimed', 'stop_requested')
+ORDER BY lease.expires_at, lease.project_id, lease.turn_id
+LIMIT ?
+"""
+
+_RECOVERY_RECONCILING_SQL = """
+SELECT turn.project_id, turn.turn_id, turn.sequence
+FROM project_turns AS turn
+     INDEXED BY idx_project_turns_actionable_recovery
+WHERE turn.status = 'reconciling'
+  AND turn.recovery_block_key IS NULL
+ORDER BY turn.project_id, turn.sequence, turn.turn_id
+LIMIT ?
+"""
+
+_RECOVERY_BLOCK_LOOKUP_SQL = """
+SELECT event_id, payload_json
+FROM project_events INDEXED BY idx_project_events_recovery_block_attempt
+WHERE project_id = ? AND turn_id = ?
+  AND kind = 'turn.recovery_blocked'
+  AND json_array(
+        json_extract(payload_json, '$.attempt_id'),
+        json_extract(payload_json, '$.lease_generation'),
+        json_extract(payload_json, '$.fencing_token')
+      ) = json_array(?, ?, ?)
+LIMIT 1
+"""
+
+_RECOVERY_BLOCK_KEY_LOOKUP_SQL = """
+SELECT event_id, payload_json
+FROM project_events
+WHERE event_id = ? AND project_id = ? AND turn_id = ?
+  AND kind = 'turn.recovery_blocked'
+LIMIT 1
 """
 
 
@@ -384,6 +451,7 @@ class RuntimeTurnRecord:
     fencing_token: int
     execution_state: str | None
     terminal_result_id: str | None
+    recovery_block_key: str | None
     created_at: int
     updated_at: int
 
@@ -521,6 +589,136 @@ def _stored_int(
 ) -> bool:
     return (optional and value is None) or (
         type(value) is int and value >= minimum
+    )
+
+
+def _recovery_block_key(
+    *,
+    project_id: str,
+    turn_id: str,
+    attempt_id: str,
+    lease_generation: int,
+    fencing_token: int,
+) -> str:
+    """Return the opaque deterministic key for one exact blocked attempt."""
+    identity = json.dumps(
+        {
+            "attempt_id": attempt_id,
+            "fencing_token": fencing_token,
+            "lease_generation": lease_generation,
+            "project_id": project_id,
+            "turn_id": turn_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return (
+        "recovery-blocked-"
+        f"{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
+    )
+
+
+def _decode_recovery_block_payload(payload_json: object) -> dict[str, object]:
+    """Decode one canonical recovery-block audit payload exactly."""
+    if type(payload_json) is not str:
+        raise RuntimeError("recovery block event payload is malformed")
+    try:
+        payload = json.loads(
+            payload_json,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(value)
+            ),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "recovery block event payload is malformed"
+        ) from exc
+    if (
+        type(payload) is not dict
+        or set(payload)
+        != {
+            "attempt_id",
+            "fencing_token",
+            "lease_generation",
+            "source_status",
+            "turn_id",
+            "version",
+        }
+        or not _stored_text(payload["attempt_id"])
+        or not _stored_int(payload["fencing_token"], minimum=1)
+        or not _stored_int(payload["lease_generation"], minimum=1)
+        or type(payload["source_status"]) is not str
+        or payload["source_status"] not in {"claimed", "stop_requested"}
+        or not _stored_text(payload["turn_id"])
+        or not _stored_int(payload["version"])
+    ):
+        raise RuntimeError("recovery block event payload is malformed")
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    if canonical != payload_json:
+        raise RuntimeError("recovery block event payload is not canonical")
+    return payload
+
+
+def _validate_recovery_block_payload(
+    payload_json: object,
+    *,
+    turn_id: str,
+    attempt_id: str,
+    lease_generation: int,
+    fencing_token: int,
+) -> None:
+    payload = _decode_recovery_block_payload(payload_json)
+    if (
+        payload["turn_id"] != turn_id
+        or payload["attempt_id"] != attempt_id
+        or payload["lease_generation"] != lease_generation
+        or payload["fencing_token"] != fencing_token
+    ):
+        raise RuntimeError(
+            "recovery block event payload has inconsistent identity"
+        )
+
+
+def _valid_task5_turn_metadata(
+    *,
+    status: str,
+    attempt_id: str | None,
+    lease_generation: int,
+    fencing_token: int,
+    execution_state: str | None,
+    terminal_result_id: str | None,
+    recovery_block_key: str | None,
+    project_id: str,
+    turn_id: str,
+) -> bool:
+    """Check cross-column states reachable by Task 5 or its migration."""
+    if attempt_id is None and execution_state is not None:
+        return False
+    if recovery_block_key is not None:
+        if attempt_id is None or status != "reconciling":
+            return False
+        if recovery_block_key != _recovery_block_key(
+            project_id=project_id,
+            turn_id=turn_id,
+            attempt_id=attempt_id,
+            lease_generation=lease_generation,
+            fencing_token=fencing_token,
+        ):
+            return False
+    if terminal_result_id is None:
+        return True
+    return (
+        status in {"succeeded", "failed"}
+        and attempt_id is not None
+        and execution_state != "not_started"
     )
 
 
@@ -737,30 +935,114 @@ def _ensure_run_control_columns(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_turn_columns(conn: sqlite3.Connection) -> None:
-    """Add Task-5 attempt/result evidence without rewriting legacy rows."""
-    for name, ddl in (
-        (
-            "execution_state",
-            """
-            execution_state TEXT
-            CHECK (
-                execution_state IS NULL
-                OR execution_state IN ('not_started', 'started')
+    """Add Task-5 evidence and migrate its exact block projection."""
+    with write_transaction(conn):
+        block_key_added = False
+        for name, ddl in (
+            (
+                "execution_state",
+                """
+                execution_state TEXT
+                CHECK (
+                    execution_state IS NULL
+                    OR execution_state IN ('not_started', 'started')
+                )
+                """,
+            ),
+            (
+                "terminal_result_id",
+                """
+                terminal_result_id TEXT
+                CHECK (
+                    terminal_result_id IS NULL
+                    OR length(terminal_result_id) > 0
+                )
+                """,
+            ),
+            (
+                "recovery_block_key",
+                """
+                recovery_block_key TEXT
+                REFERENCES project_events(event_id)
+                CHECK (
+                    recovery_block_key IS NULL
+                    OR length(recovery_block_key) > 0
+                )
+                """,
+            ),
+        ):
+            added = add_column_if_missing(
+                conn, "project_turns", name, ddl
             )
-            """,
-        ),
-        (
-            "terminal_result_id",
-            """
-            terminal_result_id TEXT
-            CHECK (
-                terminal_result_id IS NULL
-                OR length(terminal_result_id) > 0
+            if name == "recovery_block_key":
+                block_key_added = added
+        if block_key_added:
+            _backfill_recovery_block_keys(conn)
+
+
+def _backfill_recovery_block_keys(conn: sqlite3.Connection) -> None:
+    """Project canonical pre-column block events during one-time migration."""
+    rows = conn.execute(
+        """
+        SELECT turn.project_id, turn.turn_id, turn.attempt_id,
+               turn.lease_generation, turn.fencing_token,
+               event.event_id, event.payload_json
+        FROM project_turns AS turn
+        JOIN project_events AS event
+          ON event.project_id = turn.project_id
+         AND event.turn_id = turn.turn_id
+         AND event.kind = 'turn.recovery_blocked'
+        WHERE turn.status = 'reconciling'
+          AND turn.recovery_block_key IS NULL
+        ORDER BY turn.project_id, turn.turn_id, event.event_id
+        """
+    ).fetchall()
+    migrated: set[tuple[str, str]] = set()
+    for row in rows:
+        if not (
+            _stored_text(row["project_id"])
+            and _stored_text(row["turn_id"])
+            and _stored_text(row["attempt_id"])
+            and _stored_int(row["lease_generation"], minimum=1)
+            and _stored_int(row["fencing_token"], minimum=1)
+        ):
+            raise RuntimeError("malformed recovery block during migration")
+        payload = _decode_recovery_block_payload(row["payload_json"])
+        if payload["turn_id"] != row["turn_id"]:
+            raise RuntimeError(
+                "recovery block event payload has inconsistent identity"
             )
+        if (
+            payload["attempt_id"] != row["attempt_id"]
+            or payload["lease_generation"] != row["lease_generation"]
+            or payload["fencing_token"] != row["fencing_token"]
+        ):
+            continue
+        identity = (row["project_id"], row["turn_id"])
+        block_key = _recovery_block_key(
+            project_id=row["project_id"],
+            turn_id=row["turn_id"],
+            attempt_id=row["attempt_id"],
+            lease_generation=row["lease_generation"],
+            fencing_token=row["fencing_token"],
+        )
+        if identity in migrated or row["event_id"] != block_key:
+            raise RuntimeError(
+                "ambiguous recovery block during migration"
+            )
+        migrated.add(identity)
+        if conn.execute(
+            """
+            UPDATE project_turns SET recovery_block_key = ?
+            WHERE project_id = ? AND turn_id = ?
+              AND status = 'reconciling'
+              AND recovery_block_key IS NULL
             """,
-        ),
-    ):
-        add_column_if_missing(conn, "project_turns", name, ddl)
+            (block_key, row["project_id"], row["turn_id"]),
+        ).rowcount != 1:
+            raise RuntimeError(
+                "recovery block changed during migration"
+            )
 
 
 @contextlib.contextmanager
@@ -825,8 +1107,20 @@ def runtime_turn_from_row(row: sqlite3.Row) -> RuntimeTurnRecord:
             )
         )
         and _stored_text(row["terminal_result_id"], optional=True)
+        and _stored_text(row["recovery_block_key"], optional=True)
         and _stored_int(row["created_at"])
         and _stored_int(row["updated_at"])
+        and _valid_task5_turn_metadata(
+            status=row["status"],
+            attempt_id=row["attempt_id"],
+            lease_generation=row["lease_generation"],
+            fencing_token=row["fencing_token"],
+            execution_state=row["execution_state"],
+            terminal_result_id=row["terminal_result_id"],
+            recovery_block_key=row["recovery_block_key"],
+            project_id=row["project_id"],
+            turn_id=row["turn_id"],
+        )
     ):
         raise RuntimeError("malformed persisted runtime turn")
     if (
@@ -859,6 +1153,7 @@ def runtime_turn_from_row(row: sqlite3.Row) -> RuntimeTurnRecord:
         fencing_token=row["fencing_token"],
         execution_state=row["execution_state"],
         terminal_result_id=row["terminal_result_id"],
+        recovery_block_key=row["recovery_block_key"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -1087,6 +1382,34 @@ def _validate_runtime_turn_pair(
     turn: RuntimeTurnRecord,
 ) -> RuntimeControlRecord:
     """Fail closed unless one persisted turn has its exact control/lease pair."""
+    if not _valid_task5_turn_metadata(
+        status=turn.status,
+        attempt_id=turn.attempt_id,
+        lease_generation=turn.lease_generation,
+        fencing_token=turn.fencing_token,
+        execution_state=turn.execution_state,
+        terminal_result_id=turn.terminal_result_id,
+        recovery_block_key=turn.recovery_block_key,
+        project_id=turn.project_id,
+        turn_id=turn.turn_id,
+    ):
+        raise RuntimeError("runtime turn has inconsistent Task-5 metadata")
+    event_block_key = (
+        _recovery_block_event_key(
+            conn,
+            project_id=turn.project_id,
+            turn_id=turn.turn_id,
+            attempt_id=turn.attempt_id,
+            lease_generation=turn.lease_generation,
+            fencing_token=turn.fencing_token,
+        )
+        if turn.attempt_id is not None
+        else None
+    )
+    if event_block_key != turn.recovery_block_key:
+        raise RuntimeError(
+            "runtime turn recovery block projection is inconsistent"
+        )
     control = _runtime_control_for_turn(
         conn, project_id=turn.project_id, turn_id=turn.turn_id
     )
@@ -1247,6 +1570,19 @@ def _claim_oldest_queued_runtime_turn(
                         AND length(turn.terminal_result_id) > 0
                     )
                 )
+                AND (
+                    turn.attempt_id IS NOT NULL
+                    OR turn.execution_state IS NULL
+                )
+                AND (
+                    turn.terminal_result_id IS NULL
+                    OR (
+                        turn.status IN ('succeeded', 'failed')
+                        AND turn.attempt_id IS NOT NULL
+                        AND turn.execution_state IS NOT 'not_started'
+                    )
+                )
+                AND turn.recovery_block_key IS NULL
                 AND typeof(turn.created_at) = 'integer'
                 AND turn.created_at >= 0
                 AND typeof(turn.updated_at) = 'integer'
@@ -1342,7 +1678,8 @@ def _claim_oldest_queued_runtime_turn(
         UPDATE project_turns
         SET status = 'claimed', attempt_id = ?, lease_generation = ?,
             fencing_token = ?, execution_state = 'not_started',
-            terminal_result_id = NULL, updated_at = ?
+            terminal_result_id = NULL, recovery_block_key = NULL,
+            updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND status = 'queued'
           AND lease_generation = ? AND fencing_token = ?
           AND (
@@ -1780,6 +2117,52 @@ def _commit_runtime_turn(
     return result
 
 
+def _recovery_block_event_key(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    turn_id: str,
+    attempt_id: str,
+    lease_generation: int,
+    fencing_token: int,
+) -> str | None:
+    """Return and validate the canonical block event for one exact attempt."""
+    block_key = _recovery_block_key(
+        project_id=project_id,
+        turn_id=turn_id,
+        attempt_id=attempt_id,
+        lease_generation=lease_generation,
+        fencing_token=fencing_token,
+    )
+    identity_row = conn.execute(
+        _RECOVERY_BLOCK_LOOKUP_SQL,
+        (
+            project_id,
+            turn_id,
+            attempt_id,
+            lease_generation,
+            fencing_token,
+        ),
+    ).fetchone()
+    key_row = conn.execute(
+        _RECOVERY_BLOCK_KEY_LOOKUP_SQL,
+        (block_key, project_id, turn_id),
+    ).fetchone()
+    row = identity_row if identity_row is not None else key_row
+    if row is None:
+        return None
+    _validate_recovery_block_payload(
+        row["payload_json"],
+        attempt_id=attempt_id,
+        turn_id=turn_id,
+        lease_generation=lease_generation,
+        fencing_token=fencing_token,
+    )
+    if row["event_id"] != block_key:
+        raise RuntimeError("recovery block event identity is inconsistent")
+    return block_key
+
+
 def _recovery_block_exists(
     conn: sqlite3.Connection,
     *,
@@ -1789,26 +2172,58 @@ def _recovery_block_exists(
     lease_generation: int,
     fencing_token: int,
 ) -> bool:
-    """Return whether this exact attempt already has a durable block marker."""
-    return conn.execute(
-        """
-        SELECT 1
-        FROM project_events
-        WHERE project_id = ? AND turn_id = ?
-          AND kind = 'turn.recovery_blocked'
-          AND json_extract(payload_json, '$.attempt_id') = ?
-          AND json_extract(payload_json, '$.lease_generation') = ?
-          AND json_extract(payload_json, '$.fencing_token') = ?
-        LIMIT 1
-        """,
-        (
-            project_id,
-            turn_id,
-            attempt_id,
-            lease_generation,
-            fencing_token,
-        ),
-    ).fetchone() is not None
+    """Return whether this exact attempt already has a canonical block."""
+    return (
+        _recovery_block_event_key(
+            conn,
+            project_id=project_id,
+            turn_id=turn_id,
+            attempt_id=attempt_id,
+            lease_generation=lease_generation,
+            fencing_token=fencing_token,
+        )
+        is not None
+    )
+
+
+def _set_recovery_block_key(
+    conn: sqlite3.Connection,
+    *,
+    candidate: RecoveryCandidateRecord,
+    block_key: str,
+) -> bool:
+    """Materialize one canonical block event on its exact parked attempt."""
+    event_key = _recovery_block_event_key(
+        conn,
+        project_id=candidate.project_id,
+        turn_id=candidate.turn_id,
+        attempt_id=candidate.attempt_id,
+        lease_generation=candidate.lease_generation,
+        fencing_token=candidate.fencing_token,
+    )
+    if event_key != block_key:
+        raise RuntimeError("recovery block event is missing")
+    return (
+        conn.execute(
+            """
+            UPDATE project_turns SET recovery_block_key = ?
+            WHERE project_id = ? AND turn_id = ? AND sequence = ?
+              AND status = 'reconciling' AND attempt_id = ?
+              AND lease_generation = ? AND fencing_token = ?
+              AND recovery_block_key IS NULL
+            """,
+            (
+                block_key,
+                candidate.project_id,
+                candidate.turn_id,
+                candidate.sequence,
+                candidate.attempt_id,
+                candidate.lease_generation,
+                candidate.fencing_token,
+            ),
+        ).rowcount
+        == 1
+    )
 
 
 def _recovery_candidate_for_attempt(
@@ -1880,65 +2295,28 @@ def _recovery_candidates(
     limit: int,
 ) -> tuple[RecoveryCandidateRecord, ...]:
     """Select a bounded deterministic batch of expired or parked attempts."""
-    rows = conn.execute(
-        """
-        SELECT candidate.project_id, candidate.turn_id
-        FROM (
-            SELECT turn.project_id, turn.turn_id, turn.sequence
-            FROM project_worker_leases AS lease
-                 INDEXED BY idx_project_worker_leases_expiry
-            JOIN project_turns AS turn
-              ON turn.project_id = lease.project_id
-             AND turn.turn_id = lease.turn_id
-            WHERE lease.expires_at <= ?
-              AND turn.status IN ('claimed', 'stop_requested')
-
-            UNION ALL
-
-            SELECT turn.project_id, turn.turn_id, turn.sequence
-            FROM project_turns AS turn
-            JOIN project_run_controls AS control
-              ON control.project_id = turn.project_id
-             AND control.turn_id = turn.turn_id
-            LEFT JOIN project_worker_leases AS lease
-              ON lease.project_id = turn.project_id
-             AND lease.turn_id = turn.turn_id
-            WHERE turn.status IN ('claimed', 'stop_requested')
-              AND control.claim_lease_expires_at <= ?
-              AND (
-                    lease.turn_id IS NULL
-                    OR lease.expires_at > ?
-              )
-
-            UNION ALL
-
-            SELECT turn.project_id, turn.turn_id, turn.sequence
-            FROM project_turns AS turn
-            WHERE turn.status = 'reconciling'
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM project_events AS event
-                  WHERE event.project_id = turn.project_id
-                    AND event.turn_id = turn.turn_id
-                    AND event.kind = 'turn.recovery_blocked'
-                    AND json_extract(
-                          event.payload_json, '$.attempt_id'
-                        ) = turn.attempt_id
-                    AND json_extract(
-                          event.payload_json, '$.lease_generation'
-                        ) = turn.lease_generation
-                    AND json_extract(
-                          event.payload_json, '$.fencing_token'
-                        ) = turn.fencing_token
-              )
-        ) AS candidate
-        ORDER BY candidate.project_id, candidate.sequence, candidate.turn_id
-        LIMIT ?
-        """,
-        (now, now, now, limit),
-    ).fetchall()
+    branch_rows = (
+        conn.execute(
+            _RECOVERY_EXPIRED_LEASES_SQL, (now, limit)
+        ).fetchall(),
+        conn.execute(_RECOVERY_RECONCILING_SQL, (limit,)).fetchall(),
+    )
+    unique_rows: dict[tuple[str, str], sqlite3.Row] = {}
+    for rows in branch_rows:
+        for row in rows:
+            unique_rows.setdefault(
+                (row["project_id"], row["turn_id"]), row
+            )
+    selected_rows = sorted(
+        unique_rows.values(),
+        key=lambda row: (
+            row["project_id"],
+            row["sequence"],
+            row["turn_id"],
+        ),
+    )[:limit]
     candidates: list[RecoveryCandidateRecord] = []
-    for row in rows:
+    for row in selected_rows:
         turn = _runtime_turn_for_project(
             conn,
             project_id=row["project_id"],
@@ -2028,6 +2406,7 @@ def _park_expired_runtime_turn(
         WHERE project_id = ? AND turn_id = ? AND sequence = ?
           AND status = ? AND attempt_id = ?
           AND lease_generation = ? AND fencing_token = ?
+          AND recovery_block_key IS NULL
           AND (
                 (execution_state IS NULL AND ? IS NULL)
                 OR execution_state = ?
@@ -2147,11 +2526,19 @@ def _apply_recovery_outcome(
             UPDATE project_turns
             SET status = 'queued', attempt_id = NULL,
                 execution_state = NULL, terminal_result_id = NULL,
+                recovery_block_key = NULL,
                 updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
             WHERE project_id = ? AND turn_id = ? AND sequence = ?
               AND status = 'reconciling' AND attempt_id = ?
               AND lease_generation = ? AND fencing_token = ?
               AND terminal_result_id IS NULL
+              AND recovery_block_key IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM project_runtime_state AS state
+                  WHERE state.project_id = project_turns.project_id
+                    AND state.lifecycle = 'active'
+              )
         """
     else:
         turn_sql = """
@@ -2162,6 +2549,7 @@ def _apply_recovery_outcome(
               AND status = 'reconciling' AND attempt_id = ?
               AND lease_generation = ? AND fencing_token = ?
               AND terminal_result_id IS NULL
+              AND recovery_block_key IS NULL
         """
     if outcome == "queued":
         turn_parameters = (

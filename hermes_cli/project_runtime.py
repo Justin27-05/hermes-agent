@@ -863,6 +863,8 @@ class ProjectRuntime:
     ) -> bool:
         if type(result) is not TurnReadbackResult:
             return False
+        if type(result.outcome) is not str:
+            return False
         if result.outcome in {"succeeded", "failed"}:
             return _is_text(result.result_id)
         if result.outcome not in {"stopped", "unknown"}:
@@ -954,6 +956,29 @@ class ProjectRuntime:
                     candidate.project_id, candidate.turn_id
                 )
                 return self._turn_from_record(current)
+            if runtime_db._recovery_block_exists(
+                self._conn,
+                project_id=candidate.project_id,
+                turn_id=candidate.turn_id,
+                attempt_id=candidate.attempt_id,
+                lease_generation=candidate.lease_generation,
+                fencing_token=candidate.fencing_token,
+            ):
+                return self._turn_from_record(
+                    self._turn(candidate.project_id, candidate.turn_id)
+                )
+            if outcome == "queued":
+                state = runtime_db.runtime_state_for_project(
+                    self._conn, candidate.project_id
+                )
+                if state is None:
+                    raise RuntimeError(
+                        "recovery candidate has no runtime state"
+                    )
+                if state.lifecycle != "active":
+                    return self._block_current_recovery(
+                        current_candidate, now=now
+                    )
             updated = runtime_db._apply_recovery_outcome(
                 self._conn,
                 candidate=current_candidate,
@@ -1012,54 +1037,65 @@ class ProjectRuntime:
                 return self._turn_from_record(
                     self._turn(candidate.project_id, candidate.turn_id)
                 )
-            if not runtime_db._recovery_block_exists(
-                self._conn,
-                project_id=candidate.project_id,
-                turn_id=candidate.turn_id,
-                attempt_id=candidate.attempt_id,
-                lease_generation=candidate.lease_generation,
-                fencing_token=candidate.fencing_token,
-            ):
-                state = runtime_db.runtime_state_for_project(
-                    self._conn, candidate.project_id
-                )
-                if state is None:
-                    raise RuntimeError(
-                        "recovery candidate has no runtime state"
-                    )
-                updated_state = self._advance_state(state, now)
-                payload = {
-                    "attempt_id": candidate.attempt_id,
-                    "fencing_token": candidate.fencing_token,
-                    "lease_generation": candidate.lease_generation,
-                    "source_status": candidate.source_status,
-                    "turn_id": candidate.turn_id,
-                    "version": updated_state.version,
-                }
-                identity = canonical_json_object(
-                    {
-                        "attempt_id": candidate.attempt_id,
-                        "fencing_token": candidate.fencing_token,
-                        "lease_generation": candidate.lease_generation,
-                        "project_id": candidate.project_id,
-                        "turn_id": candidate.turn_id,
-                    }
-                )
-                runtime_db._append_runtime_event(
-                    self._conn,
-                    event_id=(
-                        "recovery-blocked-"
-                        f"{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
-                    ),
-                    project_id=candidate.project_id,
-                    kind="turn.recovery_blocked",
-                    turn_id=candidate.turn_id,
-                    payload_json=canonical_json_object(payload),
-                    created_at=now,
-                )
-            return self._turn_from_record(
-                self._turn(candidate.project_id, candidate.turn_id)
+            return self._block_current_recovery(
+                current_candidate, now=now
             )
+
+    def _block_current_recovery(
+        self,
+        candidate: runtime_db.RecoveryCandidateRecord,
+        *,
+        now: int,
+    ) -> ProjectTurn:
+        block_key = runtime_db._recovery_block_key(
+            project_id=candidate.project_id,
+            turn_id=candidate.turn_id,
+            attempt_id=candidate.attempt_id,
+            lease_generation=candidate.lease_generation,
+            fencing_token=candidate.fencing_token,
+        )
+        if not runtime_db._recovery_block_exists(
+            self._conn,
+            project_id=candidate.project_id,
+            turn_id=candidate.turn_id,
+            attempt_id=candidate.attempt_id,
+            lease_generation=candidate.lease_generation,
+            fencing_token=candidate.fencing_token,
+        ):
+            state = runtime_db.runtime_state_for_project(
+                self._conn, candidate.project_id
+            )
+            if state is None:
+                raise RuntimeError("recovery candidate has no runtime state")
+            updated_state = self._advance_state(state, now)
+            payload = {
+                "attempt_id": candidate.attempt_id,
+                "fencing_token": candidate.fencing_token,
+                "lease_generation": candidate.lease_generation,
+                "source_status": candidate.source_status,
+                "turn_id": candidate.turn_id,
+                "version": updated_state.version,
+            }
+            runtime_db._append_runtime_event(
+                self._conn,
+                event_id=block_key,
+                project_id=candidate.project_id,
+                kind="turn.recovery_blocked",
+                turn_id=candidate.turn_id,
+                payload_json=canonical_json_object(payload),
+                created_at=now,
+            )
+        if not runtime_db._set_recovery_block_key(
+            self._conn,
+            candidate=candidate,
+            block_key=block_key,
+        ):
+            current = self._turn(candidate.project_id, candidate.turn_id)
+            if current.recovery_block_key != block_key:
+                raise RuntimeError("recovery block projection changed")
+        return self._turn_from_record(
+            self._turn(candidate.project_id, candidate.turn_id)
+        )
 
     def enqueue_turn(
         self,

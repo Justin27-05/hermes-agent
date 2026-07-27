@@ -179,6 +179,15 @@ CREATE TABLE IF NOT EXISTS project_approvals (
                             typeof(effective_runtime_version) = 'integer'
                             AND effective_runtime_version >= 0
                         ),
+    turn_expected_control_version INTEGER
+                        CHECK (
+                            turn_expected_control_version IS NULL
+                            OR (
+                                typeof(turn_expected_control_version)
+                                    = 'integer'
+                                AND turn_expected_control_version >= 0
+                            )
+                        ),
     expected_lifecycle  TEXT NOT NULL
                         CHECK (
                             expected_lifecycle IN (
@@ -632,6 +641,19 @@ def _ensure_approval_columns(conn: sqlite3.Connection) -> None:
         ("consumed_at", "consumed_at INTEGER"),
         ("expected_runtime_version", "expected_runtime_version INTEGER"),
         ("effective_runtime_version", "effective_runtime_version INTEGER"),
+        (
+            "turn_expected_control_version",
+            """
+            turn_expected_control_version INTEGER
+            CHECK (
+                turn_expected_control_version IS NULL
+                OR (
+                    typeof(turn_expected_control_version) = 'integer'
+                    AND turn_expected_control_version >= 0
+                )
+            )
+            """,
+        ),
         ("expected_lifecycle", "expected_lifecycle TEXT"),
         ("expected_phase", "expected_phase TEXT"),
     ):
@@ -1965,6 +1987,7 @@ def _create_approval_request(
     *,
     now: int,
     effective_runtime_version: int,
+    turn_expected_control_version: int | None = None,
 ) -> ApprovalRequest:
     """Persist one request with distinct immutable and live authority versions."""
     canonical_targets, targets_json, boundary_json = _approval_storage_values(
@@ -1976,6 +1999,13 @@ def _create_approval_request(
     ):
         raise ValueError(
             "effective_runtime_version must be a non-negative integer"
+        )
+    if turn_expected_control_version is not None and (
+        type(turn_expected_control_version) is not int
+        or turn_expected_control_version < 0
+    ):
+        raise ValueError(
+            "turn_expected_control_version must be a non-negative integer"
         )
     with write_transaction(conn):
         state = _runtime_state_for_project(conn, request.project_id)
@@ -1995,11 +2025,12 @@ def _create_approval_request(
                     approval_id, project_id, actor_id, authorization_actor_id,
                     canonical_action, approval_class, command_revision,
                     expected_runtime_version, effective_runtime_version,
-                    expected_lifecycle, expected_phase,
+                    turn_expected_control_version, expected_lifecycle,
+                    expected_phase,
                     targets_json, batch_boundary_json, status, expires_at,
                     resolved_at, resolved_by_actor_id, consumed_at, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?,
                     NULL, NULL, NULL, ?
                 )
                 ON CONFLICT DO NOTHING
@@ -2014,6 +2045,7 @@ def _create_approval_request(
                     request.command_revision,
                     request.expected_runtime_version,
                     effective_runtime_version,
+                    turn_expected_control_version,
                     request.expected_lifecycle,
                     request.expected_phase,
                     targets_json,
@@ -2036,6 +2068,13 @@ def _create_approval_request(
         ) or row["effective_runtime_version"] != effective_runtime_version:
             raise ApprovalConflictError(
                 "approval id or immutable batch boundary already exists"
+            )
+        if (
+            row["turn_expected_control_version"]
+            != turn_expected_control_version
+        ):
+            raise ApprovalConflictError(
+                "approval id or immutable control boundary already exists"
             )
     result = _approval_from_row(row)
     if result.targets != canonical_targets:

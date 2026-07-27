@@ -9,6 +9,7 @@ import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
+from typing import Literal, Mapping, get_type_hints
 
 import pytest
 
@@ -21,6 +22,40 @@ def _event_count(conn, project_id):
     return conn.execute(
         "SELECT COUNT(*) FROM project_events WHERE project_id = ?", (project_id,)
     ).fetchone()[0]
+
+
+def _runtime_mutation_snapshot(conn, project_id, turn_id):
+    return (
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_approvals
+                WHERE project_id = ?
+                ORDER BY approval_id
+                """,
+                (project_id,),
+            )
+        ),
+        tuple(conn.execute(
+            "SELECT * FROM project_turns WHERE turn_id = ?", (turn_id,)
+        ).fetchone()),
+        tuple(conn.execute(
+            "SELECT * FROM project_run_controls WHERE turn_id = ?", (turn_id,)
+        ).fetchone()),
+        prdb.runtime_state_for_project(conn, project_id),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_events
+                WHERE project_id = ?
+                ORDER BY sequence
+                """,
+                (project_id,),
+            )
+        ),
+    )
 
 
 def _adopt_bound_project(conn, *, name, root, binding, external):
@@ -41,6 +76,7 @@ def _approval_request(
     *,
     approval_id="approval",
     expected_runtime_version=2,
+    expected_lifecycle="active",
     expires_at=1000,
 ):
     return prdb.ApprovalRequest(
@@ -52,7 +88,7 @@ def _approval_request(
         approval_class="publish",
         command_revision=1,
         expected_runtime_version=expected_runtime_version,
-        expected_lifecycle="active",
+        expected_lifecycle=expected_lifecycle,
         expected_phase="implementation",
         targets=("C:/work/runtime/release",),
         batch_id="batch",
@@ -108,6 +144,31 @@ def runtime_env(tmp_path):
 def test_public_values_and_control_method_signatures_match_the_task4_contract():
     module = importlib.import_module("hermes_cli.project_runtime")
 
+    assert module.JSONScalar == str | int | float | bool | None
+    assert module.JSONValue == (
+        module.JSONScalar
+        | tuple["JSONValue", ...]
+        | Mapping[str, "JSONValue"]
+    )
+    assert module.TurnStatus == Literal[
+        "queued",
+        "claimed",
+        "awaiting_approval",
+        "stop_requested",
+        "stopped",
+        "reconciling",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ]
+    assert module.ControlState == Literal[
+        "running",
+        "stop_requested",
+        "stopped",
+        "resume_requested",
+        "terminal",
+    ]
+    assert module.ApprovalRequest is prdb.ApprovalRequest
     assert tuple(field.name for field in fields(module.ProjectTurn)) == (
         "turn_id", "project_id", "sequence", "idempotency_key", "payload",
         "origin_binding_id", "status", "attempt_id", "lease_generation",
@@ -132,6 +193,19 @@ def test_public_values_and_control_method_signatures_match_the_task4_contract():
     assert tuple(inspect.signature(module.ProjectRuntime.request_turn_approval).parameters) == (
         "self", "turn_id", "request", "actor", "expected_control_version",
     )
+    turn_hints = get_type_hints(module.ProjectTurn)
+    control_hints = get_type_hints(module.RunControl)
+    approval_hints = get_type_hints(module.TurnApproval)
+    request_hints = get_type_hints(module.ProjectRuntime.request_turn_approval)
+    assert (
+        module.ProjectTurn.__annotations__["payload"]
+        == "Mapping[str, JSONValue]"
+    )
+    assert turn_hints["status"] == module.TurnStatus
+    assert control_hints["control_state"] == module.ControlState
+    assert approval_hints["approval"] is module.ApprovalRequest
+    assert request_hints["request"] is module.ApprovalRequest
+    assert request_hints["return"] is module.TurnApproval
 
 
 def test_claim_and_controls_expose_exact_creation_and_lease_identity(runtime_env):
@@ -853,13 +927,14 @@ def test_turn_approval_keeps_preversion_identity_and_is_immediately_resolvable_a
         expected_control_version=1,
     )
     snapshot = conn.execute(
-        """SELECT expected_runtime_version, effective_runtime_version
+        """SELECT expected_runtime_version, effective_runtime_version,
+                  turn_expected_control_version
            FROM project_approvals WHERE approval_id = ?""",
         (request.approval_id,),
     ).fetchone()
 
     assert result.approval.expected_runtime_version == 2
-    assert tuple(snapshot) == (2, 3)
+    assert tuple(snapshot) == (2, 3, 1)
     assert prdb.runtime_state_for_project(conn, project_id).version == 3
     resolved = prdb.resolve_approval(
         conn, approval_id=request.approval_id,
@@ -884,7 +959,7 @@ def test_turn_approval_keeps_preversion_identity_and_is_immediately_resolvable_a
     )
 
 
-def test_exact_turn_approval_replays_after_resolution_and_expiry_without_writes(runtime_env):
+def test_exact_turn_approval_replays_after_lifecycle_drift_resolution_and_expiry_without_writes(runtime_env):
     conn = runtime_env["conn"]
     project_id = runtime_env["project_id"]
     now = [100]
@@ -904,17 +979,16 @@ def test_exact_turn_approval_replays_after_resolution_and_expiry_without_writes(
         resolver=runtime_env["desktop"], outcome="approved", now=101,
     )
     assert resolved is not None
-    before = (
-        tuple(conn.execute(
-            "SELECT * FROM project_approvals WHERE approval_id = ?",
-            (request.approval_id,),
-        ).fetchone()),
-        tuple(conn.execute(
-            "SELECT * FROM project_turns WHERE turn_id = ?", (turn.turn_id,)
-        ).fetchone()),
-        prdb.runtime_state_for_project(conn, project_id),
-        _event_count(conn, project_id),
+    drifted = prdb.transition_lifecycle(
+        conn,
+        project_id=project_id,
+        expected_version=3,
+        lifecycle="awaiting_acceptance",
+        updated_at=102,
     )
+    assert drifted is not None
+    conn.commit()
+    before = _runtime_mutation_snapshot(conn, project_id, turn.turn_id)
     now[0] = 2000
 
     replay = runtime.request_turn_approval(
@@ -924,17 +998,19 @@ def test_exact_turn_approval_replays_after_resolution_and_expiry_without_writes(
 
     assert first.turn_id == replay.turn_id
     assert replay.approval.status == "approved"
-    assert before == (
-        tuple(conn.execute(
-            "SELECT * FROM project_approvals WHERE approval_id = ?",
-            (request.approval_id,),
-        ).fetchone()),
-        tuple(conn.execute(
-            "SELECT * FROM project_turns WHERE turn_id = ?", (turn.turn_id,)
-        ).fetchone()),
-        prdb.runtime_state_for_project(conn, project_id),
-        _event_count(conn, project_id),
+    assert before == _runtime_mutation_snapshot(conn, project_id, turn.turn_id)
+    with pytest.raises(runtime_env["module"].ProjectRuntimeError) as changed_cas:
+        runtime.request_turn_approval(
+            turn.turn_id,
+            request,
+            runtime_env["desktop"],
+            expected_control_version=99,
+        )
+    assert (
+        changed_cas.value.code
+        is runtime_env["module"].RuntimeErrorCode.APPROVAL_CONFLICT
     )
+    assert before == _runtime_mutation_snapshot(conn, project_id, turn.turn_id)
     with pytest.raises(runtime_env["module"].ProjectRuntimeError) as changed:
         runtime.request_turn_approval(
             turn.turn_id,
@@ -949,6 +1025,116 @@ def test_exact_turn_approval_replays_after_resolution_and_expiry_without_writes(
             expected_control_version=1,
         )
     assert wrong_turn.value.code is runtime_env["module"].RuntimeErrorCode.APPROVAL_CONFLICT
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "transitions"),
+    [
+        pytest.param(
+            "awaiting_acceptance",
+            ("awaiting_acceptance",),
+            id="awaiting-acceptance",
+        ),
+        pytest.param(
+            "completed",
+            ("awaiting_acceptance", "completed"),
+            id="completed",
+        ),
+    ],
+)
+def test_fresh_turn_approval_requires_an_active_project_without_writes(
+    runtime_env, lifecycle, transitions
+):
+    runtime = runtime_env["runtime"]
+    conn = runtime_env["conn"]
+    project_id = runtime_env["project_id"]
+    turn = runtime.enqueue_turn(
+        project_id,
+        {"message": "approve"},
+        runtime_env["desktop"],
+        idempotency_key="enqueue",
+        expected_version=0,
+    )
+    runtime.claim_next_turn(project_id, "worker", lease_seconds=30)
+    state = prdb.runtime_state_for_project(conn, project_id)
+    assert state is not None
+    for target in transitions:
+        state = prdb.transition_lifecycle(
+            conn,
+            project_id=project_id,
+            expected_version=state.version,
+            lifecycle=target,
+            updated_at=99,
+        )
+        assert state is not None
+    conn.commit()
+    request = _approval_request(
+        project_id,
+        expected_runtime_version=state.version,
+        expected_lifecycle=lifecycle,
+    )
+    before = _runtime_mutation_snapshot(conn, project_id, turn.turn_id)
+
+    with pytest.raises(runtime_env["module"].ProjectRuntimeError) as rejected:
+        runtime.request_turn_approval(
+            turn.turn_id,
+            request,
+            runtime_env["desktop"],
+            expected_control_version=1,
+        )
+
+    assert (
+        rejected.value.code
+        is runtime_env["module"].RuntimeErrorCode.PROJECT_NOT_ACTIVE
+    )
+    assert before == _runtime_mutation_snapshot(conn, project_id, turn.turn_id)
+
+
+def test_migrated_linked_turn_approval_without_control_cas_fails_closed(
+    runtime_env,
+):
+    runtime = runtime_env["runtime"]
+    conn = runtime_env["conn"]
+    project_id = runtime_env["project_id"]
+    turn = runtime.enqueue_turn(
+        project_id,
+        {"message": "approve"},
+        runtime_env["desktop"],
+        idempotency_key="enqueue",
+        expected_version=0,
+    )
+    runtime.claim_next_turn(project_id, "worker", lease_seconds=30)
+    request = _approval_request(project_id)
+    runtime.request_turn_approval(
+        turn.turn_id,
+        request,
+        runtime_env["desktop"],
+        expected_control_version=1,
+    )
+    conn.execute(
+        """
+        UPDATE project_approvals
+        SET turn_expected_control_version = NULL
+        WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    )
+    conn.commit()
+    before = _runtime_mutation_snapshot(conn, project_id, turn.turn_id)
+
+    with pytest.raises(runtime_env["module"].ProjectRuntimeError) as rejected:
+        runtime.request_turn_approval(
+            turn.turn_id,
+            request,
+            runtime_env["discord"],
+            expected_control_version=1,
+        )
+
+    assert (
+        rejected.value.code
+        is runtime_env["module"].RuntimeErrorCode.APPROVAL_CONFLICT
+    )
+    assert before == _runtime_mutation_snapshot(conn, project_id, turn.turn_id)
 
 
 @pytest.mark.parametrize(

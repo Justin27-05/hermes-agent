@@ -1225,11 +1225,13 @@ def test_fresh_approval_schema_requires_runtime_snapshot_columns(runtime_conn):
     assert {
         "expected_runtime_version",
         "effective_runtime_version",
+        "turn_expected_control_version",
         "expected_lifecycle",
         "expected_phase",
     } <= columns.keys()
     assert columns["expected_runtime_version"]["notnull"] == 1
     assert columns["effective_runtime_version"]["notnull"] == 1
+    assert columns["turn_expected_control_version"]["notnull"] == 0
     assert columns["expected_lifecycle"]["notnull"] == 1
     assert columns["expected_phase"]["notnull"] == 1
 
@@ -1270,7 +1272,8 @@ def test_create_approval_persists_the_exact_live_runtime_snapshot(runtime_conn):
     row = runtime_conn.execute(
         """
         SELECT expected_runtime_version, effective_runtime_version,
-               expected_lifecycle, expected_phase, batch_boundary_json
+               turn_expected_control_version, expected_lifecycle,
+               expected_phase, batch_boundary_json
         FROM project_approvals
         WHERE approval_id = ?
         """,
@@ -1279,7 +1282,7 @@ def test_create_approval_persists_the_exact_live_runtime_snapshot(runtime_conn):
     assert created.expected_runtime_version == 0
     assert created.expected_lifecycle == "active"
     assert created.expected_phase == "implementation"
-    assert tuple(row)[:4] == (0, 0, "active", "implementation")
+    assert tuple(row)[:5] == (0, 0, None, "active", "implementation")
     assert json.loads(row["batch_boundary_json"]) == {
         "authorization_actor_id": "owner-1",
         "canonical_action": "publish",
@@ -2337,6 +2340,7 @@ def test_task1_legacy_approval_rows_survive_additive_migration(tmp_path):
     ).fetchone())
 
     prdb.ensure_schema(conn)
+    prdb.ensure_schema(conn)
 
     after = tuple(conn.execute(
         f"SELECT {', '.join(old_columns)} FROM project_approvals"
@@ -2346,13 +2350,14 @@ def test_task1_legacy_approval_rows_survive_additive_migration(tmp_path):
         SELECT canonical_action, authorization_actor_id,
                resolved_by_actor_id, consumed_at,
                expected_runtime_version, effective_runtime_version,
-               expected_lifecycle, expected_phase
+               turn_expected_control_version, expected_lifecycle,
+               expected_phase
         FROM project_approvals WHERE approval_id = 'legacy-approval'
         """
     ).fetchone()
     assert after == before
     assert tuple(migrated) == (
-        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None,
     )
     conn.close()
 
@@ -2474,7 +2479,8 @@ def test_two_connections_can_race_task1_approval_migration(tmp_path):
         "canonical_action", "authorization_actor_id",
         "resolved_by_actor_id", "consumed_at",
         "expected_runtime_version", "effective_runtime_version",
-        "expected_lifecycle", "expected_phase",
+        "turn_expected_control_version", "expected_lifecycle",
+        "expected_phase",
     }
     assert all(expected <= columns for columns in results)
     conn = sqlite3.connect(db_path)

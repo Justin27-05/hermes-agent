@@ -15,10 +15,37 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 
 from hermes_cli import project_runtime_db as runtime_db
 from hermes_cli.project_policy import ActorContext
+
+
+JSONScalar = str | int | float | bool | None
+JSONValue = (
+    JSONScalar
+    | tuple["JSONValue", ...]
+    | Mapping[str, "JSONValue"]
+)
+TurnStatus = Literal[
+    "queued",
+    "claimed",
+    "awaiting_approval",
+    "stop_requested",
+    "stopped",
+    "reconciling",
+    "succeeded",
+    "failed",
+    "cancelled",
+]
+ControlState = Literal[
+    "running",
+    "stop_requested",
+    "stopped",
+    "resume_requested",
+    "terminal",
+]
+ApprovalRequest = runtime_db.ApprovalRequest
 
 
 class RuntimeErrorCode(str, Enum):
@@ -68,9 +95,9 @@ class ProjectTurn:
     project_id: str
     sequence: int
     idempotency_key: str
-    payload: Mapping[str, object]
+    payload: Mapping[str, JSONValue]
     origin_binding_id: str
-    status: str
+    status: TurnStatus
     attempt_id: str | None
     lease_generation: int
     fencing_token: int
@@ -82,7 +109,7 @@ class ProjectTurn:
 class RunControl:
     turn_id: str
     project_id: str
-    control_state: str
+    control_state: ControlState
     control_version: int
     last_idempotency_key: str | None
     attempt_id: str | None
@@ -105,7 +132,7 @@ class TurnClaim:
 @dataclass(frozen=True)
 class TurnApproval:
     turn_id: str
-    approval: runtime_db.ApprovalRequest
+    approval: ApprovalRequest
 
 
 def _is_text(value: object) -> bool:
@@ -823,12 +850,12 @@ class ProjectRuntime:
             )
 
     def request_turn_approval(
-        self, turn_id: str, request: runtime_db.ApprovalRequest,
+        self, turn_id: str, request: ApprovalRequest,
         actor: ActorContext, *, expected_control_version: int,
     ) -> TurnApproval:
         turn_id = _require_text(turn_id)
         expected_control_version = _require_version(expected_control_version)
-        if not isinstance(request, runtime_db.ApprovalRequest):
+        if not isinstance(request, ApprovalRequest):
             raise ProjectRuntimeError(
                 RuntimeErrorCode.INVALID_ARGUMENT, turn_id=turn_id
             )
@@ -874,6 +901,8 @@ class ProjectRuntime:
                     )
                     and existing["effective_runtime_version"]
                     == effective_runtime_version
+                    and existing["turn_expected_control_version"]
+                    == expected_control_version
                     and existing["turn_id"] == turn_id
                 ):
                     return TurnApproval(turn_id=turn_id, approval=stored)
@@ -891,6 +920,7 @@ class ProjectRuntime:
                     turn_id=turn_id,
                 ) from exc
             state = self._require_state(project_id)
+            self._require_active(state)
             turn = self._turn(project_id, turn_id)
             if turn.status != "claimed":
                 raise ProjectRuntimeError(
@@ -950,6 +980,7 @@ class ProjectRuntime:
                     request,
                     now=now,
                     effective_runtime_version=effective_runtime_version,
+                    turn_expected_control_version=expected_control_version,
                 )
             except runtime_db.ApprovalConflictError as exc:
                 raise ProjectRuntimeError(

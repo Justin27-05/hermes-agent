@@ -22,6 +22,7 @@ from hermes_cli import project_runtime_db as prdb
 from hermes_cli import projects_db
 from hermes_cli.project_policy import (
     ActorContext,
+    CRITICAL_ACTION_RULES,
     Decision,
     PolicyDecision,
 )
@@ -40,6 +41,7 @@ TASK6_COLUMNS = {
     "blocked_reason",
     "remote_idempotency_supported",
     "approval_fingerprint_json",
+    "guard_validated",
 }
 
 TASK6_INDEXES = {
@@ -49,12 +51,19 @@ TASK6_INDEXES = {
     "idx_project_operations_turn_status",
     "idx_project_operations_recovery",
     "idx_project_operations_approved_rehydrate",
+    "idx_project_operations_turn_unresolved",
+    "idx_project_operations_turn_unsafe",
 }
 
 OPERATION_PROBE = (
     Path(__file__).resolve().parents[1]
     / "fixtures"
     / "project_operation_probe.py"
+)
+
+CRITICAL_ACTION_CASES = tuple(
+    (action, rule.approval_class)
+    for action, rule in CRITICAL_ACTION_RULES.items()
 )
 
 
@@ -382,16 +391,363 @@ def test_task6_schema_is_additive_indexed_and_rejects_raw_invalid_managed_rows(
                 command_revision, targets_json, payload_json, status,
                 created_at, updated_at, guard_revision, canonical_action,
                 batch_items_json, readback_kind, attempt_id,
-                lease_generation, fencing_token
+                lease_generation, fencing_token, guard_validated
             ) VALUES (
                 'invalid-managed', ?, 'turn', 'remote-key', 1, '[]', '{}',
                 'invented', 1, 1, 1, 'local_code_edit', '["item"]',
-                'ledger', 'attempt', 1, 1
+                'ledger', 'attempt', 1, 1, 1
             )
             """,
             (project_id,),
         )
     operation_conn.rollback()
+
+
+def _unsafe_index_shape(conn):
+    rows = conn.execute(
+        """
+        SELECT name, sql, rootpage
+        FROM sqlite_master
+        WHERE type = 'index'
+          AND name IN (
+              'idx_project_operations_turn_unsafe',
+              'idx_project_operations_turn_unsafe_blocked'
+          )
+        ORDER BY name
+        """
+    ).fetchall()
+    index_list = {
+        row["name"]: row
+        for row in conn.execute(
+            "PRAGMA index_list('project_operations')"
+        )
+    }
+    xinfo = conn.execute(
+        "PRAGMA index_xinfo('idx_project_operations_turn_unsafe')"
+    ).fetchall()
+    return rows, index_list, xinfo
+
+
+def _assert_canonical_unsafe_expression_index(conn):
+    rows, index_list, xinfo = _unsafe_index_shape(conn)
+    assert [row["name"] for row in rows] == [
+        "idx_project_operations_turn_unsafe"
+    ]
+    assert prdb._OPERATION_UNSAFE_CLASS_SQL in rows[0]["sql"]
+    assert index_list["idx_project_operations_turn_unsafe"][
+        "partial"
+    ] == 0
+    key_rows = [row for row in xinfo if row["key"] == 1]
+    assert [(row["seqno"], row["cid"]) for row in key_rows] == [
+        (0, 1),
+        (1, 2),
+        (2, -2),
+        (3, 0),
+    ]
+    return rows[0]["sql"], rows[0]["rootpage"]
+
+
+@pytest.mark.parametrize(
+    (
+        "guard_validated",
+        "guard_revision",
+        "status",
+        "blocked_reason",
+        "expected",
+    ),
+    (
+        *((1, 1, status, None, 0) for status in (
+            "approved",
+            "effect_started",
+            "receipt_recorded",
+            "unknown",
+            "reconciled",
+        )),
+        *((1, 1, "blocked", reason, 0) for reason in (
+            "operation_capability_unsupported",
+            "approval_denied",
+            "approval_time_expired",
+            "approval_stale_boundary",
+        )),
+        (None, 1, "approved", None, 1),
+        ("1", 1, "approved", None, 1),
+        (0, 1, "approved", None, 1),
+        (1, None, "approved", None, 1),
+        (1, "1", "approved", None, 1),
+        (1, 0, "approved", None, 1),
+        (1, 1, None, None, 1),
+        (1, 1, 1, None, 1),
+        (1, 1, "invented", None, 1),
+        (1, 1, "blocked", None, 1),
+        (1, 1, "blocked", 1, 1),
+        (1, 1, "blocked", "operation_readback_ambiguous", 1),
+    ),
+)
+def test_operation_unsafe_classifier_is_total_exact_integer(
+    operation_conn,
+    guard_validated,
+    guard_revision,
+    status,
+    blocked_reason,
+    expected,
+):
+    result = operation_conn.execute(
+        f"""
+        SELECT ({prdb._OPERATION_UNSAFE_CLASS_SQL}) AS unsafe
+        FROM (
+            SELECT ? AS guard_validated,
+                   ? AS guard_revision,
+                   ? AS status,
+                   ? AS blocked_reason
+        )
+        """,
+        (
+            guard_validated,
+            guard_revision,
+            status,
+            blocked_reason,
+        ),
+    ).fetchone()["unsafe"]
+    assert type(result) is int
+    assert result == expected
+
+
+def test_operation_unsafe_expression_index_and_hot_probes_are_exact(
+    operation_conn,
+):
+    assert sqlite3.sqlite_version_info >= (3, 9, 0)
+    _assert_canonical_unsafe_expression_index(operation_conn)
+
+    standalone = operation_conn.execute(
+        "EXPLAIN QUERY PLAN " + prdb._OPERATION_TURN_UNSAFE_SQL,
+        ("project", "turn"),
+    ).fetchall()
+    correlated = operation_conn.execute(
+        "EXPLAIN QUERY PLAN "
+        + prdb._OPERATION_PENDING_BRANCH_SQL,
+        ("approved", 1),
+    ).fetchall()
+    for plan in (standalone, correlated):
+        details = " ".join(row["detail"] for row in plan)
+        assert (
+            "SEARCH "
+            in details
+            and "idx_project_operations_turn_unsafe" in details
+            and "<expr>=?" in details
+        )
+        assert "SCAN project_operations" not in details
+        assert "sqlite_autoindex_project_operations_3" not in details
+        assert "USE TEMP B-TREE" not in details
+        assert "UNION ALL" not in details
+        assert "idx_project_operations_turn_unsafe_blocked" not in details
+
+
+@pytest.mark.parametrize("obsolete_shape", ("partial", "partial_helper"))
+def test_operation_unsafe_index_upgrade_and_repeat_converge(
+    operation_conn,
+    obsolete_shape,
+):
+    operation_conn.execute(
+        "DROP INDEX idx_project_operations_turn_unsafe"
+    )
+    operation_conn.execute(
+        "DROP INDEX IF EXISTS idx_project_operations_turn_unsafe_blocked"
+    )
+    operation_conn.execute(
+        """
+        CREATE INDEX idx_project_operations_turn_unsafe
+        ON project_operations(project_id, turn_id, operation_id)
+        WHERE guard_validated IS NOT 1
+           OR guard_revision IS NOT 1
+           OR status IS NULL
+        """
+    )
+    if obsolete_shape == "partial_helper":
+        operation_conn.execute(
+            """
+            CREATE INDEX idx_project_operations_turn_unsafe_blocked
+            ON project_operations(project_id, turn_id, operation_id)
+            WHERE status = 'blocked'
+            """
+        )
+    operation_conn.commit()
+
+    traced = []
+    operation_conn.set_trace_callback(traced.append)
+    try:
+        prdb.ensure_schema(operation_conn)
+    finally:
+        operation_conn.set_trace_callback(None)
+    assert not any("sqlite_schema" in sql.lower() for sql in traced)
+    canonical = _assert_canonical_unsafe_expression_index(
+        operation_conn
+    )
+
+    prdb.ensure_schema(operation_conn)
+    assert _assert_canonical_unsafe_expression_index(
+        operation_conn
+    ) == canonical
+
+
+def test_operation_unsafe_index_preflight_precedes_any_drop(
+    operation_conn,
+    monkeypatch,
+):
+    operation_conn.execute(
+        "DROP INDEX idx_project_operations_turn_unsafe"
+    )
+    operation_conn.execute(
+        """
+        CREATE INDEX idx_project_operations_turn_unsafe
+        ON project_operations(project_id, turn_id, operation_id)
+        WHERE guard_validated IS NOT 1
+        """
+    )
+    operation_conn.commit()
+    before = _unsafe_index_shape(operation_conn)[0]
+    monkeypatch.setattr(
+        prdb.sqlite3, "sqlite_version_info", (3, 8, 11)
+    )
+
+    with pytest.raises(
+        prdb.OperationMigrationError,
+        match="expression index",
+    ):
+        prdb.ensure_schema(operation_conn)
+
+    after = _unsafe_index_shape(operation_conn)[0]
+    assert [(row["name"], row["sql"]) for row in after] == [
+        (row["name"], row["sql"]) for row in before
+    ]
+
+
+def test_operation_unsafe_index_replacement_failure_rolls_back(
+    operation_conn,
+    monkeypatch,
+):
+    operation_conn.execute(
+        "DROP INDEX idx_project_operations_turn_unsafe"
+    )
+    operation_conn.execute(
+        """
+        CREATE INDEX idx_project_operations_turn_unsafe
+        ON project_operations(project_id, turn_id, operation_id)
+        WHERE guard_validated IS NOT 1
+        """
+    )
+    operation_conn.commit()
+    before = _unsafe_index_shape(operation_conn)[0]
+    original_execute = prdb.execute_schema_statements
+
+    def fail_unsafe_create(conn, schema_sql):
+        if "idx_project_operations_turn_unsafe" in schema_sql:
+            raise sqlite3.OperationalError(
+                "simulated expression-index storage failure"
+            )
+        return original_execute(conn, schema_sql)
+
+    monkeypatch.setattr(
+        prdb, "execute_schema_statements", fail_unsafe_create
+    )
+    with pytest.raises(
+        prdb.OperationMigrationError,
+        match="unsafe operation index",
+    ):
+        prdb.ensure_schema(operation_conn)
+
+    after = _unsafe_index_shape(operation_conn)[0]
+    assert [(row["name"], row["sql"]) for row in after] == [
+        (row["name"], row["sql"]) for row in before
+    ]
+
+
+def test_operation_unsafe_index_concurrent_initializers_converge(
+    tmp_path,
+):
+    path = tmp_path / "concurrent-operation-schema.db"
+    initial = projects_db.connect(path)
+    project_id = _insert_project(
+        initial, "concurrent-operation-schema"
+    )
+    initial.execute(
+        "DROP INDEX idx_project_operations_turn_unsafe"
+    )
+    initial.execute(
+        """
+        CREATE INDEX idx_project_operations_turn_unsafe
+        ON project_operations(project_id, turn_id, operation_id)
+        WHERE guard_validated IS NOT 1
+        """
+    )
+    _drop_operation_sequence_guards(initial)
+    initial.commit()
+    initial.execute("PRAGMA foreign_keys=OFF")
+    for ordinal in (1, 2):
+        _insert_migration_operation(
+            initial,
+            project_id,
+            f"concurrent-operation-{ordinal}",
+            f"concurrent-approval-{ordinal}",
+        )
+        _insert_migration_approval(
+            initial,
+            project_id,
+            f"concurrent-approval-{ordinal}",
+            f"concurrent-operation-{ordinal}",
+            ordinal,
+        )
+    initial.commit()
+    initial.execute("PRAGMA foreign_keys=ON")
+    initial.close()
+    barrier = threading.Barrier(2)
+    outcomes = queue.Queue()
+
+    def initialize():
+        barrier.wait()
+        try:
+            conn = projects_db.connect(path)
+            conn.close()
+            outcomes.put(None)
+        except Exception as exc:
+            outcomes.put(exc)
+
+    threads = [threading.Thread(target=initialize) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert [outcomes.get_nowait(), outcomes.get_nowait()] == [
+        None,
+        None,
+    ]
+    final = projects_db.connect(path)
+    try:
+        _assert_canonical_unsafe_expression_index(final)
+        assert tuple(
+            tuple(row)
+            for row in final.execute(
+                """
+                SELECT approval_id, operation_maintenance_seq
+                FROM project_approvals
+                WHERE project_id = ?
+                ORDER BY approval_id
+                """,
+                (project_id,),
+            )
+        ) == (
+            ("concurrent-approval-1", 1),
+            ("concurrent-approval-2", 2),
+        )
+        assert _maintenance_state(final)[-1] == 3
+        assert final.execute(
+            """
+            SELECT COUNT(*)
+            FROM project_operation_maintenance
+            """
+        ).fetchone()[0] == 1
+    finally:
+        final.close()
 
 
 def test_task1_operation_rows_remain_byte_exact_revision_zero_and_fail_closed(
@@ -460,6 +816,324 @@ def test_managed_operation_mapper_rejects_noncanonical_json(operation_conn):
         )
 
 
+@pytest.mark.parametrize(
+    ("mutation_sql", "parameters"),
+    (
+        (
+            "approval_fingerprint_json = ?",
+            ("{",),
+        ),
+        (
+            "targets_json = ?",
+            ("[",),
+        ),
+        (
+            "payload_json = ?",
+            ("{",),
+        ),
+        (
+            """
+            status = 'receipt_recorded',
+            receipt_id = 'receipt-malformed',
+            receipt_json = ?
+            """,
+            ("{",),
+        ),
+        (
+            """
+            status = 'reconciled',
+            receipt_id = 'receipt-valid',
+            receipt_json = '{}',
+            readback_json = ?
+            """,
+            ("{",),
+        ),
+    ),
+    ids=(
+        "fingerprint",
+        "targets",
+        "payload",
+        "receipt",
+        "readback",
+    ),
+)
+def test_validation_migration_quarantines_semantic_json_invalidity_once(
+    operation_env,
+    monkeypatch,
+    mutation_sql,
+    parameters,
+):
+    conn = operation_env["conn"]
+    conn.execute(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, turn_id, idempotency_key,
+            command_revision, targets_json, payload_json, status,
+            created_at, updated_at, guard_revision, canonical_action,
+            batch_items_json, readback_kind, attempt_id,
+            lease_generation, fencing_token,
+            remote_idempotency_supported
+        ) VALUES (
+            'migration-invalid', ?, ?, 'migration-invalid-key',
+            1, '["c:/work/operations/file.py"]', '{}', 'approved',
+            1, 1, 1, 'local_code_edit', '["item"]', 'ledger', ?,
+            1, 1, 1
+        )
+        """,
+        (
+            operation_env["project_id"],
+            operation_env["turn"].turn_id,
+            operation_env["claim"].attempt_id,
+        ),
+    )
+    conn.execute("DROP TRIGGER trg_project_operations_task6_update")
+    conn.execute(
+        f"""
+        UPDATE project_operations
+        SET {mutation_sql}
+        WHERE operation_id = 'migration-invalid'
+        """,
+        parameters,
+    )
+    conn.execute(
+        """
+        UPDATE project_operation_maintenance
+        SET operation_validation_migration_complete = 0
+        WHERE singleton = 1
+        """
+    )
+    conn.commit()
+
+    prdb.ensure_schema(conn)
+
+    assert conn.execute(
+        """
+        SELECT guard_validated
+        FROM project_operations
+        WHERE operation_id = 'migration-invalid'
+        """
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        """
+        SELECT operation_validation_migration_complete
+        FROM project_operation_maintenance
+        WHERE singleton = 1
+        """
+    ).fetchone()[0] == 1
+    assert not prdb._turn_allows_new_unresolved_operation(
+        conn,
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+    )
+    before = _operation_snapshot(operation_env)
+    with pytest.raises(
+        operation_env["module"].ProjectOperationError
+    ) as conflict:
+        operation_env["guard"].prepare(
+            operation_env["claim"],
+            _intent(
+                operation_env,
+                operation_id="after-invalid",
+                idempotency_key="after-invalid-key",
+            ),
+            policy=PolicyDecision(
+                Decision.ALLOW, "policy.allow.local", "allowed"
+            ),
+            approval=None,
+        )
+    assert (
+        conflict.value.code
+        is operation_env[
+            "module"
+        ].OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert before == _operation_snapshot(operation_env)
+
+    mapped = []
+    original_certifier = prdb._certify_project_operation_row
+
+    def recording_certifier(conn, row):
+        mapped.append(row["operation_id"])
+        return original_certifier(conn, row)
+
+    monkeypatch.setattr(
+        prdb,
+        "_certify_project_operation_row",
+        recording_certifier,
+    )
+    prdb.ensure_schema(conn)
+    assert mapped == []
+
+
+def test_raw_marker_zero_critical_row_is_durable_and_blocks_authority(
+    operation_env,
+):
+    conn = operation_env["conn"]
+    fingerprint = (
+        '{"approval_class":"publish","approval_id":"provisional-approval",'
+        '"authorization_actor_id":"owner-1","expires_at":1000,'
+        '"requires_owner":true}'
+    )
+    conn.execute(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, turn_id, idempotency_key,
+            command_revision, targets_json, payload_json, status,
+            created_at, updated_at, guard_revision, guard_validated,
+            canonical_action, batch_items_json, readback_kind, attempt_id,
+            lease_generation, fencing_token,
+            remote_idempotency_supported, approval_fingerprint_json
+        ) VALUES (
+            'provisional-critical', ?, ?, 'provisional-critical-key',
+            1, '["c:/work/operations/file.py"]', '{}', 'approved',
+            1, 1, 1, 0, 'publish', '["publish"]', 'ledger', ?,
+            1, 1, 1, ?
+        )
+        """,
+        (
+            operation_env["project_id"],
+            operation_env["turn"].turn_id,
+            operation_env["claim"].attempt_id,
+            fingerprint,
+        ),
+    )
+    conn.commit()
+    before = _operation_snapshot(operation_env)
+
+    with pytest.raises(
+        operation_env["module"].ProjectOperationError
+    ) as conflict:
+        operation_env["guard"].prepare(
+            operation_env["claim"],
+            _intent(
+                operation_env,
+                operation_id="after-provisional",
+                idempotency_key="after-provisional-key",
+            ),
+            policy=PolicyDecision(
+                Decision.ALLOW, "policy.allow.local", "allowed"
+            ),
+            approval=None,
+        )
+
+    assert (
+        conflict.value.code
+        is operation_env[
+            "module"
+        ].OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert before == _operation_snapshot(operation_env)
+    _park_raw_operation_turn(operation_env)
+    assert prdb._operation_pending_candidates(conn, limit=1) == ()
+    reopened = projects_db.connect(
+        Path(
+            conn.execute("PRAGMA database_list").fetchone()["file"]
+        )
+    )
+    try:
+        assert reopened.execute(
+            """
+            SELECT guard_validated
+            FROM project_operations
+            WHERE operation_id = 'provisional-critical'
+            """
+        ).fetchone()[0] == 0
+    finally:
+        reopened.close()
+
+
+def test_validation_migration_quarantines_malformed_linked_approval_pair(
+    operation_env,
+):
+    _prepare_critical(operation_env)
+    conn = operation_env["conn"]
+    operation = prdb._project_operation_for_id(
+        conn,
+        project_id=operation_env["project_id"],
+        operation_id="operation-1",
+    )
+    assert operation is not None
+    prdb._decertify_project_operation(conn, operation)
+    conn.execute(
+        """
+        UPDATE project_approvals
+        SET turn_expected_control_version = NULL
+        WHERE approval_id = 'approval-1'
+          AND operation_id = 'operation-1'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE project_operation_maintenance
+        SET operation_validation_migration_complete = 0
+        WHERE singleton = 1
+        """
+    )
+    conn.commit()
+
+    prdb.ensure_schema(conn)
+
+    assert conn.execute(
+        """
+        SELECT guard_validated
+        FROM project_operations
+        WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()[0] == 0
+    assert not prdb._turn_allows_new_unresolved_operation(
+        conn,
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+    )
+
+
+def test_validation_migration_storage_failure_rolls_back_completion(
+    operation_env,
+    monkeypatch,
+):
+    _insert_raw_unresolved_operation(operation_env)
+    conn = operation_env["conn"]
+    conn.execute(
+        """
+        UPDATE project_operation_maintenance
+        SET operation_validation_migration_complete = 0
+        WHERE singleton = 1
+        """
+    )
+    conn.commit()
+
+    def fail_certification(conn, row):
+        raise sqlite3.OperationalError(
+            "simulated operation certification storage failure"
+        )
+
+    monkeypatch.setattr(
+        prdb,
+        "_certify_project_operation_row",
+        fail_certification,
+    )
+    with pytest.raises(
+        prdb.OperationMigrationError,
+        match="operation validation migration",
+    ):
+        prdb.ensure_schema(conn)
+
+    assert conn.execute(
+        """
+        SELECT operation_validation_migration_complete
+        FROM project_operation_maintenance
+        WHERE singleton = 1
+        """
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        """
+        SELECT guard_validated
+        FROM project_operations
+        WHERE operation_id = 'current-unresolved'
+        """
+    ).fetchone()[0] == 0
+
+
 def test_migration_rejects_duplicate_legacy_operation_approval_links(
     operation_conn,
 ):
@@ -481,7 +1155,8 @@ def test_migration_rejects_duplicate_legacy_operation_approval_links(
         operation_conn.execute(
             """
             INSERT INTO project_approvals (
-                approval_id, project_id, turn_id, operation_id, actor_id,
+                approval_id, project_id, turn_id, operation_id,
+                operation_maintenance_seq, actor_id,
                 authorization_actor_id, canonical_action, approval_class,
                 command_revision, expected_runtime_version,
                 effective_runtime_version, turn_expected_control_version,
@@ -489,15 +1164,16 @@ def test_migration_rejects_duplicate_legacy_operation_approval_links(
                 batch_boundary_json, status, expires_at, resolved_at,
                 resolved_by_actor_id, consumed_at, created_at
             ) VALUES (
-                ?, ?, NULL, 'legacy-operation', 'owner', 'owner', 'publish',
+                ?, ?, NULL, 'legacy-operation', ?, 'owner', 'owner', 'publish',
                 'publish', ?, 0, 0, NULL, 'active', 'implementation',
                 ?, ?, 'pending', 100, NULL, NULL, NULL, 1
             )
             """,
             (
-                f"approval-{ordinal}",
-                project_id,
-                ordinal,
+                    f"approval-{ordinal}",
+                    project_id,
+                    ordinal,
+                    ordinal,
                 f'["C:/target-{ordinal}"]',
                 (
                     '{"authorization_actor_id":"owner",'
@@ -555,6 +1231,7 @@ def test_operation_mapper_rejects_exact_type_impostors(mutation):
         "created_at": 1,
         "updated_at": 1,
         "guard_revision": 1,
+        "guard_validated": 1,
         "canonical_action": "local_code_edit",
         "batch_items_json": '["item"]',
         "readback_kind": "ledger",
@@ -717,6 +1394,134 @@ def test_allowed_prepare_persists_one_canonical_intent_and_exact_replay_is_write
         ),
     )
     assert after_first == _operation_snapshot(operation_env)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    (
+        ("deny", "OPERATION_POLICY_DENIED"),
+        ("none-policy", "INVALID_OPERATION_ARGUMENT"),
+        ("malformed-policy", "INVALID_OPERATION_ARGUMENT"),
+        ("allow-with-spec", "INVALID_OPERATION_ARGUMENT"),
+        ("allow-with-class", "INVALID_OPERATION_ARGUMENT"),
+        ("require-without-spec", "INVALID_OPERATION_ARGUMENT"),
+        ("require-class-mismatch", "INVALID_OPERATION_ARGUMENT"),
+        ("require-for-noncritical", "INVALID_OPERATION_ARGUMENT"),
+        ("require-nonowner", "INVALID_OPERATION_ARGUMENT"),
+        ("require-malformed-spec", "INVALID_OPERATION_ARGUMENT"),
+    ),
+)
+def test_existing_allow_replay_validates_policy_before_return_write_free(
+    operation_env,
+    monkeypatch,
+    case,
+    expected_code,
+):
+    module = operation_env["module"]
+    intent = _intent(operation_env)
+    operation_env["guard"].prepare(
+        operation_env["claim"],
+        intent,
+        policy=PolicyDecision(
+            Decision.ALLOW, "policy.allow.local", "allowed"
+        ),
+        approval=None,
+    )
+    before = _operation_snapshot(operation_env)
+    valid_spec = module.OperationApprovalSpec(
+        "approval-replay",
+        "publish",
+        1_000,
+        operation_env["actor"],
+    )
+    policy: object = PolicyDecision(
+        Decision.ALLOW, "policy.allow.local", "allowed"
+    )
+    approval: object = None
+    if case == "deny":
+        policy = PolicyDecision(
+            Decision.DENY, "policy.deny", "denied"
+        )
+    elif case == "none-policy":
+        policy = None
+    elif case == "malformed-policy":
+        policy = PolicyDecision(
+            "allow", "policy.allow.local", "allowed"
+        )
+    elif case == "allow-with-spec":
+        approval = valid_spec
+    elif case == "allow-with-class":
+        policy = PolicyDecision(
+            Decision.ALLOW,
+            "policy.allow.local",
+            "allowed",
+            "publish",
+        )
+    elif case == "require-without-spec":
+        policy = PolicyDecision(
+            Decision.REQUIRE_APPROVAL,
+            "policy.approval.publish",
+            "approval required",
+            "publish",
+        )
+    elif case == "require-class-mismatch":
+        policy = PolicyDecision(
+            Decision.REQUIRE_APPROVAL,
+            "policy.approval.publish",
+            "approval required",
+            "publish",
+        )
+        approval = replace(valid_spec, approval_class="credentials")
+    elif case == "require-for-noncritical":
+        policy = PolicyDecision(
+            Decision.REQUIRE_APPROVAL,
+            "policy.approval.publish",
+            "approval required",
+            "publish",
+        )
+        approval = valid_spec
+    elif case == "require-nonowner":
+        policy = PolicyDecision(
+            Decision.REQUIRE_APPROVAL,
+            "policy.approval.publish",
+            "approval required",
+            "publish",
+        )
+        approval = replace(
+            valid_spec,
+            authorization=ActorContext(
+                "owner-1", "desktop", "desktop-owner", False
+            ),
+        )
+    else:
+        policy = PolicyDecision(
+            Decision.REQUIRE_APPROVAL,
+            "policy.approval.publish",
+            "approval required",
+            "publish",
+        )
+        approval = object()
+
+    def unexpected_lookup(**_kwargs):
+        raise AssertionError("invalid replay reached operation lookup")
+
+    monkeypatch.setattr(
+        operation_env["guard"],
+        "_existing_operation",
+        unexpected_lookup,
+    )
+    with pytest.raises(module.ProjectOperationError) as failure:
+        operation_env["guard"].prepare(
+            operation_env["claim"],
+            intent,
+            policy=policy,
+            approval=approval,
+        )
+
+    assert failure.value.code is getattr(
+        module.OperationErrorCode, expected_code
+    )
+    assert before == _operation_snapshot(operation_env)
 
 
 def test_prepare_compares_the_full_immutable_fingerprint_without_writes(
@@ -1012,6 +1817,229 @@ def _prepare_critical(operation_env, *, expires_at=1000):
         approval=spec,
     )
     return prepared
+
+
+def _generic_approval_request(
+    operation_env,
+    *,
+    approval_id,
+    expires_at=1_000,
+):
+    state = prdb.runtime_state_for_project(
+        operation_env["conn"], operation_env["project_id"]
+    )
+    assert state is not None
+    return prdb.ApprovalRequest(
+        approval_id=approval_id,
+        project_id=operation_env["project_id"],
+        requester_actor_id="owner-1",
+        authorization_actor_id="owner-1",
+        canonical_action="publish",
+        approval_class="publish",
+        command_revision=1,
+        expected_runtime_version=state.version,
+        expected_lifecycle=state.lifecycle,
+        expected_phase=state.current_phase,
+        targets=(f"C:/work/operations/{approval_id}",),
+        batch_id=f"batch-{approval_id}",
+        batch_items=(f"item-{approval_id}",),
+        status="pending",
+        expires_at=expires_at,
+    )
+
+
+def _generic_authorization_args(request, *, now):
+    return {
+        "approval_id": request.approval_id,
+        "project_id": request.project_id,
+        "authorization_actor_id": request.authorization_actor_id,
+        "canonical_action": request.canonical_action,
+        "approval_class": request.approval_class,
+        "command_revision": request.command_revision,
+        "expected_runtime_version": request.expected_runtime_version,
+        "expected_lifecycle": request.expected_lifecycle,
+        "expected_phase": request.expected_phase,
+        "targets": request.targets,
+        "batch_id": request.batch_id,
+        "batch_items": request.batch_items,
+        "now": now,
+    }
+
+
+def _linked_authority_snapshot(operation_env):
+    conn = operation_env["conn"]
+    return (
+        tuple(
+            conn.execute(
+                """
+                SELECT * FROM project_operations
+                WHERE operation_id = 'operation-1'
+                """
+            ).fetchone()
+        ),
+        tuple(
+            conn.execute(
+                """
+                SELECT * FROM project_approvals
+                WHERE approval_id = 'approval-1'
+                """
+            ).fetchone()
+        ),
+        prdb.runtime_state_for_project(
+            conn, operation_env["project_id"]
+        ),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_events
+                WHERE project_id = ?
+                ORDER BY sequence
+                """,
+                (operation_env["project_id"],),
+            )
+        ),
+    )
+
+
+def test_generic_bulk_expiry_owns_only_unlinked_approvals(
+    operation_env,
+):
+    _prepare_critical(operation_env, expires_at=105)
+    pending = _generic_approval_request(
+        operation_env,
+        approval_id="generic-pending",
+        expires_at=105,
+    )
+    approved = _generic_approval_request(
+        operation_env,
+        approval_id="generic-approved",
+        expires_at=105,
+    )
+    prdb.create_approval_request(
+        operation_env["conn"], pending, now=100
+    )
+    prdb.create_approval_request(
+        operation_env["conn"], approved, now=100
+    )
+    assert prdb.resolve_approval(
+        operation_env["conn"],
+        approval_id=approved.approval_id,
+        resolver=operation_env["actor"],
+        outcome="approved",
+        now=101,
+    ) is not None
+    linked_before = _linked_authority_snapshot(operation_env)
+
+    with prdb.write_transaction(operation_env["conn"]):
+        prdb._expire_approvals(operation_env["conn"], 110)
+
+    assert tuple(
+        tuple(row)
+        for row in operation_env["conn"].execute(
+            """
+            SELECT approval_id, status
+            FROM project_approvals
+            WHERE approval_id LIKE 'generic-%'
+            ORDER BY approval_id
+            """
+        )
+    ) == (
+        ("generic-approved", "expired"),
+        ("generic-pending", "expired"),
+    )
+    assert _linked_authority_snapshot(operation_env) == linked_before
+
+
+def test_generic_resolve_and_consume_are_filtered_from_linked_authority(
+    operation_env,
+):
+    _prepare_critical(operation_env)
+    linked_before = _linked_authority_snapshot(operation_env)
+    assert prdb.resolve_approval(
+        operation_env["conn"],
+        approval_id="approval-1",
+        resolver=operation_env["actor"],
+        outcome="approved",
+        now=100,
+    ) is None
+    assert _linked_authority_snapshot(operation_env) == linked_before
+
+    generic = _generic_approval_request(
+        operation_env, approval_id="generic-target"
+    )
+    prdb.create_approval_request(
+        operation_env["conn"], generic, now=100
+    )
+    traced = []
+    operation_env["conn"].set_trace_callback(traced.append)
+    try:
+        assert prdb.resolve_approval(
+            operation_env["conn"],
+            approval_id=generic.approval_id,
+            resolver=operation_env["actor"],
+            outcome="approved",
+            now=101,
+        ) is not None
+        assert prdb.consume_approval_authorization(
+            operation_env["conn"],
+            **_generic_authorization_args(generic, now=102),
+        )
+    finally:
+        operation_env["conn"].set_trace_callback(None)
+    approval_statements = [
+        " ".join(statement.lower().split())
+        for statement in traced
+        if "project_approvals" in statement.lower()
+        and (
+            statement.lstrip().upper().startswith("UPDATE")
+            or statement.lstrip().upper().startswith("SELECT")
+        )
+    ]
+    assert approval_statements
+    assert all(
+        "operation_id is null" in statement
+        for statement in approval_statements
+    )
+    assert _linked_authority_snapshot(operation_env) == linked_before
+
+
+def test_linked_approval_id_never_replays_through_generic_apis(
+    operation_env,
+):
+    _prepare_critical(operation_env)
+    conn = operation_env["conn"]
+    row = conn.execute(
+        """
+        SELECT * FROM project_approvals
+        WHERE approval_id = 'approval-1'
+        """
+    ).fetchone()
+    request = prdb._approval_from_row(row)
+    linked_before = _linked_authority_snapshot(operation_env)
+
+    with pytest.raises(prdb.ApprovalConflictError):
+        prdb.create_approval_request(conn, request, now=100)
+
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    with pytest.raises(
+        runtime_module.ProjectRuntimeError
+    ) as conflict:
+        operation_env["runtime"].request_turn_approval(
+            operation_env["turn"].turn_id,
+            request,
+            operation_env["actor"],
+            expected_control_version=(
+                row["turn_expected_control_version"]
+            ),
+        )
+    assert (
+        conflict.value.code
+        is runtime_module.RuntimeErrorCode.APPROVAL_CONFLICT
+    )
+    assert _linked_authority_snapshot(operation_env) == linked_before
 
 
 def _assert_policy_failure(
@@ -1921,6 +2949,88 @@ def test_resolve_versus_expiry_process_race_has_one_terminal_policy(
     ).fetchone()[0] == before_events + 3
 
 
+@pytest.mark.parametrize("_iteration", range(25))
+def test_two_fresh_stale_pollers_finalize_once_per_epoch(
+    operation_env,
+    _iteration,
+):
+    _prepare_critical(operation_env, expires_at=1_000)
+    conn = operation_env["conn"]
+    conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET version = version + 1
+        WHERE project_id = ?
+        """,
+        (operation_env["project_id"],),
+    )
+    conn.execute(
+        """
+        UPDATE project_operation_maintenance
+        SET next_lane = 1,
+            approval_scan_after_seq = 0,
+            approval_scan_high_water_seq = 0
+        WHERE singleton = 1
+        """
+    )
+    conn.commit()
+    before_version = prdb.runtime_state_for_project(
+        conn, operation_env["project_id"]
+    ).version
+    before_events = conn.execute(
+        """
+        SELECT COUNT(*) FROM project_events
+        WHERE project_id = ?
+        """,
+        (operation_env["project_id"],),
+    ).fetchone()[0]
+    processes = [
+        _start_operation_probe(
+            operation_env, mode="expire", now=100
+        )
+        for _ in range(2)
+    ]
+    try:
+        for process in processes:
+            _release_operation_probe(process)
+        results = [
+            _finish_operation_probe(process)
+            for process in processes
+        ]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+    assert sum(result["count"] for result in results) == 1
+    assert conn.execute(
+        """
+        SELECT status FROM project_approvals
+        WHERE approval_id = 'approval-1'
+        """
+    ).fetchone()[0] == "expired"
+    assert tuple(
+        conn.execute(
+            """
+            SELECT status, blocked_reason
+            FROM project_operations
+            WHERE operation_id = 'operation-1'
+            """
+        ).fetchone()
+    ) == ("blocked", "approval_stale_boundary")
+    assert prdb.runtime_state_for_project(
+        conn, operation_env["project_id"]
+    ).version == before_version + 1
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM project_events
+        WHERE project_id = ?
+        """,
+        (operation_env["project_id"],),
+    ).fetchone()[0] == before_events + 3
+
+
 def test_resolve_versus_stale_process_race_has_one_terminal_policy(
     operation_env,
 ):
@@ -2037,6 +3147,7 @@ def test_mapper_accepts_authoritative_not_applied_evidence_on_approved_operation
         "created_at": 1,
         "updated_at": 2,
         "guard_revision": 1,
+        "guard_validated": 1,
         "canonical_action": "local_code_edit",
         "batch_items_json": '["item"]',
         "readback_kind": "ledger",
@@ -2167,6 +3278,13 @@ def test_not_applied_evidence_rehydrates_without_receipt_or_send(
         approval=None,
     )
     conn = operation_env["conn"]
+    operation = prdb._project_operation_for_id(
+        conn,
+        project_id=operation_env["project_id"],
+        operation_id="operation-1",
+    )
+    assert operation is not None
+    prdb._decertify_project_operation(conn, operation)
     conn.execute(
         """
         UPDATE project_operations
@@ -2191,6 +3309,11 @@ def test_not_applied_evidence_rehydrates_without_receipt_or_send(
         WHERE project_id = ? AND turn_id = ?
         """,
         (operation_env["project_id"], operation_env["turn"].turn_id),
+    )
+    prdb._certify_project_operation(
+        conn,
+        project_id=operation_env["project_id"],
+        operation_id="operation-1",
     )
     conn.commit()
     before_receipts = conn.execute(
@@ -2379,6 +3502,96 @@ def _prepare_allowed(operation_env):
     )
 
 
+def test_operation_marker_transitions_are_marker_only(
+    operation_env,
+):
+    _prepare_allowed(operation_env)
+    conn = operation_env["conn"]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            UPDATE project_operations
+            SET status = 'effect_started'
+            WHERE operation_id = 'operation-1'
+              AND guard_validated = 1
+            """
+        )
+    conn.rollback()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            UPDATE project_operations
+            SET guard_validated = 0, status = 'effect_started'
+            WHERE operation_id = 'operation-1'
+              AND guard_validated = 1
+            """
+        )
+    conn.rollback()
+
+    conn.execute(
+        """
+        UPDATE project_operations
+        SET guard_validated = 0
+        WHERE operation_id = 'operation-1'
+          AND guard_validated = 1
+        """
+    )
+    conn.execute(
+        """
+        UPDATE project_operations
+        SET status = 'effect_started'
+        WHERE operation_id = 'operation-1'
+          AND guard_validated = 0
+        """
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            UPDATE project_operations
+            SET guard_validated = 1, updated_at = updated_at + 1
+            WHERE operation_id = 'operation-1'
+              AND guard_validated = 0
+            """
+        )
+    conn.rollback()
+    assert tuple(
+        conn.execute(
+            """
+            SELECT status, guard_validated
+            FROM project_operations
+            WHERE operation_id = 'operation-1'
+            """
+        ).fetchone()
+    ) == ("approved", 1)
+
+
+def test_linked_approval_mutation_requires_operation_decertification(
+    operation_env,
+):
+    _prepare_critical(operation_env)
+    conn = operation_env["conn"]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            UPDATE project_approvals
+            SET status = 'denied', resolved_at = 100,
+                resolved_by_actor_id = 'owner-1'
+            WHERE approval_id = 'approval-1'
+              AND operation_id = 'operation-1'
+            """
+        )
+    conn.rollback()
+    assert conn.execute(
+        """
+        SELECT status FROM project_approvals
+        WHERE approval_id = 'approval-1'
+        """
+    ).fetchone()[0] == "pending"
+
+
 class _Readback:
     def __init__(self, conn, result):
         self.conn = conn
@@ -2410,6 +3623,255 @@ def _readback_result(
         evidence,
         receipt,
     )
+
+
+class _InjectedCertificationFault(RuntimeError):
+    pass
+
+
+def _transition_authority_snapshot(operation_env):
+    return (
+        _operation_snapshot(operation_env),
+        tuple(
+            tuple(row)
+            for row in operation_env["conn"].execute(
+                """
+                SELECT * FROM project_worker_leases
+                WHERE project_id = ?
+                ORDER BY lease_id
+                """,
+                (operation_env["project_id"],),
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "fault_call"),
+    (
+        ("start", 1),
+        ("receipt", 1),
+        ("reconcile_phase_a", 1),
+        ("reconcile_phase_c", 2),
+        ("block", 1),
+        ("rehydrate", 1),
+        ("approve", 1),
+        ("expire", 1),
+    ),
+)
+@pytest.mark.parametrize("fault_stage", ("decertify", "certify"))
+def test_operation_transition_certification_fault_rolls_back_everything(
+    operation_env,
+    monkeypatch,
+    action,
+    fault_call,
+    fault_stage,
+):
+    guard = operation_env["guard"]
+    if action in {
+        "start",
+        "receipt",
+        "reconcile_phase_a",
+        "reconcile_phase_c",
+        "block",
+    }:
+        _prepare_allowed(operation_env)
+    if action in {
+        "receipt",
+        "reconcile_phase_a",
+        "reconcile_phase_c",
+        "block",
+    }:
+        guard.mark_started(
+            operation_env["claim"], "operation-1"
+        )
+    if action == "block":
+        class PhaseACrash(BaseException):
+            pass
+
+        class CrashReadback:
+            def read_operation(self, request):
+                raise PhaseACrash
+
+        with pytest.raises(PhaseACrash):
+            guard.reconcile(
+                operation_env["claim"],
+                "operation-1",
+                CrashReadback(),
+            )
+    if action in {"rehydrate", "approve", "expire"}:
+        _prepare_critical(
+            operation_env,
+            expires_at=105 if action == "expire" else 1_000,
+        )
+    if action == "rehydrate":
+        operation_env["now"][0] = 131
+        guard.resolve_operation_approval(
+            "approval-1",
+            operation_env["actor"],
+            outcome="approved",
+        )
+    if action == "expire":
+        operation_env["now"][0] = 110
+
+    before = _transition_authority_snapshot(operation_env)
+    phase_c_before = [None]
+    calls = [0]
+    if fault_stage == "decertify":
+        original = prdb._decertify_project_operation
+
+        def fail_after_decertify(conn, operation):
+            result = original(conn, operation)
+            calls[0] += 1
+            if calls[0] == fault_call:
+                raise _InjectedCertificationFault(
+                    "after decertification"
+                )
+            return result
+
+        monkeypatch.setattr(
+            prdb,
+            "_decertify_project_operation",
+            fail_after_decertify,
+        )
+    else:
+        original = prdb._certify_project_operation
+
+        def fail_before_certify(
+            conn, *, project_id, operation_id
+        ):
+            calls[0] += 1
+            if calls[0] == fault_call:
+                raise _InjectedCertificationFault(
+                    "before certification"
+                )
+            return original(
+                conn,
+                project_id=project_id,
+                operation_id=operation_id,
+            )
+
+        monkeypatch.setattr(
+            prdb,
+            "_certify_project_operation",
+            fail_before_certify,
+        )
+
+    module = operation_env["module"]
+
+    def invoke():
+        if action == "start":
+            return guard.mark_started(
+                operation_env["claim"], "operation-1"
+            )
+        elif action == "receipt":
+            return guard.record_receipt(
+                operation_env["claim"],
+                "operation-1",
+                _receipt(operation_env),
+            )
+        elif action.startswith("reconcile"):
+            class BoundaryReadback(_Readback):
+                def read_operation(self, request):
+                    if action == "reconcile_phase_c":
+                        phase_c_before[0] = (
+                            _transition_authority_snapshot(
+                                operation_env
+                            )
+                        )
+                    return super().read_operation(request)
+
+            return guard.reconcile(
+                operation_env["claim"],
+                "operation-1",
+                BoundaryReadback(
+                    operation_env["conn"],
+                    _readback_result(
+                        operation_env,
+                        "applied",
+                        evidence={"ledger": "complete"},
+                        receipt=_receipt(operation_env),
+                    ),
+                ),
+            )
+        elif action == "block":
+            return guard.block_unknown(
+                operation_env["claim"], "operation-1"
+            )
+        elif action == "rehydrate":
+            return guard._rehydrate_approved_operation(
+                operation_env["project_id"],
+                "operation-1",
+                worker_id="replacement-worker",
+                lease_seconds=30,
+            )
+        elif action == "approve":
+            return guard.resolve_operation_approval(
+                "approval-1",
+                operation_env["actor"],
+                outcome="approved",
+            )
+        return guard.expire_due_operation_approvals(limit=1)
+
+    if action == "expire":
+        assert invoke() == ()
+    else:
+        with pytest.raises(module.ProjectOperationError) as conflict:
+            invoke()
+        expected_code = (
+            module.OperationErrorCode.OPERATION_APPROVAL_CONFLICT
+            if action == "approve"
+            else module.OperationErrorCode.OPERATION_STATE_CONFLICT
+        )
+        assert conflict.value.code is expected_code
+    assert calls[0] == fault_call
+    expected_before = (
+        phase_c_before[0]
+        if action == "reconcile_phase_c"
+        else before
+    )
+    assert expected_before is not None
+    assert (
+        _transition_authority_snapshot(operation_env)
+        == expected_before
+    )
+    assert operation_env["conn"].execute(
+        """
+        SELECT guard_validated FROM project_operations
+        WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()[0] == 1
+
+
+def test_critical_prepare_certification_failure_rolls_back_whole_pair(
+    operation_env,
+    monkeypatch,
+):
+    before = _transition_authority_snapshot(operation_env)
+
+    def fail_certification(
+        conn, *, project_id, operation_id
+    ):
+        raise _InjectedCertificationFault(
+            "prepare certification failed"
+        )
+
+    monkeypatch.setattr(
+        prdb,
+        "_certify_project_operation",
+        fail_certification,
+    )
+    with pytest.raises(
+        operation_env["module"].ProjectOperationError
+    ) as conflict:
+        _prepare_critical(operation_env)
+    assert (
+        conflict.value.code
+        is operation_env[
+            "module"
+        ].OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert _transition_authority_snapshot(operation_env) == before
 
 
 def test_mark_started_is_fenced_atomic_and_exact_replay_is_write_free(
@@ -2858,14 +4320,12 @@ def test_block_unknown_is_fenced_and_exactly_once(operation_env):
     operation_env["guard"].mark_started(
         operation_env["claim"], "operation-1"
     )
-    operation_env["conn"].execute(
-        """
-        UPDATE project_operations
-        SET status = 'unknown', updated_at = 100
-        WHERE operation_id = 'operation-1'
-        """
-    )
-    operation_env["conn"].commit()
+    with pytest.raises(_PhaseACrash):
+        operation_env["guard"].reconcile(
+            operation_env["claim"],
+            "operation-1",
+            _CrashAfterPhaseA(),
+        )
     before_version = prdb.runtime_state_for_project(
         operation_env["conn"], operation_env["project_id"]
     ).version
@@ -2985,13 +4445,12 @@ def test_disposition_for_turn_is_positive_and_fail_closed(
                     _receipt(operation_env),
                 )
             if operation_state == "unknown":
-                conn.execute(
-                    """
-                    UPDATE project_operations SET status = 'unknown'
-                    WHERE operation_id = 'operation-1'
-                    """
-                )
-                conn.commit()
+                with pytest.raises(_PhaseACrash):
+                    guard.reconcile(
+                        operation_env["claim"],
+                        "operation-1",
+                        _CrashAfterPhaseA(),
+                    )
             elif operation_state == "reconciled":
                 guard.reconcile(
                     operation_env["claim"],
@@ -3020,11 +4479,13 @@ def test_disposition_for_turn_is_positive_and_fail_closed(
                     ),
                 )
         if operation_state == "malformed":
-            conn.execute(
-                """
-                DROP TRIGGER trg_project_operations_task6_update
-                """
+            operation = prdb._project_operation_for_id(
+                conn,
+                project_id=operation_env["project_id"],
+                operation_id="operation-1",
             )
+            assert operation is not None
+            prdb._decertify_project_operation(conn, operation)
             conn.execute(
                 """
                 UPDATE project_operations
@@ -4233,6 +5694,241 @@ def _add_parked_operation_candidate(
     return operation_id
 
 
+def _insert_large_allowed_operation_history(
+    operation_env,
+    *,
+    count=10_000,
+):
+    conn = operation_env["conn"]
+    project_id = operation_env["project_id"]
+    turn_id = operation_env["turn"].turn_id
+    attempt_id = operation_env["claim"].attempt_id
+    conn.executemany(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, turn_id, idempotency_key,
+            command_revision, targets_json, payload_json, status,
+            created_at, updated_at, guard_revision, canonical_action,
+            batch_items_json, readback_kind, attempt_id,
+            lease_generation, fencing_token, blocked_reason,
+            remote_idempotency_supported
+        ) VALUES (
+            ?, ?, ?, ?, 1, '["c:/work/history"]', '{}', 'blocked',
+            1, 1, 1, 'local_code_edit', '["history"]', NULL, ?,
+            1, 1, 'operation_capability_unsupported', 0
+        )
+        """,
+        (
+            (
+                f"history-{ordinal:05d}",
+                project_id,
+                turn_id,
+                f"history-key-{ordinal:05d}",
+                attempt_id,
+            )
+            for ordinal in range(count)
+        ),
+    )
+    conn.commit()
+
+
+def _certify_operation_fixture_rows(operation_env):
+    conn = operation_env["conn"]
+    conn.execute(
+        """
+        UPDATE project_operation_maintenance
+        SET operation_validation_migration_complete = 0
+        WHERE singleton = 1
+        """
+    )
+    conn.commit()
+    prdb.ensure_schema(conn)
+
+
+def _insert_raw_unresolved_operation(
+    operation_env,
+    *,
+    operation_id="current-unresolved",
+    status="approved",
+    updated_at=100,
+):
+    conn = operation_env["conn"]
+    conn.execute(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, turn_id, idempotency_key,
+            command_revision, targets_json, payload_json, status,
+            created_at, updated_at, guard_revision, canonical_action,
+            batch_items_json, readback_kind, attempt_id,
+            lease_generation, fencing_token,
+            remote_idempotency_supported
+        ) VALUES (
+            ?, ?, ?, ?, 1, '["c:/work/current"]', '{}', ?,
+            1, ?, 1, 'local_code_edit', '["current"]', 'ledger', ?,
+            1, 1, 1
+        )
+        """,
+        (
+            operation_id,
+            operation_env["project_id"],
+            operation_env["turn"].turn_id,
+            f"{operation_id}-key",
+            status,
+            updated_at,
+            operation_env["claim"].attempt_id,
+        ),
+    )
+    conn.commit()
+
+
+def _park_raw_operation_turn(operation_env):
+    conn = operation_env["conn"]
+    conn.execute(
+        """
+        DELETE FROM project_worker_leases
+        WHERE project_id = ? AND turn_id = ?
+        """,
+        (
+            operation_env["project_id"],
+            operation_env["turn"].turn_id,
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE project_turns
+        SET status = 'reconciling', recovery_block_key = NULL
+        WHERE project_id = ? AND turn_id = ?
+        """,
+        (
+            operation_env["project_id"],
+            operation_env["turn"].turn_id,
+        ),
+    )
+    conn.commit()
+
+
+def _with_sql_progress_budget(conn, *, budget, action):
+    steps = [0]
+
+    def count_progress():
+        steps[0] += 1
+        return int(steps[0] > budget)
+
+    conn.set_progress_handler(count_progress, 1)
+    try:
+        result = action()
+    finally:
+        conn.set_progress_handler(None, 0)
+    return result, steps[0]
+
+
+def test_operation_pending_large_history_is_bounded_and_maps_candidate_only(
+    operation_env, monkeypatch
+):
+    _insert_large_allowed_operation_history(operation_env)
+    _insert_raw_unresolved_operation(operation_env)
+    _certify_operation_fixture_rows(operation_env)
+    _park_raw_operation_turn(operation_env)
+    mapped = []
+    original_mapper = prdb._project_operation_for_id
+
+    def recording_mapper(
+        conn,
+        *,
+        project_id,
+        operation_id,
+    ):
+        mapped.append(operation_id)
+        if operation_id.startswith("history-"):
+            raise AssertionError("allowed history must not be mapped")
+        return original_mapper(
+            conn,
+            project_id=project_id,
+            operation_id=operation_id,
+        )
+
+    monkeypatch.setattr(
+        prdb, "_project_operation_for_id", recording_mapper
+    )
+
+    candidates, steps = _with_sql_progress_budget(
+        operation_env["conn"],
+        budget=2_000,
+        action=lambda: prdb._operation_pending_candidates(
+            operation_env["conn"], limit=1
+        ),
+    )
+
+    assert [candidate.operation_id for candidate in candidates] == [
+        "current-unresolved"
+    ]
+    assert mapped == ["current-unresolved"]
+    assert steps < 2_000
+    for status in (
+        "approved",
+        "effect_started",
+        "receipt_recorded",
+        "unknown",
+    ):
+        plan = operation_env["conn"].execute(
+            "EXPLAIN QUERY PLAN "
+            + prdb._OPERATION_PENDING_BRANCH_SQL,
+            (status, 1),
+        ).fetchall()
+        details = " ".join(row["detail"] for row in plan)
+        assert "idx_project_operations_recovery" in details
+        assert "idx_project_operations_turn_unresolved" in details
+        assert "idx_project_operations_turn_unsafe" in details
+        assert "USE TEMP B-TREE" not in details
+
+
+def test_prepare_gate_is_bounded_and_does_not_map_allowed_history(
+    operation_env, monkeypatch
+):
+    _insert_large_allowed_operation_history(operation_env)
+    _certify_operation_fixture_rows(operation_env)
+    mapped = []
+    original_mapper = prdb._project_operation_for_id
+
+    def recording_mapper(
+        conn,
+        *,
+        project_id,
+        operation_id,
+    ):
+        mapped.append(operation_id)
+        if operation_id.startswith("history-"):
+            raise AssertionError("prepare must not map allowed history")
+        return original_mapper(
+            conn,
+            project_id=project_id,
+            operation_id=operation_id,
+        )
+
+    monkeypatch.setattr(
+        prdb, "_project_operation_for_id", recording_mapper
+    )
+    prepared, steps = _with_sql_progress_budget(
+        operation_env["conn"],
+        budget=4_000,
+        action=lambda: operation_env["guard"].prepare(
+            operation_env["claim"],
+            _intent(operation_env),
+            policy=PolicyDecision(
+                Decision.ALLOW, "policy.allow.local", "allowed"
+            ),
+            approval=None,
+        ),
+    )
+
+    assert prepared.status == "approved"
+    assert all(
+        not operation_id.startswith("history-")
+        for operation_id in mapped
+    )
+    assert steps < 4_000
+
+
 def test_operation_pending_selector_is_four_branch_bounded_and_global(
     operation_conn,
 ):
@@ -4383,7 +6079,7 @@ def test_task5_pending_projection_keeps_query_work_bounded(
             batch_items_json, readback_kind, attempt_id,
             lease_generation, fencing_token,
             remote_idempotency_supported
-        ) VALUES (?, ?, ?, ?, 1, '["C:/work/bounded-task5"]', '{}',
+        ) VALUES (?, ?, ?, ?, 1, '["c:/work/bounded-task5"]', '{}',
                   'approved', 1, 1, 1, 'local_code_edit', '["item"]',
                   'ledger', ?, 1, 1, 1)
         """,
@@ -4398,6 +6094,12 @@ def test_task5_pending_projection_keeps_query_work_bounded(
             for ordinal in range(1, pending_count + 1)
         ),
     )
+    for ordinal in range(1, pending_count + 1):
+        prdb._certify_project_operation(
+            operation_conn,
+            project_id=project_id,
+            operation_id=f"pending-operation-{ordinal}",
+        )
     operation_conn.execute(
         """
         INSERT INTO project_turns (
@@ -4443,32 +6145,651 @@ def test_task5_pending_projection_keeps_query_work_bounded(
 def _maintenance_state(conn):
     row = conn.execute(
         """
-        SELECT singleton, approval_scan_after, next_lane
+        SELECT singleton, approval_scan_after, next_lane,
+               approval_scan_after_seq,
+               approval_scan_high_water_seq,
+               approval_scan_epoch,
+               next_operation_approval_seq
         FROM project_operation_maintenance
         """
     ).fetchone()
     return tuple(row) if row is not None else None
 
 
+def _stage_critical_link(operation_env):
+    conn = operation_env["conn"]
+    state = prdb.runtime_state_for_project(
+        conn, operation_env["project_id"]
+    )
+    assert state is not None
+    fingerprint = _raw_critical_fingerprint(
+        "publish", approval_id="approval-staging"
+    )
+    assert prdb._insert_project_operation(
+        conn,
+        operation_id="operation-staging",
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+        idempotency_key="operation-staging-key",
+        command_revision=1,
+        targets_json='["c:/work/operations/file.py"]',
+        payload_json='{"content_digest":"sha256:staging"}',
+        status="approved",
+        canonical_action="publish",
+        batch_items_json='["publish"]',
+        readback_kind="remote-ledger",
+        attempt_id=operation_env["claim"].attempt_id,
+        lease_generation=operation_env["claim"].lease_generation,
+        fencing_token=operation_env["claim"].fencing_token,
+        blocked_reason=None,
+        remote_idempotency_supported=True,
+        approval_fingerprint_json=fingerprint,
+        now=operation_env["now"][0],
+    )
+    conn.commit()
+    request = prdb.ApprovalRequest(
+        approval_id="approval-staging",
+        project_id=operation_env["project_id"],
+        requester_actor_id="owner-1",
+        authorization_actor_id="owner-1",
+        canonical_action="publish",
+        approval_class="publish",
+        command_revision=1,
+        expected_runtime_version=state.version,
+        expected_lifecycle=state.lifecycle,
+        expected_phase=state.current_phase,
+        targets=("c:/work/operations/file.py",),
+        batch_id="operation-staging",
+        batch_items=("publish",),
+        status="pending",
+        expires_at=1_000,
+    )
+    operation_env["runtime"].request_turn_approval(
+        operation_env["turn"].turn_id,
+        request,
+        operation_env["actor"],
+        expected_control_version=1,
+    )
+
+
 def test_approval_maintenance_singleton_alternates_and_live_advances_cursor(
     operation_env,
 ):
     _prepare_critical(operation_env, expires_at=1_000)
-    assert _maintenance_state(operation_env["conn"]) == (1, "", 0)
-
-    assert operation_env[
-        "guard"
-    ].expire_due_operation_approvals(limit=1) == ()
-    assert _maintenance_state(operation_env["conn"]) == (1, "", 1)
+    assert _maintenance_state(operation_env["conn"]) == (
+        1,
+        "",
+        0,
+        0,
+        0,
+        0,
+        2,
+    )
 
     assert operation_env[
         "guard"
     ].expire_due_operation_approvals(limit=1) == ()
     assert _maintenance_state(operation_env["conn"]) == (
         1,
-        "approval-1",
+        "",
+        1,
         0,
+        0,
+        0,
+        2,
     )
+
+    assert operation_env[
+        "guard"
+    ].expire_due_operation_approvals(limit=1) == ()
+    assert _maintenance_state(operation_env["conn"]) == (
+        1,
+        "",
+        0,
+        0,
+        0,
+        1,
+        2,
+    )
+
+
+def test_linked_approval_sequence_is_positive_immutable_and_generic_is_null(
+    operation_env,
+):
+    _prepare_critical(operation_env, expires_at=1_000)
+    generic = _generic_approval_request(
+        operation_env, approval_id="generic-sequence"
+    )
+    prdb.create_approval_request(
+        operation_env["conn"], generic, now=100
+    )
+    assert tuple(
+        operation_env["conn"].execute(
+            """
+            SELECT
+                (
+                    SELECT operation_maintenance_seq
+                    FROM project_approvals
+                    WHERE approval_id = 'approval-1'
+                ),
+                (
+                    SELECT operation_maintenance_seq
+                    FROM project_approvals
+                    WHERE approval_id = 'generic-sequence'
+                )
+            """
+        ).fetchone()
+    ) == (1, None)
+
+    for statement in (
+        """
+        UPDATE project_approvals
+        SET operation_maintenance_seq = 2
+        WHERE approval_id = 'approval-1'
+        """,
+        """
+        UPDATE project_approvals
+        SET operation_id = NULL, operation_maintenance_seq = NULL
+        WHERE approval_id = 'approval-1'
+        """,
+    ):
+        operation = prdb._project_operation_for_id(
+            operation_env["conn"],
+            project_id=operation_env["project_id"],
+            operation_id="operation-1",
+        )
+        assert operation is not None
+        prdb._decertify_project_operation(
+            operation_env["conn"], operation
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            operation_env["conn"].execute(statement)
+        operation_env["conn"].rollback()
+
+    assert operation_env["conn"].execute(
+        """
+        SELECT operation_maintenance_seq
+        FROM project_approvals
+        WHERE approval_id = 'approval-1'
+        """
+    ).fetchone()[0] == 1
+
+
+def _insert_epoch_approvals(
+    conn,
+    project_id,
+    sequences,
+    *,
+    reset_maintenance,
+):
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executemany(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, turn_id, idempotency_key,
+            approval_id, command_revision, targets_json, payload_json,
+            status, created_at, updated_at, guard_revision,
+            guard_validated
+        ) VALUES (
+            ?, ?, NULL, ?, ?, 1, '[]', '{}', 'intent', 1, 1, 0, 0
+        )
+        """,
+        (
+            (
+                f"epoch-operation-{sequence}",
+                project_id,
+                f"epoch-operation-key-{sequence}",
+                f"epoch-approval-{sequence}",
+            )
+            for sequence in sequences
+        ),
+    )
+    conn.executemany(
+        """
+        INSERT INTO project_approvals (
+            approval_id, project_id, turn_id, operation_id,
+            operation_maintenance_seq, actor_id,
+            authorization_actor_id, canonical_action, approval_class,
+            command_revision, expected_runtime_version,
+            effective_runtime_version, turn_expected_control_version,
+            expected_lifecycle, expected_phase, targets_json,
+            batch_boundary_json, status, expires_at, resolved_at,
+            resolved_by_actor_id, consumed_at, created_at
+        ) VALUES (
+            ?, ?, NULL, ?, ?, 'owner-1', 'owner-1',
+            'publish', 'publish', ?, 0, 0, NULL, 'active',
+            'implementation', ?, ?, 'pending', 10000,
+            NULL, NULL, NULL, 1
+        )
+        """,
+        (
+            (
+                f"epoch-approval-{sequence}",
+                project_id,
+                f"epoch-operation-{sequence}",
+                sequence,
+                sequence,
+                f'["c:/epoch/{sequence}"]',
+                (
+                    '{"batch_id":"epoch-operation-'
+                    f'{sequence}","batch_items":["item-{sequence}"]'
+                    "}"
+                ),
+            )
+            for sequence in sequences
+        ),
+    )
+    if reset_maintenance:
+        conn.execute(
+            """
+            UPDATE project_operation_maintenance
+            SET approval_scan_after_seq = 0,
+                approval_scan_high_water_seq = 0,
+                approval_scan_epoch = 0,
+                next_operation_approval_seq = ?,
+                next_lane = 1
+            WHERE singleton = 1
+            """,
+            (max(sequences, default=0) + 1,),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE project_operation_maintenance
+            SET next_operation_approval_seq = ?
+            WHERE singleton = 1
+            """,
+            (max(sequences, default=0) + 1,),
+        )
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _select_approval_maintenance(conn, *, now=100, limit=1):
+    with prdb.write_transaction(conn):
+        return prdb._select_operation_approval_maintenance(
+            conn, now=now, limit=limit
+        )
+
+
+def test_stale_maintenance_epoch_has_finite_high_water_and_revisits(
+    operation_conn,
+):
+    project_id = projects_db.create_project(
+        operation_conn,
+        name="Finite Approval Epoch",
+        folders=("C:/work/finite-approval-epoch",),
+    )
+    _insert_epoch_approvals(
+        operation_conn,
+        project_id,
+        (1, 2, 3),
+        reset_maintenance=True,
+    )
+
+    assert _select_approval_maintenance(operation_conn) == (
+        "epoch-approval-1",
+    )
+    assert _maintenance_state(operation_conn) == (
+        1,
+        "",
+        0,
+        1,
+        3,
+        0,
+        4,
+    )
+
+    _insert_epoch_approvals(
+        operation_conn,
+        project_id,
+        (4,),
+        reset_maintenance=False,
+    )
+    assert _select_approval_maintenance(
+        operation_conn, now=0
+    ) == ()
+    assert _select_approval_maintenance(operation_conn) == (
+        "epoch-approval-2",
+    )
+    assert _select_approval_maintenance(
+        operation_conn, now=0
+    ) == ()
+    assert _select_approval_maintenance(operation_conn) == (
+        "epoch-approval-3",
+    )
+    assert _maintenance_state(operation_conn) == (
+        1,
+        "",
+        0,
+        0,
+        0,
+        1,
+        5,
+    )
+
+    assert _select_approval_maintenance(
+        operation_conn, now=0
+    ) == ()
+    assert _select_approval_maintenance(operation_conn) == (
+        "epoch-approval-1",
+    )
+    state = _maintenance_state(operation_conn)
+    assert state[3:6] == (1, 4, 1)
+
+
+def test_stale_epoch_restart_and_unfinalized_page_defer_only_one_epoch(
+    operation_conn,
+):
+    project_id = projects_db.create_project(
+        operation_conn,
+        name="Restart Approval Epoch",
+        folders=("C:/work/restart-approval-epoch",),
+    )
+    _insert_epoch_approvals(
+        operation_conn,
+        project_id,
+        (1, 2),
+        reset_maintenance=True,
+    )
+    assert _select_approval_maintenance(operation_conn) == (
+        "epoch-approval-1",
+    )
+
+    path = Path(
+        operation_conn.execute("PRAGMA database_list").fetchone()["file"]
+    )
+    restarted = projects_db.connect(path)
+    try:
+        assert _select_approval_maintenance(
+            restarted, now=0
+        ) == ()
+        assert _select_approval_maintenance(restarted) == (
+            "epoch-approval-2",
+        )
+        assert _maintenance_state(restarted)[3:6] == (0, 0, 1)
+        assert _select_approval_maintenance(
+            restarted, now=0
+        ) == ()
+        assert _select_approval_maintenance(restarted) == (
+            "epoch-approval-1",
+        )
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("approval_scan_after", "raced"),
+        ("next_lane", 0),
+        ("operation_validation_migration_complete", 0),
+        ("approval_scan_after_seq", 1),
+        ("approval_scan_high_water_seq", 1),
+        ("approval_scan_epoch", 1),
+        ("next_operation_approval_seq", 2),
+    ),
+)
+def test_approval_maintenance_every_field_cas_loss_is_write_free(
+    operation_conn,
+    field,
+    value,
+):
+    if field == "next_lane":
+        operation_conn.execute(
+            """
+            UPDATE project_operation_maintenance
+            SET next_lane = 1
+            WHERE singleton = 1
+            """
+        )
+        operation_conn.commit()
+    columns = (
+        "approval_scan_after",
+        "next_lane",
+        "operation_validation_migration_complete",
+        "approval_scan_after_seq",
+        "approval_scan_high_water_seq",
+        "approval_scan_epoch",
+        "next_operation_approval_seq",
+    )
+    before = tuple(
+        operation_conn.execute(
+            f"""
+            SELECT {", ".join(columns)}
+            FROM project_operation_maintenance
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    )
+    expected = list(before)
+    expected[columns.index(field)] = value
+    path = Path(
+        operation_conn.execute("PRAGMA database_list").fetchone()["file"]
+    )
+    racer = projects_db.connect(path)
+    fired = [False]
+
+    def race_before_update(statement):
+        normalized = " ".join(statement.lower().split())
+        if (
+            not fired[0]
+            and normalized.startswith(
+                "update project_operation_maintenance"
+            )
+        ):
+            fired[0] = True
+            racer.execute(
+                f"""
+                UPDATE project_operation_maintenance
+                SET {field} = ?
+                WHERE singleton = 1
+                """,
+                (value,),
+            )
+            racer.commit()
+
+    operation_conn.set_trace_callback(race_before_update)
+    try:
+        assert prdb._select_operation_approval_maintenance(
+            operation_conn, now=100, limit=1
+        ) == ()
+        operation_conn.commit()
+    finally:
+        operation_conn.set_trace_callback(None)
+        racer.close()
+    assert fired == [True]
+    assert tuple(
+        operation_conn.execute(
+            f"""
+        SELECT {", ".join(columns)}
+        FROM project_operation_maintenance
+        WHERE singleton = 1
+        """
+        ).fetchone()
+    ) == tuple(expected)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("approval_scan_after", "raced"),
+        ("next_lane", 1),
+        ("operation_validation_migration_complete", 0),
+        ("approval_scan_after_seq", 1),
+        ("approval_scan_high_water_seq", 1),
+        ("approval_scan_epoch", 1),
+    ),
+)
+def test_link_sequence_all_nonsequence_singleton_cas_losses_are_write_free(
+    operation_env,
+    field,
+    value,
+):
+    _stage_critical_link(operation_env)
+    conn = operation_env["conn"]
+    columns = (
+        "singleton",
+        "approval_scan_after",
+        "next_lane",
+        "operation_validation_migration_complete",
+        "approval_scan_after_seq",
+        "approval_scan_high_water_seq",
+        "approval_scan_epoch",
+        "next_operation_approval_seq",
+    )
+    maintenance_before = tuple(
+        conn.execute(
+            f"""
+            SELECT {", ".join(columns)}
+            FROM project_operation_maintenance
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    )
+    expected = list(maintenance_before)
+    expected[columns.index(field)] = value
+    operation_before = _operation_snapshot(operation_env)
+    path = Path(
+        conn.execute("PRAGMA database_list").fetchone()["file"]
+    )
+    racer = projects_db.connect(path)
+    fired = [False]
+
+    def race_before_allocation(statement):
+        normalized = " ".join(statement.lower().split())
+        if (
+            not fired[0]
+            and normalized.startswith(
+                "update project_operation_maintenance"
+            )
+        ):
+            fired[0] = True
+            racer.execute(
+                f"""
+                UPDATE project_operation_maintenance
+                SET {field} = ?
+                WHERE singleton = 1
+                """,
+                (value,),
+            )
+            racer.commit()
+
+    conn.set_trace_callback(race_before_allocation)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="maintenance sequence changed",
+        ):
+            prdb._link_project_operation_approval(
+                conn,
+                project_id=operation_env["project_id"],
+                turn_id=operation_env["turn"].turn_id,
+                operation_id="operation-staging",
+                approval_id="approval-staging",
+                attempt_id=operation_env["claim"].attempt_id,
+                lease_generation=(
+                    operation_env["claim"].lease_generation
+                ),
+                fencing_token=operation_env["claim"].fencing_token,
+                now=operation_env["now"][0],
+            )
+        conn.commit()
+    finally:
+        conn.set_trace_callback(None)
+        racer.close()
+
+    assert fired == [True]
+    assert tuple(
+        conn.execute(
+            f"""
+            SELECT {", ".join(columns)}
+            FROM project_operation_maintenance
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    ) == tuple(expected)
+    assert operation_before == _operation_snapshot(operation_env)
+    assert conn.execute(
+        """
+        SELECT guard_validated, approval_id, status
+        FROM project_operations
+        WHERE operation_id = 'operation-staging'
+        """
+    ).fetchone()[:] == (0, None, "approved")
+    assert conn.execute(
+        """
+        SELECT operation_id, operation_maintenance_seq
+        FROM project_approvals
+        WHERE approval_id = 'approval-staging'
+        """
+    ).fetchone()[:] == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("singleton", 2),
+        ("approval_scan_after", sqlite3.Binary(b"invalid")),
+        ("next_lane", 2),
+        ("operation_validation_migration_complete", 2),
+        ("approval_scan_after_seq", -1),
+        ("approval_scan_high_water_seq", -1),
+        ("approval_scan_epoch", -1),
+        ("next_operation_approval_seq", 0),
+    ),
+)
+def test_link_sequence_validates_the_complete_singleton_before_allocation(
+    operation_env,
+    field,
+    value,
+):
+    _stage_critical_link(operation_env)
+    conn = operation_env["conn"]
+    operation_before = _operation_snapshot(operation_env)
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    conn.execute(
+        f"""
+        UPDATE project_operation_maintenance
+        SET {field} = ?
+        """,
+        (value,),
+    )
+    conn.execute("PRAGMA ignore_check_constraints=OFF")
+    conn.commit()
+
+    with pytest.raises(
+        RuntimeError, match="invalid operation maintenance state"
+    ):
+        prdb._link_project_operation_approval(
+            conn,
+            project_id=operation_env["project_id"],
+            turn_id=operation_env["turn"].turn_id,
+            operation_id="operation-staging",
+            approval_id="approval-staging",
+            attempt_id=operation_env["claim"].attempt_id,
+            lease_generation=(
+                operation_env["claim"].lease_generation
+            ),
+            fencing_token=operation_env["claim"].fencing_token,
+            now=operation_env["now"][0],
+        )
+
+    assert operation_before == _operation_snapshot(operation_env)
+    assert conn.execute(
+        """
+        SELECT guard_validated, approval_id, status
+        FROM project_operations
+        WHERE operation_id = 'operation-staging'
+        """
+    ).fetchone()[:] == (0, None, "approved")
+    assert conn.execute(
+        """
+        SELECT operation_id, operation_maintenance_seq
+        FROM project_approvals
+        WHERE approval_id = 'approval-staging'
+        """
+    ).fetchone()[:] == (None, None)
 
 
 @pytest.mark.parametrize(
@@ -4559,21 +6880,47 @@ def test_approval_maintenance_queries_are_indexed_and_population_bounded(
     }
     assert {
         "idx_project_approvals_operation_due",
-        "idx_project_approvals_operation_scan",
+        "idx_project_approvals_operation_maintenance_seq",
+        "idx_project_approvals_operation_stale_epoch",
     } <= indexes
     due_plan = operation_conn.execute(
         "EXPLAIN QUERY PLAN " + prdb._APPROVAL_DUE_MAINTENANCE_SQL,
         (100, 10),
     ).fetchall()
+    high_water_plan = operation_conn.execute(
+        "EXPLAIN QUERY PLAN "
+        + prdb._APPROVAL_STALE_HIGH_WATER_SQL
+    ).fetchall()
     stale_plan = operation_conn.execute(
         "EXPLAIN QUERY PLAN " + prdb._APPROVAL_STALE_MAINTENANCE_SQL,
-        ("", 10),
+        (0, 10_000, 10),
+    ).fetchall()
+    remaining_plan = operation_conn.execute(
+        "EXPLAIN QUERY PLAN "
+        + prdb._APPROVAL_STALE_REMAINING_SQL,
+        (0, 10_000),
     ).fetchall()
     due_details = " ".join(row["detail"] for row in due_plan)
+    high_water_details = " ".join(
+        row["detail"] for row in high_water_plan
+    )
     stale_details = " ".join(row["detail"] for row in stale_plan)
+    remaining_details = " ".join(
+        row["detail"] for row in remaining_plan
+    )
     assert "idx_project_approvals_operation_due" in due_details
-    assert "idx_project_approvals_operation_scan" in stale_details
-    assert "USE TEMP B-TREE" not in due_details + stale_details
+    for details in (
+        high_water_details,
+        stale_details,
+        remaining_details,
+    ):
+        assert "idx_project_approvals_operation_stale_epoch" in details
+    assert "USE TEMP B-TREE" not in (
+        due_details
+        + high_water_details
+        + stale_details
+        + remaining_details
+    )
 
     project_id = projects_db.create_project(
         operation_conn,
@@ -4590,6 +6937,7 @@ def test_approval_maintenance_queries_are_indexed_and_population_bounded(
                 project_id,
                 f"final-operation-{ordinal:05d}",
                 ordinal + 1,
+                ordinal + 1,
                 f'["C:/final/{ordinal}"]',
                 f'{{"batch_id":"final-{ordinal}"}}',
                 "approved",
@@ -4604,6 +6952,7 @@ def test_approval_maintenance_queries_are_indexed_and_population_bounded(
                 f"live-{ordinal:05d}",
                 project_id,
                 f"live-operation-{ordinal:05d}",
+                ordinal + 5_001,
                 ordinal + 10_001,
                 f'["C:/live/{ordinal}"]',
                 f'{{"batch_id":"live-{ordinal}"}}',
@@ -4617,7 +6966,8 @@ def test_approval_maintenance_queries_are_indexed_and_population_bounded(
     operation_conn.executemany(
         """
         INSERT INTO project_approvals (
-            approval_id, project_id, turn_id, operation_id, actor_id,
+            approval_id, project_id, turn_id, operation_id,
+            operation_maintenance_seq, actor_id,
             authorization_actor_id, canonical_action, approval_class,
             command_revision, expected_runtime_version,
             effective_runtime_version, turn_expected_control_version,
@@ -4625,7 +6975,8 @@ def test_approval_maintenance_queries_are_indexed_and_population_bounded(
             batch_boundary_json, status, expires_at, resolved_at,
             resolved_by_actor_id, consumed_at, created_at
         ) VALUES (
-            ?, ?, NULL, ?, 'owner-1', 'owner-1', 'publish', 'publish',
+            ?, ?, NULL, ?, ?, 'owner-1', 'owner-1',
+            'publish', 'publish',
             ?, 0, 0, NULL, 'active', 'implementation', ?, ?, ?, ?,
             ?, ?, ?, 1
         )
@@ -4654,13 +7005,23 @@ def test_approval_maintenance_queries_are_indexed_and_population_bounded(
     due, due_steps = progress_for(
         prdb._APPROVAL_DUE_MAINTENANCE_SQL, (100, 10)
     )
+    high_water, high_water_steps = progress_for(
+        prdb._APPROVAL_STALE_HIGH_WATER_SQL, ()
+    )
     stale, stale_steps = progress_for(
-        prdb._APPROVAL_STALE_MAINTENANCE_SQL, ("", 10)
+        prdb._APPROVAL_STALE_MAINTENANCE_SQL, (0, 10_000, 10)
+    )
+    remaining, remaining_steps = progress_for(
+        prdb._APPROVAL_STALE_REMAINING_SQL, (0, 10_000)
     )
     assert due == []
+    assert high_water[0]["operation_maintenance_seq"] == 10_000
     assert len(stale) == 10
+    assert len(remaining) == 1
     assert due_steps < 500
+    assert high_water_steps < 500
     assert stale_steps < 500
+    assert remaining_steps < 500
 
 
 def _insert_migration_operation(
@@ -4692,11 +7053,14 @@ def _insert_migration_approval(
     approval_id,
     operation_id,
     revision,
+    *,
+    maintenance_seq=None,
 ):
     conn.execute(
         """
         INSERT INTO project_approvals (
-            approval_id, project_id, turn_id, operation_id, actor_id,
+            approval_id, project_id, turn_id, operation_id,
+            operation_maintenance_seq, actor_id,
             authorization_actor_id, canonical_action, approval_class,
             command_revision, expected_runtime_version,
             effective_runtime_version, turn_expected_control_version,
@@ -4704,7 +7068,7 @@ def _insert_migration_approval(
             batch_boundary_json, status, expires_at, resolved_at,
             resolved_by_actor_id, consumed_at, created_at
         ) VALUES (
-            ?, ?, NULL, ?, 'owner', 'owner', 'publish', 'publish', ?,
+            ?, ?, NULL, ?, ?, 'owner', 'owner', 'publish', 'publish', ?,
             0, 0, NULL, 'active', 'implementation', ?, ?,
             'pending', 100, NULL, NULL, NULL, 1
         )
@@ -4713,11 +7077,191 @@ def _insert_migration_approval(
             approval_id,
             project_id,
             operation_id,
+            maintenance_seq,
             revision,
             f'["C:/migration/{approval_id}"]',
             f'{{"batch_id":"{approval_id}"}}',
         ),
     )
+
+
+def _drop_operation_sequence_guards(conn):
+    conn.execute(
+        "DROP TRIGGER IF EXISTS trg_project_approvals_task6_insert"
+    )
+    conn.execute(
+        "DROP TRIGGER IF EXISTS trg_project_approvals_task6_update"
+    )
+    conn.execute(
+        """
+        DROP INDEX IF EXISTS
+        idx_project_approvals_operation_maintenance_seq
+        """
+    )
+    conn.execute(
+        """
+        DROP INDEX IF EXISTS
+        idx_project_approvals_operation_stale_epoch
+        """
+    )
+
+
+def test_sequence_migration_dense_remaps_signed_rowids_and_is_idempotent(
+    operation_conn,
+):
+    project_id = _insert_project(
+        operation_conn, "signed-sequence-migration"
+    )
+    _drop_operation_sequence_guards(operation_conn)
+    operation_conn.commit()
+    operation_conn.execute("PRAGMA foreign_keys=OFF")
+    signed = (
+        ("approval-positive", "operation-positive", 9, 3),
+        ("approval-negative", "operation-negative", -4, 1),
+        ("approval-zero", "operation-zero", 0, 2),
+    )
+    for approval_id, operation_id, rowid, revision in signed:
+        _insert_migration_operation(
+            operation_conn,
+            project_id,
+            operation_id,
+            approval_id,
+        )
+        _insert_migration_approval(
+            operation_conn,
+            project_id,
+            approval_id,
+            operation_id,
+            revision,
+        )
+        operation_conn.execute(
+            """
+            UPDATE project_approvals
+            SET rowid = ?
+            WHERE approval_id = ?
+            """,
+            (rowid, approval_id),
+        )
+    operation_conn.execute(
+        """
+        UPDATE project_operation_maintenance
+        SET approval_scan_after_seq = 7,
+            approval_scan_high_water_seq = 9,
+            approval_scan_epoch = 11,
+            next_operation_approval_seq = 1
+        WHERE singleton = 1
+        """
+    )
+    operation_conn.commit()
+    operation_conn.execute("PRAGMA foreign_keys=ON")
+
+    prdb.ensure_schema(operation_conn)
+    expected = (
+        ("approval-negative", -4, 1),
+        ("approval-zero", 0, 2),
+        ("approval-positive", 9, 3),
+    )
+    assert tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT approval_id, rowid, operation_maintenance_seq
+            FROM project_approvals
+            WHERE project_id = ?
+            ORDER BY rowid, approval_id
+            """,
+            (project_id,),
+        )
+    ) == expected
+    assert _maintenance_state(operation_conn)[3:] == (
+        0,
+        0,
+        0,
+        4,
+    )
+
+    prdb.ensure_schema(operation_conn)
+    assert tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT approval_id, rowid, operation_maintenance_seq
+            FROM project_approvals
+            WHERE project_id = ?
+            ORDER BY rowid, approval_id
+            """,
+            (project_id,),
+        )
+    ) == expected
+
+
+@pytest.mark.parametrize("invalid_shape", ("zero", "duplicate"))
+def test_sequence_migration_rejects_invalid_stored_values_atomically(
+    operation_conn,
+    invalid_shape,
+):
+    project_id = _insert_project(
+        operation_conn, f"invalid-sequence-{invalid_shape}"
+    )
+    _drop_operation_sequence_guards(operation_conn)
+    operation_conn.commit()
+    operation_conn.execute("PRAGMA foreign_keys=OFF")
+    for ordinal in (1, 2):
+        _insert_migration_operation(
+            operation_conn,
+            project_id,
+            f"operation-{ordinal}",
+            f"approval-{ordinal}",
+        )
+        _insert_migration_approval(
+            operation_conn,
+            project_id,
+            f"approval-{ordinal}",
+            f"operation-{ordinal}",
+            ordinal,
+        )
+    operation_conn.execute("PRAGMA ignore_check_constraints=ON")
+    values = (0, 2) if invalid_shape == "zero" else (1, 1)
+    for ordinal, value in enumerate(values, start=1):
+        operation_conn.execute(
+            """
+            UPDATE project_approvals
+            SET operation_maintenance_seq = ?
+            WHERE approval_id = ?
+            """,
+            (value, f"approval-{ordinal}"),
+        )
+    operation_conn.execute("PRAGMA ignore_check_constraints=OFF")
+    operation_conn.commit()
+    operation_conn.execute("PRAGMA foreign_keys=ON")
+    before = tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT approval_id, operation_maintenance_seq
+            FROM project_approvals
+            WHERE project_id = ?
+            ORDER BY approval_id
+            """,
+            (project_id,),
+        )
+    )
+
+    with pytest.raises(prdb.OperationMigrationError):
+        prdb.ensure_schema(operation_conn)
+
+    assert tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT approval_id, operation_maintenance_seq
+            FROM project_approvals
+            WHERE project_id = ?
+            ORDER BY approval_id
+            """,
+            (project_id,),
+        )
+    ) == before
 
 
 @pytest.mark.parametrize(
@@ -4759,6 +7303,7 @@ def test_migration_rejects_non_inverse_operation_approval_links(
             "approval-1",
             "operation-1",
             1,
+            maintenance_seq=1,
         )
     elif shape == "dangling_operation":
         _insert_migration_operation(
@@ -4771,6 +7316,7 @@ def test_migration_rejects_non_inverse_operation_approval_links(
             "approval-1",
             "operation-missing",
             1,
+            maintenance_seq=1,
         )
     else:
         _insert_migration_operation(
@@ -4785,6 +7331,7 @@ def test_migration_rejects_non_inverse_operation_approval_links(
             "approval-1",
             "operation-2",
             1,
+            maintenance_seq=1,
         )
         _insert_migration_approval(
             operation_conn,
@@ -4792,6 +7339,7 @@ def test_migration_rejects_non_inverse_operation_approval_links(
             "approval-2",
             "operation-1",
             2,
+            maintenance_seq=2,
         )
     operation_conn.commit()
     operation_conn.execute("PRAGMA foreign_keys=ON")
@@ -4852,7 +7400,21 @@ def test_migration_rejects_non_inverse_operation_approval_links(
 def test_approval_maintenance_schema_is_idempotent(operation_conn):
     prdb.ensure_schema(operation_conn)
     prdb.ensure_schema(operation_conn)
-    assert _maintenance_state(operation_conn) == (1, "", 0)
+    assert _maintenance_state(operation_conn) == (
+        1,
+        "",
+        0,
+        0,
+        0,
+        0,
+        1,
+    )
+    assert {
+        row["name"]
+        for row in operation_conn.execute(
+            "PRAGMA table_info(project_approvals)"
+        )
+    } >= {"operation_maintenance_seq"}
     assert operation_conn.execute(
         """
         SELECT COUNT(*) FROM project_operation_maintenance
@@ -4869,6 +7431,273 @@ def test_operation_intent_requires_exact_builtin_remote_capability(
         replace(intent, remote_idempotency_supported=1)
     with pytest.raises(TypeError):
         replace(intent, remote_idempotency_supported=None)
+
+
+def test_task6_static_critical_map_exactly_matches_task2_policy_authority():
+    assert prdb.TASK6_CRITICAL_ACTION_APPROVAL_CLASSES == (
+        CRITICAL_ACTION_CASES
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "approval_class"),
+    CRITICAL_ACTION_CASES,
+)
+@pytest.mark.parametrize(
+    "capability_supported",
+    (True, False),
+    ids=("linked", "capability-blocked"),
+)
+def test_every_critical_action_requires_its_exact_owner_approval_class(
+    operation_env,
+    action,
+    approval_class,
+    capability_supported,
+):
+    module = operation_env["module"]
+    approval_id = f"approval-{action}"
+    prepared = operation_env["guard"].prepare(
+        operation_env["claim"],
+        _intent(
+            operation_env,
+            canonical_action=action,
+            batch_items=(action,),
+            remote_idempotency_supported=capability_supported,
+        ),
+        policy=PolicyDecision(
+            Decision.REQUIRE_APPROVAL,
+            CRITICAL_ACTION_RULES[action].rule_id,
+            "critical action requires owner approval",
+            approval_class,
+        ),
+        approval=module.OperationApprovalSpec(
+            approval_id,
+            approval_class,
+            1_000,
+            operation_env["actor"],
+        ),
+    )
+    row = operation_env["conn"].execute(
+        """
+        SELECT approval_id, approval_fingerprint_json, status,
+               blocked_reason
+        FROM project_operations
+        WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()
+    fingerprint = json.loads(row["approval_fingerprint_json"])
+
+    assert fingerprint == {
+        "approval_class": approval_class,
+        "approval_id": approval_id,
+        "authorization_actor_id": "owner-1",
+        "expires_at": 1_000,
+        "requires_owner": True,
+    }
+    if capability_supported:
+        assert prepared.status == "awaiting_approval"
+        assert tuple(row[::2]) == (
+            approval_id,
+            "awaiting_approval",
+        )
+        assert operation_env["conn"].execute(
+            """
+            SELECT operation_id
+            FROM project_approvals
+            WHERE project_id = ? AND approval_id = ?
+            """,
+            (operation_env["project_id"], approval_id),
+        ).fetchone()[0] == "operation-1"
+    else:
+        assert prepared.status == "blocked"
+        assert tuple(row[::2]) == (None, "blocked")
+        assert row["blocked_reason"] == (
+            "operation_capability_unsupported"
+        )
+        assert operation_env["conn"].execute(
+            """
+            SELECT COUNT(*)
+            FROM project_approvals
+            WHERE project_id = ?
+            """,
+            (operation_env["project_id"],),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("action", "approval_class"),
+    CRITICAL_ACTION_CASES,
+)
+def test_every_critical_action_rejects_allow_before_any_lookup_or_write(
+    operation_env,
+    monkeypatch,
+    action,
+    approval_class,
+):
+    module = operation_env["module"]
+    before = _operation_snapshot(operation_env)
+
+    def unexpected_lookup(**_kwargs):
+        raise AssertionError("critical ALLOW reached operation lookup")
+
+    monkeypatch.setattr(
+        operation_env["guard"],
+        "_existing_operation",
+        unexpected_lookup,
+    )
+    with pytest.raises(module.ProjectOperationError) as denied:
+        operation_env["guard"].prepare(
+            operation_env["claim"],
+            _intent(operation_env, canonical_action=action),
+            policy=PolicyDecision(
+                Decision.ALLOW,
+                f"policy.invalid.allow.{approval_class}",
+                "critical action cannot be allowed directly",
+            ),
+            approval=None,
+        )
+
+    assert (
+        denied.value.code
+        is module.OperationErrorCode.OPERATION_POLICY_DENIED
+    )
+    assert before == _operation_snapshot(operation_env)
+
+
+def _raw_critical_fingerprint(
+    approval_class: str,
+    *,
+    approval_id: str,
+) -> str:
+    return json.dumps(
+        {
+            "approval_class": approval_class,
+            "approval_id": approval_id,
+            "authorization_actor_id": "owner-1",
+            "expires_at": 1_000,
+            "requires_owner": True,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def test_static_trigger_rejects_every_uncertified_critical_authority_shape(
+    operation_env,
+):
+    conn = operation_env["conn"]
+    accepted: list[tuple[str, str]] = []
+    for action, approval_class in CRITICAL_ACTION_CASES:
+        for shape, fingerprint in (
+            ("no-fingerprint", None),
+            ("malformed-json", "not json"),
+            (
+                "wrong-class",
+                _raw_critical_fingerprint(
+                    f"wrong-{approval_class}",
+                    approval_id=f"raw-{action}-wrong-class",
+                ),
+            ),
+            (
+                "missing-link",
+                _raw_critical_fingerprint(
+                    approval_class,
+                    approval_id=f"raw-{action}-missing-link",
+                ),
+            ),
+        ):
+            operation_id = f"raw-{action}-{shape}"
+            conn.execute("SAVEPOINT raw_critical_shape")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO project_operations (
+                        operation_id, project_id, turn_id,
+                        idempotency_key, command_revision,
+                        targets_json, payload_json, status,
+                        created_at, updated_at, guard_revision,
+                        guard_validated, canonical_action,
+                        batch_items_json, readback_kind, attempt_id,
+                        lease_generation, fencing_token,
+                        remote_idempotency_supported,
+                        approval_fingerprint_json
+                    ) VALUES (
+                        ?, ?, ?, ?, 1,
+                        '["c:/work/operations/file.py"]', '{}',
+                        'approved', 100, 100, 1,
+                        1, ?, '["critical"]', 'remote-ledger', ?,
+                        1, 1, 1, ?
+                    )
+                    """,
+                    (
+                        operation_id,
+                        operation_env["project_id"],
+                        operation_env["turn"].turn_id,
+                        f"{operation_id}-key",
+                        action,
+                        operation_env["claim"].attempt_id,
+                        fingerprint,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                accepted.append((action, shape))
+            finally:
+                conn.execute("ROLLBACK TO raw_critical_shape")
+                conn.execute("RELEASE raw_critical_shape")
+
+        operation_id = f"raw-{action}-malformed-update"
+        conn.execute("SAVEPOINT raw_critical_update")
+        try:
+            conn.execute(
+                """
+                INSERT INTO project_operations (
+                    operation_id, project_id, turn_id,
+                    idempotency_key, command_revision,
+                    targets_json, payload_json, status,
+                    created_at, updated_at, guard_revision,
+                    guard_validated, canonical_action,
+                    batch_items_json, readback_kind, attempt_id,
+                    lease_generation, fencing_token,
+                    remote_idempotency_supported,
+                    approval_fingerprint_json
+                ) VALUES (
+                    ?, ?, ?, ?, 1,
+                    '["c:/work/operations/file.py"]', '{}',
+                    'approved', 100, 100, 1,
+                    0, ?, '["critical"]', 'remote-ledger', ?,
+                    1, 1, 1, 'not json'
+                )
+                """,
+                (
+                    operation_id,
+                    operation_env["project_id"],
+                    operation_env["turn"].turn_id,
+                    f"{operation_id}-key",
+                    action,
+                    operation_env["claim"].attempt_id,
+                ),
+            )
+            try:
+                conn.execute(
+                    """
+                    UPDATE project_operations
+                    SET guard_validated = 1
+                    WHERE operation_id = ?
+                    """,
+                    (operation_id,),
+                )
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                accepted.append((action, "malformed-update"))
+        finally:
+            conn.execute("ROLLBACK TO raw_critical_update")
+            conn.execute("RELEASE raw_critical_update")
+
+    assert accepted == []
 
 
 @pytest.mark.parametrize(
@@ -5024,12 +7853,16 @@ def test_capability_blocked_critical_replay_rejects_every_fingerprint_drift(
     ) as conflict:
         _critical_capability_block(operation_env, **values)
 
-    assert (
-        conflict.value.code
-        is operation_env[
+    expected_code = (
+        operation_env[
+            "module"
+        ].OperationErrorCode.INVALID_OPERATION_ARGUMENT
+        if drift in {"approval_class", "requires_owner"}
+        else operation_env[
             "module"
         ].OperationErrorCode.OPERATION_IDEMPOTENCY_CONFLICT
     )
+    assert conflict.value.code is expected_code
     assert before == _operation_snapshot(operation_env)
 
 
@@ -5067,8 +7900,14 @@ def test_revision_one_null_capability_is_not_backfilled_and_fails_closed(
     operation_env,
 ):
     _prepare_allowed(operation_env)
-    operation_env["conn"].execute(
-        "DROP TRIGGER trg_project_operations_task6_update"
+    operation = prdb._project_operation_for_id(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        operation_id="operation-1",
+    )
+    assert operation is not None
+    prdb._decertify_project_operation(
+        operation_env["conn"], operation
     )
     operation_env["conn"].execute(
         """

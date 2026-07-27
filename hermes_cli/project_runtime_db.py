@@ -31,6 +31,29 @@ from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 
 _SQLITE_INT_MAX = (1 << 63) - 1
 
+TASK6_CRITICAL_ACTION_APPROVAL_CLASSES = (
+    ("credentials", "credentials"),
+    ("money_quota", "money_quota"),
+    ("money", "money_quota"),
+    ("quota", "money_quota"),
+    ("external_communication", "external_communication"),
+    ("publish", "publish"),
+    ("push", "publish"),
+    ("pull_request", "publish"),
+    ("release", "publish"),
+    ("production", "production"),
+    ("admin_service", "admin_service"),
+    ("admin", "admin_service"),
+    ("service", "admin_service"),
+    ("startup", "admin_service"),
+    ("destructive", "destructive"),
+    ("live_canary", "live_canary"),
+    ("final_acceptance", "final_acceptance"),
+)
+_TASK6_CRITICAL_APPROVAL_CLASS_BY_ACTION = dict(
+    TASK6_CRITICAL_ACTION_APPROVAL_CLASSES
+)
+
 
 RUNTIME_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS project_contracts (
@@ -185,6 +208,15 @@ CREATE TABLE IF NOT EXISTS project_approvals (
                         REFERENCES projects(id) ON DELETE RESTRICT,
     turn_id             TEXT,
     operation_id        TEXT,
+    operation_maintenance_seq INTEGER
+                        CHECK (
+                            operation_maintenance_seq IS NULL
+                            OR (
+                                typeof(operation_maintenance_seq)
+                                    = 'integer'
+                                AND operation_maintenance_seq > 0
+                            )
+                        ),
     actor_id            TEXT NOT NULL,
     authorization_actor_id TEXT NOT NULL,
     canonical_action    TEXT NOT NULL,
@@ -326,6 +358,11 @@ CREATE TABLE IF NOT EXISTS project_operations (
                          typeof(guard_revision) = 'integer'
                          AND guard_revision IN (0, 1)
                      ),
+    guard_validated  INTEGER NOT NULL DEFAULT 0
+                     CHECK (
+                         typeof(guard_validated) = 'integer'
+                         AND guard_validated IN (0, 1)
+                     ),
     canonical_action TEXT,
     batch_items_json TEXT,
     readback_kind    TEXT,
@@ -366,7 +403,36 @@ CREATE TABLE IF NOT EXISTS project_operation_maintenance (
                         CHECK (singleton = 1),
     approval_scan_after TEXT NOT NULL DEFAULT '',
     next_lane           INTEGER NOT NULL DEFAULT 0
-                        CHECK (next_lane IN (0, 1))
+                        CHECK (next_lane IN (0, 1)),
+    approval_scan_after_seq INTEGER NOT NULL DEFAULT 0
+                        CHECK (
+                            typeof(approval_scan_after_seq) = 'integer'
+                            AND approval_scan_after_seq >= 0
+                        ),
+    approval_scan_high_water_seq INTEGER NOT NULL DEFAULT 0
+                        CHECK (
+                            typeof(approval_scan_high_water_seq) = 'integer'
+                            AND approval_scan_high_water_seq >= 0
+                        ),
+    approval_scan_epoch INTEGER NOT NULL DEFAULT 0
+                        CHECK (
+                            typeof(approval_scan_epoch) = 'integer'
+                            AND approval_scan_epoch >= 0
+                        ),
+    next_operation_approval_seq INTEGER NOT NULL DEFAULT 1
+                        CHECK (
+                            typeof(next_operation_approval_seq) = 'integer'
+                            AND next_operation_approval_seq > 0
+                        ),
+    operation_validation_migration_complete
+                        INTEGER NOT NULL DEFAULT 0
+                        CHECK (
+                            typeof(
+                                operation_validation_migration_complete
+                            ) = 'integer'
+                            AND operation_validation_migration_complete
+                                IN (0, 1)
+                        )
 );
 """
 
@@ -412,6 +478,40 @@ ON project_events(
 WHERE kind = 'turn.recovery_blocked';
 """
 
+_OPERATION_UNSAFE_CLASS_SQL = """CASE WHEN
+     typeof(guard_validated) IS NOT 'integer'
+  OR guard_validated IS NOT 1
+  OR typeof(guard_revision) IS NOT 'integer'
+  OR guard_revision IS NOT 1
+  OR typeof(status) IS NOT 'text'
+  OR status NOT IN (
+       'approved','effect_started','receipt_recorded','unknown',
+       'reconciled','blocked'
+     )
+  OR (
+       status = 'blocked'
+       AND (
+         typeof(blocked_reason) IS NOT 'text'
+         OR blocked_reason NOT IN (
+           'operation_capability_unsupported','approval_denied',
+           'approval_time_expired','approval_stale_boundary'
+         )
+       )
+     )
+THEN 1 ELSE 0 END"""
+
+_OPERATION_UNSAFE_INDEX_SQL = f"""
+CREATE INDEX idx_project_operations_turn_unsafe
+ON project_operations(
+  project_id,
+  turn_id,
+  (
+{_OPERATION_UNSAFE_CLASS_SQL}
+  ),
+  operation_id
+);
+"""
+
 TASK6_INDEX_SQL = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_operations_one_approval
 ON project_operations(project_id, approval_id)
@@ -423,44 +523,185 @@ WHERE operation_id IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_operations_receipt
 ON project_operations(project_id, receipt_id)
-WHERE guard_revision = 1 AND receipt_id IS NOT NULL;
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND receipt_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_project_operations_turn_status
 ON project_operations(project_id, turn_id, status, operation_id)
-WHERE guard_revision = 1;
+WHERE guard_revision = 1 AND guard_validated = 1;
 
 CREATE INDEX IF NOT EXISTS idx_project_operations_recovery
 ON project_operations(
     status, updated_at, project_id, operation_id, turn_id
 )
 WHERE guard_revision = 1
+  AND guard_validated = 1
   AND status IN (
       'approved', 'effect_started', 'receipt_recorded', 'unknown'
   );
 
 CREATE INDEX IF NOT EXISTS idx_project_operations_approved_rehydrate
 ON project_operations(project_id, turn_id, operation_id)
-WHERE guard_revision = 1 AND status = 'approved';
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND status = 'approved';
 
-CREATE INDEX IF NOT EXISTS idx_project_operations_turn_guard
-ON project_operations(
-    project_id, turn_id, guard_revision, status,
-    blocked_reason, operation_id
-);
+CREATE INDEX IF NOT EXISTS idx_project_operations_turn_unresolved
+ON project_operations(project_id, turn_id, status, operation_id)
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND status IN (
+      'approved', 'effect_started', 'receipt_recorded', 'unknown'
+  );
 
 CREATE INDEX IF NOT EXISTS idx_project_approvals_operation_due
 ON project_approvals(expires_at, project_id, approval_id)
 WHERE status = 'pending' AND operation_id IS NOT NULL;
 
-CREATE INDEX IF NOT EXISTS idx_project_approvals_operation_scan
-ON project_approvals(approval_id)
+CREATE UNIQUE INDEX IF NOT EXISTS
+idx_project_approvals_operation_maintenance_seq
+ON project_approvals(operation_maintenance_seq)
+WHERE operation_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_project_approvals_operation_stale_epoch
+ON project_approvals(operation_maintenance_seq)
 WHERE status = 'pending' AND operation_id IS NOT NULL;
+"""
+
+_TASK6_CRITICAL_AUTHORITY_PREDICATE_SQL = """
+COALESCE(
+    (
+        SELECT
+            CASE
+            WHEN (
+                typeof(NEW.approval_fingerprint_json) = 'text'
+                AND json_valid(
+                    NEW.approval_fingerprint_json
+                ) = 1
+            )
+            THEN (
+            NEW.approval_fingerprint_json = json_object(
+                'approval_class',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.approval_class'
+                ),
+                'approval_id',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.approval_id'
+                ),
+                'authorization_actor_id',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.authorization_actor_id'
+                ),
+                'expires_at',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.expires_at'
+                ),
+                'requires_owner',
+                json('true')
+            )
+            AND json_extract(
+                NEW.approval_fingerprint_json,
+                '$.approval_class'
+            ) = critical.column2
+            AND typeof(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.approval_id'
+            )) = 'text'
+            AND length(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.approval_id'
+            )) > 0
+            AND typeof(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.authorization_actor_id'
+            )) = 'text'
+            AND length(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.authorization_actor_id'
+            )) > 0
+            AND json_type(
+                NEW.approval_fingerprint_json,
+                '$.expires_at'
+            ) = 'integer'
+            AND json_extract(
+                NEW.approval_fingerprint_json,
+                '$.expires_at'
+            ) >= 0
+            AND json_type(
+                NEW.approval_fingerprint_json,
+                '$.requires_owner'
+            ) = 'true'
+            AND (
+                (
+                    NEW.status = 'blocked'
+                    AND NEW.blocked_reason
+                        = 'operation_capability_unsupported'
+                    AND (
+                        NEW.remote_idempotency_supported = 0
+                        OR NEW.readback_kind IS NULL
+                    )
+                    AND NEW.approval_id IS NULL
+                )
+                OR (
+                    NOT (
+                        NEW.status = 'blocked'
+                        AND NEW.blocked_reason
+                            = 'operation_capability_unsupported'
+                    )
+                    AND typeof(NEW.approval_id) = 'text'
+                    AND length(NEW.approval_id) > 0
+                    AND NEW.approval_id = json_extract(
+                        NEW.approval_fingerprint_json,
+                        '$.approval_id'
+                    )
+                )
+            )
+            )
+            ELSE 0
+            END
+        FROM (
+            VALUES
+                ('credentials', 'credentials'),
+                ('money_quota', 'money_quota'),
+                ('money', 'money_quota'),
+                ('quota', 'money_quota'),
+                (
+                    'external_communication',
+                    'external_communication'
+                ),
+                ('publish', 'publish'),
+                ('push', 'publish'),
+                ('pull_request', 'publish'),
+                ('release', 'publish'),
+                ('production', 'production'),
+                ('admin_service', 'admin_service'),
+                ('admin', 'admin_service'),
+                ('service', 'admin_service'),
+                ('startup', 'admin_service'),
+                ('destructive', 'destructive'),
+                ('live_canary', 'live_canary'),
+                ('final_acceptance', 'final_acceptance')
+        ) AS critical
+        WHERE critical.column1 = NEW.canonical_action
+    ),
+    (
+        NEW.approval_fingerprint_json IS NULL
+        AND NEW.approval_id IS NULL
+    )
+)
 """
 
 TASK6_TRIGGER_SQL = """
 CREATE TRIGGER IF NOT EXISTS trg_project_operations_task6_insert
 BEFORE INSERT ON project_operations
 WHEN NEW.guard_revision = 1
+ AND NEW.guard_validated = 1
  AND NOT (
     typeof(NEW.operation_id) = 'text' AND length(NEW.operation_id) > 0
     AND typeof(NEW.project_id) = 'text' AND length(NEW.project_id) > 0
@@ -524,97 +765,7 @@ WHEN NEW.guard_revision = 1
             )
         )
     )
-    AND (
-        (
-            NEW.canonical_action NOT IN (
-                'publish', 'push', 'pull_request', 'release'
-            )
-            AND NEW.approval_fingerprint_json IS NULL
-            AND NEW.approval_id IS NULL
-        )
-        OR (
-            NEW.canonical_action IN (
-                'publish', 'push', 'pull_request', 'release'
-            )
-            AND typeof(NEW.approval_fingerprint_json) = 'text'
-            AND NEW.approval_fingerprint_json = json_object(
-                'approval_class',
-                json_extract(
-                    NEW.approval_fingerprint_json,
-                    '$.approval_class'
-                ),
-                'approval_id',
-                json_extract(
-                    NEW.approval_fingerprint_json,
-                    '$.approval_id'
-                ),
-                'authorization_actor_id',
-                json_extract(
-                    NEW.approval_fingerprint_json,
-                    '$.authorization_actor_id'
-                ),
-                'expires_at',
-                json_extract(
-                    NEW.approval_fingerprint_json,
-                    '$.expires_at'
-                ),
-                'requires_owner',
-                json('true')
-            )
-            AND json_extract(
-                NEW.approval_fingerprint_json,
-                '$.approval_class'
-            ) = 'publish'
-            AND typeof(json_extract(
-                NEW.approval_fingerprint_json,
-                '$.approval_id'
-            )) = 'text'
-            AND length(json_extract(
-                NEW.approval_fingerprint_json,
-                '$.approval_id'
-            )) > 0
-            AND typeof(json_extract(
-                NEW.approval_fingerprint_json,
-                '$.authorization_actor_id'
-            )) = 'text'
-            AND length(json_extract(
-                NEW.approval_fingerprint_json,
-                '$.authorization_actor_id'
-            )) > 0
-            AND json_type(
-                NEW.approval_fingerprint_json,
-                '$.expires_at'
-            ) = 'integer'
-            AND json_extract(
-                NEW.approval_fingerprint_json,
-                '$.expires_at'
-            ) >= 0
-            AND json_type(
-                NEW.approval_fingerprint_json,
-                '$.requires_owner'
-            ) = 'true'
-            AND (
-                (
-                    NEW.approval_id IS NOT NULL
-                    AND NEW.approval_id = json_extract(
-                        NEW.approval_fingerprint_json,
-                        '$.approval_id'
-                    )
-                )
-                OR (
-                    NEW.approval_id IS NULL
-                    AND (
-                        (
-                            NEW.status = 'blocked'
-                            AND NEW.blocked_reason
-                                = 'operation_capability_unsupported'
-                        )
-                        OR NEW.status = 'approved'
-                    )
-                )
-            )
-        )
-    )
+    AND (__TASK6_CRITICAL_AUTHORITY__)
     AND (
         (
             (
@@ -678,6 +829,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_project_operations_task6_update
 BEFORE UPDATE ON project_operations
 WHEN NEW.guard_revision = 1
+ AND NEW.guard_validated = 1
  AND NOT (
     typeof(NEW.operation_id) = 'text' AND length(NEW.operation_id) > 0
     AND typeof(NEW.project_id) = 'text' AND length(NEW.project_id) > 0
@@ -741,97 +893,7 @@ WHEN NEW.guard_revision = 1
             )
         )
     )
-    AND (
-        (
-            NEW.canonical_action NOT IN (
-                'publish', 'push', 'pull_request', 'release'
-            )
-            AND NEW.approval_fingerprint_json IS NULL
-            AND NEW.approval_id IS NULL
-        )
-        OR (
-            NEW.canonical_action IN (
-                'publish', 'push', 'pull_request', 'release'
-            )
-            AND typeof(NEW.approval_fingerprint_json) = 'text'
-            AND NEW.approval_fingerprint_json = json_object(
-                'approval_class',
-                json_extract(
-                    NEW.approval_fingerprint_json,
-                    '$.approval_class'
-                ),
-                'approval_id',
-                json_extract(
-                    NEW.approval_fingerprint_json,
-                    '$.approval_id'
-                ),
-                'authorization_actor_id',
-                json_extract(
-                    NEW.approval_fingerprint_json,
-                    '$.authorization_actor_id'
-                ),
-                'expires_at',
-                json_extract(
-                    NEW.approval_fingerprint_json,
-                    '$.expires_at'
-                ),
-                'requires_owner',
-                json('true')
-            )
-            AND json_extract(
-                NEW.approval_fingerprint_json,
-                '$.approval_class'
-            ) = 'publish'
-            AND typeof(json_extract(
-                NEW.approval_fingerprint_json,
-                '$.approval_id'
-            )) = 'text'
-            AND length(json_extract(
-                NEW.approval_fingerprint_json,
-                '$.approval_id'
-            )) > 0
-            AND typeof(json_extract(
-                NEW.approval_fingerprint_json,
-                '$.authorization_actor_id'
-            )) = 'text'
-            AND length(json_extract(
-                NEW.approval_fingerprint_json,
-                '$.authorization_actor_id'
-            )) > 0
-            AND json_type(
-                NEW.approval_fingerprint_json,
-                '$.expires_at'
-            ) = 'integer'
-            AND json_extract(
-                NEW.approval_fingerprint_json,
-                '$.expires_at'
-            ) >= 0
-            AND json_type(
-                NEW.approval_fingerprint_json,
-                '$.requires_owner'
-            ) = 'true'
-            AND (
-                (
-                    NEW.approval_id IS NOT NULL
-                    AND NEW.approval_id = json_extract(
-                        NEW.approval_fingerprint_json,
-                        '$.approval_id'
-                    )
-                )
-                OR (
-                    NEW.approval_id IS NULL
-                    AND (
-                        (
-                            NEW.status = 'blocked'
-                            AND NEW.blocked_reason
-                                = 'operation_capability_unsupported'
-                        )
-                        OR NEW.status = 'approved'
-                    )
-                )
-            )
-        )
-    )
+    AND (__TASK6_CRITICAL_AUTHORITY__)
     AND (
         (
             (
@@ -891,7 +953,150 @@ WHEN NEW.guard_revision = 1
 BEGIN
     SELECT RAISE(ABORT, 'invalid managed project operation');
 END;
-"""
+
+CREATE TRIGGER IF NOT EXISTS trg_project_operations_guard_update
+BEFORE UPDATE ON project_operations
+WHEN (
+       OLD.guard_validated = 1
+       OR (
+            OLD.guard_validated = 0
+            AND NEW.guard_validated = 1
+       )
+     )
+ AND (
+       NEW.operation_id IS NOT OLD.operation_id
+    OR NEW.project_id IS NOT OLD.project_id
+    OR NEW.turn_id IS NOT OLD.turn_id
+    OR NEW.idempotency_key IS NOT OLD.idempotency_key
+    OR NEW.approval_id IS NOT OLD.approval_id
+    OR NEW.command_revision IS NOT OLD.command_revision
+    OR NEW.targets_json IS NOT OLD.targets_json
+    OR NEW.payload_json IS NOT OLD.payload_json
+    OR NEW.status IS NOT OLD.status
+    OR NEW.receipt_json IS NOT OLD.receipt_json
+    OR NEW.created_at IS NOT OLD.created_at
+    OR NEW.updated_at IS NOT OLD.updated_at
+    OR NEW.guard_revision IS NOT OLD.guard_revision
+    OR NEW.canonical_action IS NOT OLD.canonical_action
+    OR NEW.batch_items_json IS NOT OLD.batch_items_json
+    OR NEW.readback_kind IS NOT OLD.readback_kind
+    OR NEW.attempt_id IS NOT OLD.attempt_id
+    OR NEW.lease_generation IS NOT OLD.lease_generation
+    OR NEW.fencing_token IS NOT OLD.fencing_token
+    OR NEW.receipt_id IS NOT OLD.receipt_id
+    OR NEW.readback_json IS NOT OLD.readback_json
+    OR NEW.blocked_reason IS NOT OLD.blocked_reason
+    OR NEW.remote_idempotency_supported
+       IS NOT OLD.remote_idempotency_supported
+    OR NEW.approval_fingerprint_json
+       IS NOT OLD.approval_fingerprint_json
+ )
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'certified project operation requires marker-only transition'
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_project_approvals_task6_insert
+BEFORE INSERT ON project_approvals
+WHEN NOT (
+       (
+           NEW.operation_id IS NULL
+           AND NEW.operation_maintenance_seq IS NULL
+       )
+    OR (
+           typeof(NEW.operation_id) = 'text'
+           AND length(NEW.operation_id) > 0
+           AND typeof(NEW.operation_maintenance_seq) = 'integer'
+           AND NEW.operation_maintenance_seq > 0
+       )
+)
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'linked project approval requires positive maintenance sequence'
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_project_approvals_task6_update
+BEFORE UPDATE ON project_approvals
+WHEN (
+       OLD.operation_id IS NOT NULL
+       AND (
+            NEW.operation_id IS NOT OLD.operation_id
+         OR NEW.operation_maintenance_seq
+            IS NOT OLD.operation_maintenance_seq
+       )
+     )
+  OR (
+       OLD.operation_id IS NOT NULL
+       AND (
+            NEW.approval_id IS NOT OLD.approval_id
+         OR NEW.project_id IS NOT OLD.project_id
+         OR NEW.turn_id IS NOT OLD.turn_id
+         OR NEW.actor_id IS NOT OLD.actor_id
+         OR NEW.authorization_actor_id
+            IS NOT OLD.authorization_actor_id
+         OR NEW.canonical_action IS NOT OLD.canonical_action
+         OR NEW.approval_class IS NOT OLD.approval_class
+         OR NEW.command_revision IS NOT OLD.command_revision
+         OR NEW.expected_runtime_version
+            IS NOT OLD.expected_runtime_version
+         OR NEW.effective_runtime_version
+            IS NOT OLD.effective_runtime_version
+         OR NEW.turn_expected_control_version
+            IS NOT OLD.turn_expected_control_version
+         OR NEW.expected_lifecycle IS NOT OLD.expected_lifecycle
+         OR NEW.expected_phase IS NOT OLD.expected_phase
+         OR NEW.targets_json IS NOT OLD.targets_json
+         OR NEW.batch_boundary_json IS NOT OLD.batch_boundary_json
+         OR NEW.status IS NOT OLD.status
+         OR NEW.expires_at IS NOT OLD.expires_at
+         OR NEW.resolved_at IS NOT OLD.resolved_at
+         OR NEW.resolved_by_actor_id
+            IS NOT OLD.resolved_by_actor_id
+         OR NEW.consumed_at IS NOT OLD.consumed_at
+         OR NEW.created_at IS NOT OLD.created_at
+       )
+       AND NOT EXISTS (
+           SELECT 1
+           FROM project_operations AS operation
+           WHERE operation.project_id = OLD.project_id
+             AND operation.operation_id = OLD.operation_id
+             AND operation.guard_validated = 0
+       )
+     )
+  OR (
+       OLD.operation_id IS NULL
+       AND NEW.operation_id IS NOT NULL
+       AND (
+           typeof(NEW.operation_maintenance_seq) != 'integer'
+           OR NEW.operation_maintenance_seq <= 0
+           OR NOT EXISTS (
+               SELECT 1
+               FROM project_operations AS operation
+               WHERE operation.project_id = NEW.project_id
+                 AND operation.operation_id = NEW.operation_id
+                 AND operation.guard_validated = 0
+           )
+       )
+     )
+  OR (
+       OLD.operation_id IS NULL
+       AND NEW.operation_id IS NULL
+       AND NEW.operation_maintenance_seq IS NOT NULL
+     )
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'linked project approval requires decertified operation'
+    );
+END;
+""".replace(
+    "__TASK6_CRITICAL_AUTHORITY__",
+    _TASK6_CRITICAL_AUTHORITY_PREDICATE_SQL,
+)
 
 _RECOVERY_EXPIRED_LEASES_SQL = """
 SELECT turn.project_id, turn.turn_id, turn.sequence
@@ -915,6 +1120,7 @@ SELECT turn.project_id, turn.turn_id, turn.sequence,
            WHERE operation.project_id = turn.project_id
              AND operation.turn_id = turn.turn_id
              AND operation.guard_revision = 1
+             AND operation.guard_validated = 1
              AND operation.status IN (
                  'approved', 'effect_started',
                  'receipt_recorded', 'unknown'
@@ -929,7 +1135,7 @@ ORDER BY turn.project_id, turn.sequence, turn.turn_id
 LIMIT ?
 """
 
-_OPERATION_PENDING_BRANCH_SQL = """
+_OPERATION_PENDING_BRANCH_SQL = f"""
 SELECT operation.project_id, operation.turn_id, operation.operation_id
 FROM project_operations AS operation
      INDEXED BY idx_project_operations_recovery
@@ -938,6 +1144,7 @@ JOIN project_turns AS turn
  AND turn.turn_id = operation.turn_id
 WHERE operation.status = ?
   AND operation.guard_revision = 1
+  AND operation.guard_validated = 1
   AND operation.status IN (
       'approved', 'effect_started', 'receipt_recorded', 'unknown'
   )
@@ -949,45 +1156,55 @@ WHERE operation.status = ?
       WHERE lease.project_id = turn.project_id
         AND lease.turn_id = turn.turn_id
   )
-  AND (
-      SELECT COUNT(*)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM project_operations AS unsafe
+           INDEXED BY idx_project_operations_turn_unsafe
+      WHERE unsafe.project_id = turn.project_id
+        AND unsafe.turn_id = turn.turn_id
+        AND ({_OPERATION_UNSAFE_CLASS_SQL}) = 1
+      LIMIT 1
+  )
+  AND NOT EXISTS (
+      SELECT 1
       FROM project_operations AS unresolved
-           INDEXED BY idx_project_operations_recovery
+           INDEXED BY idx_project_operations_turn_unresolved
       WHERE unresolved.project_id = turn.project_id
         AND unresolved.turn_id = turn.turn_id
         AND unresolved.guard_revision = 1
+        AND unresolved.guard_validated = 1
         AND unresolved.status IN (
             'approved', 'effect_started',
             'receipt_recorded', 'unknown'
         )
-  ) = 1
-  AND NOT EXISTS (
-      SELECT 1
-      FROM project_operations AS history
-           INDEXED BY idx_project_operations_turn_guard
-      WHERE history.project_id = turn.project_id
-        AND history.turn_id = turn.turn_id
-        AND NOT (
-            history.guard_revision = 1
-            AND (
-                history.status IN (
-                    'approved', 'effect_started',
-                    'receipt_recorded', 'unknown', 'reconciled'
-                )
-                OR (
-                    history.status = 'blocked'
-                    AND history.blocked_reason IN (
-                        'operation_capability_unsupported',
-                        'approval_denied',
-                        'approval_time_expired',
-                        'approval_stale_boundary'
-                    )
-                )
-            )
-        )
+        AND unresolved.operation_id != operation.operation_id
+      LIMIT 1
   )
 ORDER BY operation.updated_at, operation.project_id,
          operation.operation_id, operation.turn_id
+LIMIT ?
+"""
+
+_OPERATION_TURN_UNSAFE_SQL = f"""
+SELECT 1
+FROM project_operations INDEXED BY idx_project_operations_turn_unsafe
+WHERE project_id = ?
+  AND turn_id = ?
+  AND ({_OPERATION_UNSAFE_CLASS_SQL}) = 1
+LIMIT 1
+"""
+
+_OPERATION_TURN_UNRESOLVED_SQL = """
+SELECT operation_id
+FROM project_operations AS unresolved
+     INDEXED BY idx_project_operations_turn_unresolved
+WHERE unresolved.project_id = ?
+  AND unresolved.turn_id = ?
+  AND unresolved.guard_revision = 1
+  AND unresolved.guard_validated = 1
+  AND unresolved.status IN (
+      'approved', 'effect_started', 'receipt_recorded', 'unknown'
+  )
 LIMIT ?
 """
 
@@ -1002,26 +1219,37 @@ ORDER BY expires_at, project_id, approval_id
 LIMIT ?
 """
 
-_APPROVAL_STALE_MAINTENANCE_SQL = """
-SELECT approval_id
+_APPROVAL_STALE_HIGH_WATER_SQL = """
+SELECT operation_maintenance_seq
 FROM project_approvals
-     INDEXED BY idx_project_approvals_operation_scan
+     INDEXED BY idx_project_approvals_operation_stale_epoch
 WHERE status = 'pending'
   AND operation_id IS NOT NULL
-  AND approval_id > ?
-ORDER BY approval_id
+ORDER BY operation_maintenance_seq DESC
+LIMIT 1
+"""
+
+_APPROVAL_STALE_MAINTENANCE_SQL = """
+SELECT approval_id, operation_maintenance_seq
+FROM project_approvals
+     INDEXED BY idx_project_approvals_operation_stale_epoch
+WHERE status = 'pending'
+  AND operation_id IS NOT NULL
+  AND operation_maintenance_seq > ?
+  AND operation_maintenance_seq <= ?
+ORDER BY operation_maintenance_seq
 LIMIT ?
 """
 
-_APPROVAL_STALE_MAINTENANCE_WRAP_SQL = """
-SELECT approval_id
+_APPROVAL_STALE_REMAINING_SQL = """
+SELECT 1
 FROM project_approvals
-     INDEXED BY idx_project_approvals_operation_scan
+     INDEXED BY idx_project_approvals_operation_stale_epoch
 WHERE status = 'pending'
   AND operation_id IS NOT NULL
-  AND approval_id <= ?
-ORDER BY approval_id
-LIMIT ?
+  AND operation_maintenance_seq > ?
+  AND operation_maintenance_seq <= ?
+LIMIT 1
 """
 
 _RECOVERY_BLOCK_LOOKUP_SQL = """
@@ -1145,6 +1373,7 @@ class ProjectOperationRecord:
     created_at: int
     updated_at: int
     guard_revision: int
+    guard_validated: int
     canonical_action: str
     batch_items_json: str
     readback_kind: str | None
@@ -1192,6 +1421,10 @@ class LegacyOperationUnmanagedError(RuntimeError):
 
 class OperationMigrationError(RuntimeError):
     """Task-6 cannot safely add uniqueness to malformed legacy links."""
+
+
+class _InvalidOperationCertification(RuntimeError):
+    """One row-local canonical/inverse-pair certification failure."""
 
 
 class LineageConflictError(ValueError):
@@ -1309,12 +1542,15 @@ def _decode_operation_json(
     return decoded
 
 
-def project_operation_from_row(
+def _project_operation_from_row(
     row: sqlite3.Row | dict[str, object],
+    *,
+    expected_guard_validated: int,
 ) -> ProjectOperationRecord:
-    """Map one managed operation row, rejecting legacy and malformed state."""
+    """Map one operation at one explicit durable-certification boundary."""
     try:
         guard_revision = row["guard_revision"]
+        guard_validated = row["guard_validated"]
     except (IndexError, KeyError) as exc:
         raise RuntimeError(
             "malformed persisted project operation"
@@ -1391,8 +1627,10 @@ def project_operation_from_row(
             and type(decoded_readback["evidence"]) is dict
             and bool(decoded_readback["evidence"])
         )
-        expected_approval_class = approval_class_for_action(
-            canonical_action
+        expected_approval_class = (
+            _TASK6_CRITICAL_APPROVAL_CLASS_BY_ACTION.get(
+                canonical_action
+            )
         )
         fingerprint_present = (
             type(decoded_fingerprint) is dict
@@ -1423,6 +1661,8 @@ def project_operation_from_row(
         )
         valid = (
             guard_revision == 1
+            and type(guard_validated) is int
+            and guard_validated == expected_guard_validated
             and _stored_text(row["operation_id"])
             and _stored_text(row["project_id"])
             and _stored_text(row["turn_id"])
@@ -1564,6 +1804,7 @@ def project_operation_from_row(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         guard_revision=guard_revision,
+        guard_validated=guard_validated,
         canonical_action=canonical_action,
         batch_items_json=row["batch_items_json"],
         readback_kind=readback_kind,
@@ -1577,6 +1818,15 @@ def project_operation_from_row(
             remote_idempotency_supported
         ),
         approval_fingerprint_json=approval_fingerprint_json,
+    )
+
+
+def project_operation_from_row(
+    row: sqlite3.Row | dict[str, object],
+) -> ProjectOperationRecord:
+    """Map one certified managed operation row."""
+    return _project_operation_from_row(
+        row, expected_guard_validated=1
     )
 
 
@@ -1775,6 +2025,110 @@ def execute_schema_statements(
         raise
 
 
+def _normalized_schema_sql(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    return " ".join(value.strip().rstrip(";").split())
+
+
+def _operation_unsafe_index_is_canonical(
+    conn: sqlite3.Connection,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'index'
+          AND name = 'idx_project_operations_turn_unsafe'
+        """
+    ).fetchone()
+    if row is None or _normalized_schema_sql(
+        row["sql"]
+    ) != _normalized_schema_sql(_OPERATION_UNSAFE_INDEX_SQL):
+        return False
+    index_rows = [
+        index
+        for index in conn.execute(
+            "PRAGMA index_list('project_operations')"
+        )
+        if index["name"] == "idx_project_operations_turn_unsafe"
+    ]
+    if len(index_rows) != 1 or index_rows[0]["partial"] != 0:
+        return False
+    key_rows = [
+        index
+        for index in conn.execute(
+            "PRAGMA index_xinfo('idx_project_operations_turn_unsafe')"
+        )
+        if index["key"] == 1
+    ]
+    return [
+        (index["seqno"], index["cid"], index["name"])
+        for index in key_rows
+    ] == [
+        (0, 1, "project_id"),
+        (1, 2, "turn_id"),
+        (2, -2, None),
+        (3, 0, "operation_id"),
+    ]
+
+
+def _ensure_operation_unsafe_index(
+    conn: sqlite3.Connection,
+) -> None:
+    """Replace every stale unsafe classifier with one canonical expression."""
+    version = sqlite3.sqlite_version_info
+    if not (
+        type(version) is tuple
+        and len(version) >= 3
+        and all(type(part) is int for part in version[:3])
+        and version[:3] >= (3, 9, 0)
+    ):
+        raise OperationMigrationError(
+            "SQLite expression index support requires version 3.9.0"
+        )
+    try:
+        helper = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND name =
+                  'idx_project_operations_turn_unsafe_blocked'
+            """
+        ).fetchone()
+        if helper is not None:
+            conn.execute(
+                "DROP INDEX idx_project_operations_turn_unsafe_blocked"
+            )
+        if not _operation_unsafe_index_is_canonical(conn):
+            stale = conn.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'index'
+                  AND name = 'idx_project_operations_turn_unsafe'
+                """
+            ).fetchone()
+            if stale is not None:
+                conn.execute(
+                    "DROP INDEX idx_project_operations_turn_unsafe"
+                )
+            execute_schema_statements(
+                conn, _OPERATION_UNSAFE_INDEX_SQL
+            )
+        if not _operation_unsafe_index_is_canonical(conn):
+            raise OperationMigrationError(
+                "unsafe operation index did not converge"
+            )
+    except OperationMigrationError:
+        raise
+    except sqlite3.Error as exc:
+        raise OperationMigrationError(
+            "unsafe operation index replacement failed"
+        ) from exc
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create all additive ProjectRuntime tables without adopting projects."""
     conn.execute("PRAGMA foreign_keys=ON")
@@ -1789,8 +2143,6 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         execute_schema_statements(conn, LINEAGE_INDEX_SQL)
         execute_schema_statements(conn, TASK4_INDEX_SQL)
         execute_schema_statements(conn, TASK5_INDEX_SQL)
-        execute_schema_statements(conn, TASK6_INDEX_SQL)
-        execute_schema_statements(conn, TASK6_TRIGGER_SQL)
     except sqlite3.IntegrityError as exc:
         raise LineageMigrationError(
             "multiple conversation roots exist for one project"
@@ -1798,7 +2150,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
-    """Add Task-6 operation authority without reinterpreting placeholder rows."""
+    """Install and migrate durable Task-6 operation certification."""
     with write_transaction(conn):
         conn.execute(
             """
@@ -1815,6 +2167,16 @@ def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
                 CHECK (
                     typeof(guard_revision) = 'integer'
                     AND guard_revision IN (0, 1)
+                )
+                """,
+            ),
+            (
+                "guard_validated",
+                """
+                guard_validated INTEGER NOT NULL DEFAULT 0
+                CHECK (
+                    typeof(guard_validated) = 'integer'
+                    AND guard_validated IN (0, 1)
                 )
                 """,
             ),
@@ -1837,6 +2199,131 @@ def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
             ),
         ):
             add_column_if_missing(conn, "project_operations", name, ddl)
+        add_column_if_missing(
+            conn,
+            "project_approvals",
+            "operation_maintenance_seq",
+            """
+            operation_maintenance_seq INTEGER
+                CHECK (
+                    operation_maintenance_seq IS NULL
+                    OR (
+                        typeof(operation_maintenance_seq) = 'integer'
+                        AND operation_maintenance_seq > 0
+                    )
+                )
+            """,
+        )
+        add_column_if_missing(
+            conn,
+            "project_operation_maintenance",
+            "operation_validation_migration_complete",
+            """
+            operation_validation_migration_complete
+                INTEGER NOT NULL DEFAULT 0
+                CHECK (
+                    typeof(
+                        operation_validation_migration_complete
+                    ) = 'integer'
+                    AND operation_validation_migration_complete IN (0, 1)
+                )
+            """,
+        )
+        for name, ddl in (
+            (
+                "approval_scan_after_seq",
+                """
+                approval_scan_after_seq INTEGER NOT NULL DEFAULT 0
+                    CHECK (
+                        typeof(approval_scan_after_seq) = 'integer'
+                        AND approval_scan_after_seq >= 0
+                    )
+                """,
+            ),
+            (
+                "approval_scan_high_water_seq",
+                """
+                approval_scan_high_water_seq
+                    INTEGER NOT NULL DEFAULT 0
+                    CHECK (
+                        typeof(approval_scan_high_water_seq) = 'integer'
+                        AND approval_scan_high_water_seq >= 0
+                    )
+                """,
+            ),
+            (
+                "approval_scan_epoch",
+                """
+                approval_scan_epoch INTEGER NOT NULL DEFAULT 0
+                    CHECK (
+                        typeof(approval_scan_epoch) = 'integer'
+                        AND approval_scan_epoch >= 0
+                    )
+                """,
+            ),
+            (
+                "next_operation_approval_seq",
+                """
+                next_operation_approval_seq
+                    INTEGER NOT NULL DEFAULT 1
+                    CHECK (
+                        typeof(next_operation_approval_seq) = 'integer'
+                        AND next_operation_approval_seq > 0
+                    )
+                """,
+            ),
+        ):
+            add_column_if_missing(
+                conn,
+                "project_operation_maintenance",
+                name,
+                ddl,
+            )
+        maintenance_rows = conn.execute(
+            """
+            SELECT singleton, approval_scan_after, next_lane,
+                   operation_validation_migration_complete,
+                   approval_scan_after_seq,
+                   approval_scan_high_water_seq,
+                   approval_scan_epoch,
+                   next_operation_approval_seq
+            FROM project_operation_maintenance
+            """
+        ).fetchall()
+        if len(maintenance_rows) != 1:
+            raise OperationMigrationError(
+                "invalid operation maintenance singleton"
+            )
+        maintenance = maintenance_rows[0]
+        if not (
+            type(maintenance["singleton"]) is int
+            and maintenance["singleton"] == 1
+            and type(maintenance["approval_scan_after"]) is str
+            and type(maintenance["next_lane"]) is int
+            and maintenance["next_lane"] in {0, 1}
+            and _stored_int(maintenance["approval_scan_after_seq"])
+            and _stored_int(
+                maintenance["approval_scan_high_water_seq"]
+            )
+            and _stored_int(maintenance["approval_scan_epoch"])
+            and _stored_int(
+                maintenance["next_operation_approval_seq"],
+                minimum=1,
+            )
+            and type(
+                maintenance[
+                    "operation_validation_migration_complete"
+                ]
+            )
+            is int
+            and maintenance[
+                "operation_validation_migration_complete"
+            ]
+            in {0, 1}
+        ):
+            raise OperationMigrationError(
+                "invalid operation maintenance singleton"
+            )
         non_inverse_operation_link = conn.execute(
             """
             SELECT operation.project_id, operation.operation_id
@@ -1903,25 +2390,159 @@ def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
             raise OperationMigrationError(
                 "operation approval links are not inverse"
             )
-        recovery_index = conn.execute(
+
+        conn.execute(
+            "DROP TRIGGER IF EXISTS trg_project_approvals_task6_insert"
+        )
+        conn.execute(
+            "DROP TRIGGER IF EXISTS trg_project_approvals_task6_update"
+        )
+        invalid_approval_sequence = conn.execute(
             """
-            SELECT sql FROM sqlite_master
-            WHERE type = 'index'
-              AND name = 'idx_project_operations_recovery'
+            SELECT approval_id
+            FROM project_approvals
+            WHERE (
+                    operation_id IS NULL
+                    AND operation_maintenance_seq IS NOT NULL
+                  )
+               OR (
+                    operation_id IS NOT NULL
+                    AND operation_maintenance_seq IS NOT NULL
+                    AND (
+                        typeof(operation_maintenance_seq) != 'integer'
+                        OR operation_maintenance_seq <= 0
+                    )
+                  )
+            LIMIT 1
             """
         ).fetchone()
-        if recovery_index is not None:
-            normalized = " ".join(
-                recovery_index["sql"].lower().split()
+        duplicate_approval_sequence = conn.execute(
+            """
+            SELECT operation_maintenance_seq
+            FROM project_approvals
+            WHERE operation_id IS NOT NULL
+              AND operation_maintenance_seq IS NOT NULL
+            GROUP BY operation_maintenance_seq
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if (
+            invalid_approval_sequence is not None
+            or duplicate_approval_sequence is not None
+        ):
+            raise OperationMigrationError(
+                "invalid operation approval maintenance sequence"
             )
-            if not (
-                "status, updated_at, project_id, operation_id, turn_id"
-                in normalized
-                and "'approved'" in normalized
-            ):
-                conn.execute(
-                    "DROP INDEX idx_project_operations_recovery"
+        unsequenced_approvals = conn.execute(
+            """
+            SELECT rowid AS approval_rowid, approval_id
+            FROM project_approvals
+            WHERE operation_id IS NOT NULL
+              AND operation_maintenance_seq IS NULL
+            ORDER BY rowid, approval_id
+            """
+        ).fetchall()
+        maximum_sequence = conn.execute(
+            """
+            SELECT COALESCE(MAX(operation_maintenance_seq), 0)
+            FROM project_approvals
+            WHERE operation_id IS NOT NULL
+            """
+        ).fetchone()[0]
+        if not _stored_int(maximum_sequence):
+            raise OperationMigrationError(
+                "invalid operation approval maintenance sequence"
+            )
+        if (
+            maximum_sequence > _SQLITE_INT_MAX
+            - len(unsequenced_approvals)
+        ):
+            raise OperationMigrationError(
+                "operation approval maintenance sequence exhausted"
+            )
+        for offset, approval in enumerate(
+            unsequenced_approvals, start=1
+        ):
+            assigned = maximum_sequence + offset
+            if conn.execute(
+                """
+                UPDATE project_approvals
+                SET operation_maintenance_seq = ?
+                WHERE rowid = ? AND approval_id = ?
+                  AND operation_id IS NOT NULL
+                  AND operation_maintenance_seq IS NULL
+                """,
+                (
+                    assigned,
+                    approval["approval_rowid"],
+                    approval["approval_id"],
+                ),
+            ).rowcount != 1:
+                raise OperationMigrationError(
+                    "operation approval sequence migration changed"
                 )
+        final_maximum = maximum_sequence + len(
+            unsequenced_approvals
+        )
+        if final_maximum >= _SQLITE_INT_MAX:
+            raise OperationMigrationError(
+                "operation approval maintenance sequence exhausted"
+            )
+        target_next_sequence = max(
+            maintenance["next_operation_approval_seq"],
+            final_maximum + 1,
+        )
+        if conn.execute(
+            """
+            UPDATE project_operation_maintenance
+            SET next_operation_approval_seq = ?,
+                approval_scan_after_seq = CASE
+                    WHEN ? THEN 0 ELSE approval_scan_after_seq
+                END,
+                approval_scan_high_water_seq = CASE
+                    WHEN ? THEN 0 ELSE approval_scan_high_water_seq
+                END,
+                approval_scan_epoch = CASE
+                    WHEN ? THEN 0 ELSE approval_scan_epoch
+                END
+            WHERE singleton = 1
+              AND next_operation_approval_seq = ?
+              AND approval_scan_after_seq = ?
+              AND approval_scan_high_water_seq = ?
+              AND approval_scan_epoch = ?
+            """,
+            (
+                target_next_sequence,
+                bool(unsequenced_approvals),
+                bool(unsequenced_approvals),
+                bool(unsequenced_approvals),
+                maintenance["next_operation_approval_seq"],
+                maintenance["approval_scan_after_seq"],
+                maintenance["approval_scan_high_water_seq"],
+                maintenance["approval_scan_epoch"],
+            ),
+        ).rowcount != 1:
+            raise OperationMigrationError(
+                "operation approval maintenance state changed"
+            )
+        maintenance = conn.execute(
+            """
+            SELECT singleton, approval_scan_after, next_lane,
+                   operation_validation_migration_complete,
+                   approval_scan_after_seq,
+                   approval_scan_high_water_seq,
+                   approval_scan_epoch,
+                   next_operation_approval_seq
+            FROM project_operation_maintenance
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        if maintenance is None:
+            raise OperationMigrationError(
+                "operation approval maintenance state disappeared"
+            )
+
         for trigger_name in (
             "trg_project_operations_task6_insert",
             "trg_project_operations_task6_update",
@@ -1934,12 +2555,110 @@ def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
                 (trigger_name,),
             ).fetchone()
             if trigger is not None and (
-                "remote_idempotency_supported"
+                "guard_validated" not in trigger["sql"]
+                or "remote_idempotency_supported"
                 not in trigger["sql"]
                 or "approval_fingerprint_json"
                 not in trigger["sql"]
+                or "critical.column2" not in trigger["sql"]
             ):
                 conn.execute(f"DROP TRIGGER {trigger_name}")
+
+        if (
+            maintenance[
+                "operation_validation_migration_complete"
+            ]
+            == 0
+        ):
+            conn.execute(
+                """
+                UPDATE project_operations
+                SET guard_validated = 0
+                WHERE guard_validated IS NOT 0
+                """
+            )
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM project_operations
+                WHERE guard_revision = 1
+                  AND guard_validated = 0
+                ORDER BY rowid, operation_id
+                """
+            ).fetchall()
+            for row in rows:
+                try:
+                    _certify_project_operation_row(conn, row)
+                except _InvalidOperationCertification:
+                    continue
+                except (RuntimeError, sqlite3.Error) as exc:
+                    raise OperationMigrationError(
+                        "operation validation migration failed"
+                    ) from exc
+            if conn.execute(
+                """
+                UPDATE project_operation_maintenance
+                SET operation_validation_migration_complete = 1
+                WHERE singleton = 1
+                  AND operation_validation_migration_complete = 0
+                """
+            ).rowcount != 1:
+                raise OperationMigrationError(
+                    "operation validation migration changed"
+                )
+
+        index_requirements = {
+            "idx_project_operations_receipt": (
+                "guard_validated = 1",
+            ),
+            "idx_project_operations_turn_status": (
+                "guard_validated = 1",
+            ),
+            "idx_project_operations_recovery": (
+                "status, updated_at, project_id, operation_id, turn_id",
+                "guard_validated = 1",
+            ),
+            "idx_project_operations_approved_rehydrate": (
+                "guard_validated = 1",
+            ),
+            "idx_project_operations_turn_unresolved": (
+                "guard_validated = 1",
+            ),
+            "idx_project_approvals_operation_maintenance_seq": (
+                "create unique index",
+                "operation_maintenance_seq",
+                "where operation_id is not null",
+            ),
+            "idx_project_approvals_operation_stale_epoch": (
+                "operation_maintenance_seq",
+                "where status = 'pending' and operation_id is not null",
+            ),
+        }
+        for index_name, required_fragments in index_requirements.items():
+            index = conn.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'index' AND name = ?
+                """,
+                (index_name,),
+            ).fetchone()
+            if index is None:
+                continue
+            normalized = " ".join(index["sql"].lower().split())
+            if not all(
+                fragment in normalized
+                for fragment in required_fragments
+            ):
+                conn.execute(f"DROP INDEX {index_name}")
+        conn.execute(
+            "DROP INDEX IF EXISTS idx_project_operations_turn_guard"
+        )
+        conn.execute(
+            "DROP INDEX IF EXISTS idx_project_approvals_operation_scan"
+        )
+        execute_schema_statements(conn, TASK6_INDEX_SQL)
+        _ensure_operation_unsafe_index(conn)
+        execute_schema_statements(conn, TASK6_TRIGGER_SQL)
 
 
 def _validate_existing_lineage(conn: sqlite3.Connection) -> None:
@@ -2411,6 +3130,455 @@ def _runtime_turn_for_project(
     return runtime_turn_from_row(row) if row is not None else None
 
 
+_OPERATION_CERTIFICATION_COLUMNS = (
+    "operation_id",
+    "project_id",
+    "turn_id",
+    "idempotency_key",
+    "approval_id",
+    "command_revision",
+    "targets_json",
+    "payload_json",
+    "status",
+    "receipt_json",
+    "created_at",
+    "updated_at",
+    "guard_revision",
+    "canonical_action",
+    "batch_items_json",
+    "readback_kind",
+    "attempt_id",
+    "lease_generation",
+    "fencing_token",
+    "receipt_id",
+    "readback_json",
+    "blocked_reason",
+    "remote_idempotency_supported",
+    "approval_fingerprint_json",
+)
+
+_APPROVAL_CERTIFICATION_COLUMNS = (
+    "approval_id",
+    "project_id",
+    "turn_id",
+    "operation_id",
+    "operation_maintenance_seq",
+    "actor_id",
+    "authorization_actor_id",
+    "canonical_action",
+    "approval_class",
+    "command_revision",
+    "expected_runtime_version",
+    "effective_runtime_version",
+    "turn_expected_control_version",
+    "expected_lifecycle",
+    "expected_phase",
+    "targets_json",
+    "batch_boundary_json",
+    "status",
+    "expires_at",
+    "resolved_at",
+    "resolved_by_actor_id",
+    "consumed_at",
+    "created_at",
+)
+
+
+def _operation_approval_certification_row(
+    conn: sqlite3.Connection,
+    operation: ProjectOperationRecord,
+) -> sqlite3.Row | None:
+    """Validate and return the complete inverse approval, when required."""
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM project_approvals
+        WHERE project_id = ? AND operation_id = ?
+        ORDER BY approval_id
+        """,
+        (operation.project_id, operation.operation_id),
+    ).fetchall()
+    expected_class = _TASK6_CRITICAL_APPROVAL_CLASS_BY_ACTION.get(
+        operation.canonical_action
+    )
+    capability_blocked = (
+        operation.status == "blocked"
+        and operation.blocked_reason
+        == "operation_capability_unsupported"
+    )
+    if expected_class is None or capability_blocked:
+        if operation.approval_id is not None or rows:
+            raise RuntimeError(
+                "malformed persisted project operation approval link"
+            )
+        return None
+    if operation.approval_id is None or len(rows) != 1:
+        raise RuntimeError(
+            "malformed persisted project operation approval link"
+        )
+    row = rows[0]
+    try:
+        targets = _decode_operation_json(
+            row["targets_json"], require_object=False
+        )
+        if not _stored_text(row["batch_boundary_json"]):
+            raise ValueError("approval boundary must be text")
+        boundary = json.loads(
+            row["batch_boundary_json"],
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(value)
+            ),
+        )
+        fingerprint = _decode_operation_json(
+            operation.approval_fingerprint_json,
+            require_object=True,
+        )
+        valid_targets = (
+            type(targets) is list
+            and bool(targets)
+            and all(type(value) is str and value for value in targets)
+            and canonicalize_targets(tuple(targets)) == tuple(targets)
+        )
+        valid_boundary = (
+            type(boundary) is dict
+            and set(boundary)
+            == {
+                "authorization_actor_id",
+                "batch_id",
+                "batch_items",
+                "canonical_action",
+                "expected_lifecycle",
+                "expected_phase",
+                "expected_runtime_version",
+            }
+            and _stored_text(boundary["authorization_actor_id"])
+            and _stored_text(boundary["batch_id"])
+            and type(boundary["batch_items"]) is list
+            and bool(boundary["batch_items"])
+            and all(
+                type(value) is str and value
+                for value in boundary["batch_items"]
+            )
+            and len(set(boundary["batch_items"]))
+            == len(boundary["batch_items"])
+            and _stored_text(boundary["canonical_action"])
+            and boundary["expected_lifecycle"]
+            in {"active", "awaiting_acceptance", "completed"}
+            and _stored_text(boundary["expected_phase"])
+            and _stored_int(boundary["expected_runtime_version"])
+            and row["batch_boundary_json"]
+            == _canonical_boundary_json(
+                authorization_actor_id=(
+                    boundary["authorization_actor_id"]
+                ),
+                canonical_action=boundary["canonical_action"],
+                batch_id=boundary["batch_id"],
+                batch_items=tuple(boundary["batch_items"]),
+                expected_runtime_version=(
+                    boundary["expected_runtime_version"]
+                ),
+                expected_lifecycle=boundary["expected_lifecycle"],
+                expected_phase=boundary["expected_phase"],
+            )
+        )
+        valid_fingerprint = (
+            type(fingerprint) is dict
+            and fingerprint["approval_class"] == expected_class
+            and fingerprint["approval_id"] == operation.approval_id
+            and fingerprint["authorization_actor_id"]
+            == row["authorization_actor_id"]
+            and fingerprint["expires_at"] == row["expires_at"]
+            and fingerprint["requires_owner"] is True
+        )
+        approval_status = row["status"]
+        resolved_at = row["resolved_at"]
+        resolved_by_actor_id = row["resolved_by_actor_id"]
+        consumed_at = row["consumed_at"]
+        valid_resolution = (
+            (
+                approval_status == "pending"
+                and resolved_at is None
+                and resolved_by_actor_id is None
+                and consumed_at is None
+            )
+            or (
+                approval_status == "approved"
+                and _stored_int(resolved_at)
+                and _stored_text(resolved_by_actor_id)
+                and _stored_int(consumed_at)
+                and consumed_at >= resolved_at
+            )
+            or (
+                approval_status == "denied"
+                and _stored_int(resolved_at)
+                and _stored_text(resolved_by_actor_id)
+                and consumed_at is None
+            )
+            or (
+                approval_status == "expired"
+                and consumed_at is None
+                and (
+                    (
+                        resolved_at is None
+                        and resolved_by_actor_id is None
+                    )
+                    or (
+                        _stored_int(resolved_at)
+                        and _stored_text(resolved_by_actor_id)
+                    )
+                )
+            )
+        )
+        approval_status_for_operation = {
+            "awaiting_approval": {"pending"},
+            "approved": {"approved"},
+            "effect_started": {"approved"},
+            "receipt_recorded": {"approved"},
+            "unknown": {"approved"},
+            "reconciled": {"approved"},
+            "blocked": (
+                {"denied"}
+                if operation.blocked_reason == "approval_denied"
+                else (
+                    {"expired"}
+                    if operation.blocked_reason
+                    in {
+                        "approval_time_expired",
+                        "approval_stale_boundary",
+                    }
+                    else {"approved"}
+                )
+            ),
+        }
+        valid = (
+            valid_targets
+            and valid_boundary
+            and valid_fingerprint
+            and valid_resolution
+            and row["approval_id"] == operation.approval_id
+            and row["project_id"] == operation.project_id
+            and row["turn_id"] == operation.turn_id
+            and row["operation_id"] == operation.operation_id
+            and _stored_int(
+                row["operation_maintenance_seq"], minimum=1
+            )
+            and _stored_text(row["actor_id"])
+            and row["actor_id"] == row["authorization_actor_id"]
+            and _stored_text(row["authorization_actor_id"])
+            and row["canonical_action"] == operation.canonical_action
+            and row["approval_class"] == expected_class
+            and _stored_int(row["command_revision"], minimum=1)
+            and row["command_revision"] == operation.command_revision
+            and _stored_int(row["expected_runtime_version"])
+            and _stored_int(row["effective_runtime_version"])
+            and _stored_int(
+                row["turn_expected_control_version"]
+            )
+            and row["expected_lifecycle"]
+            in {"active", "awaiting_acceptance", "completed"}
+            and _stored_text(row["expected_phase"])
+            and row["targets_json"] == operation.targets_json
+            and boundary["authorization_actor_id"]
+            == row["authorization_actor_id"]
+            and boundary["batch_id"] == operation.operation_id
+            and json.dumps(
+                boundary["batch_items"],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            == operation.batch_items_json
+            and boundary["canonical_action"]
+            == operation.canonical_action
+            and boundary["expected_runtime_version"]
+            == row["expected_runtime_version"]
+            and boundary["expected_lifecycle"]
+            == row["expected_lifecycle"]
+            and boundary["expected_phase"] == row["expected_phase"]
+            and row["status"]
+            in approval_status_for_operation[operation.status]
+            and _stored_int(row["expires_at"])
+            and _stored_int(row["created_at"])
+            and row["expires_at"] > row["created_at"]
+            and (
+                resolved_at is None
+                or resolved_at >= row["created_at"]
+            )
+        )
+    except (
+        IndexError,
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise RuntimeError(
+            "malformed persisted project operation approval link"
+        ) from exc
+    if not valid:
+        raise RuntimeError(
+            "malformed persisted project operation approval link"
+        )
+    return row
+
+
+def _certify_project_operation_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> ProjectOperationRecord:
+    """Certify one marker-zero snapshot with one marker-only tuple CAS."""
+    try:
+        operation = _project_operation_from_row(
+            row, expected_guard_validated=0
+        )
+        approval = _operation_approval_certification_row(
+            conn, operation
+        )
+    except (
+        LegacyOperationUnmanagedError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise _InvalidOperationCertification(
+            "operation is not canonically certifiable"
+        ) from exc
+    operation_predicate = " AND ".join(
+        f"{column} IS ?" for column in _OPERATION_CERTIFICATION_COLUMNS
+    )
+    parameters: list[object] = [
+        operation.project_id,
+        operation.operation_id,
+        *(row[column] for column in _OPERATION_CERTIFICATION_COLUMNS),
+    ]
+    if approval is None:
+        approval_predicate = """
+          AND NOT EXISTS (
+              SELECT 1
+              FROM project_approvals AS approval
+              WHERE approval.project_id = project_operations.project_id
+                AND approval.operation_id
+                    = project_operations.operation_id
+              LIMIT 1
+          )
+        """
+    else:
+        approval_columns = " AND ".join(
+            f"approval.{column} IS ?"
+            for column in _APPROVAL_CERTIFICATION_COLUMNS
+        )
+        approval_predicate = f"""
+          AND EXISTS (
+              SELECT 1
+              FROM project_approvals AS approval
+              WHERE {approval_columns}
+              LIMIT 1
+          )
+        """
+        parameters.extend(
+            approval[column]
+            for column in _APPROVAL_CERTIFICATION_COLUMNS
+        )
+    cursor = conn.execute(
+        f"""
+        UPDATE project_operations
+        SET guard_validated = 1
+        WHERE project_id = ? AND operation_id = ?
+          AND guard_validated = 0
+          AND {operation_predicate}
+          {approval_predicate}
+        """,
+        parameters,
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError(
+            "project operation changed during certification"
+        )
+    certified = conn.execute(
+        """
+        SELECT *
+        FROM project_operations
+        WHERE project_id = ? AND operation_id = ?
+        """,
+        (operation.project_id, operation.operation_id),
+    ).fetchone()
+    if certified is None:
+        raise RuntimeError(
+            "project operation disappeared during certification"
+        )
+    result = project_operation_from_row(certified)
+    _operation_approval_certification_row(conn, result)
+    return result
+
+
+def _certify_project_operation(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    operation_id: str,
+) -> ProjectOperationRecord:
+    row = conn.execute(
+        """
+        SELECT *
+        FROM project_operations
+        WHERE project_id = ? AND operation_id = ?
+          AND guard_revision = 1 AND guard_validated = 0
+        """,
+        (project_id, operation_id),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("project operation is not certifiable")
+    return _certify_project_operation_row(conn, row)
+
+
+def _decertify_project_operation(
+    conn: sqlite3.Connection,
+    operation: ProjectOperationRecord,
+) -> ProjectOperationRecord:
+    """CAS one exact certified snapshot to marker zero only."""
+    row = conn.execute(
+        """
+        SELECT *
+        FROM project_operations
+        WHERE project_id = ? AND operation_id = ?
+          AND guard_revision = 1 AND guard_validated = 1
+        """,
+        (operation.project_id, operation.operation_id),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("project operation is not certified")
+    stored = project_operation_from_row(row)
+    _operation_approval_certification_row(conn, stored)
+    if stored != operation:
+        raise RuntimeError(
+            "project operation changed before decertification"
+        )
+    operation_predicate = " AND ".join(
+        f"{column} IS ?" for column in _OPERATION_CERTIFICATION_COLUMNS
+    )
+    cursor = conn.execute(
+        f"""
+        UPDATE project_operations
+        SET guard_validated = 0
+        WHERE project_id = ? AND operation_id = ?
+          AND guard_validated = 1
+          AND {operation_predicate}
+        """,
+        (
+            operation.project_id,
+            operation.operation_id,
+            *(
+                row[column]
+                for column in _OPERATION_CERTIFICATION_COLUMNS
+            ),
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError(
+            "project operation changed during decertification"
+        )
+    return operation
+
+
 def _project_operation_for_id(
     conn: sqlite3.Connection,
     *,
@@ -2428,28 +3596,7 @@ def _project_operation_for_id(
     if row is None:
         return None
     operation = project_operation_from_row(row)
-    inverse_rows = conn.execute(
-        """
-        SELECT approval_id, operation_id
-        FROM project_approvals
-        WHERE project_id = ? AND operation_id = ?
-        ORDER BY approval_id
-        """,
-        (project_id, operation_id),
-    ).fetchall()
-    if operation.approval_id is None:
-        if inverse_rows:
-            raise RuntimeError(
-                "malformed persisted project operation approval link"
-            )
-    elif (
-        len(inverse_rows) != 1
-        or inverse_rows[0]["approval_id"] != operation.approval_id
-        or inverse_rows[0]["operation_id"] != operation.operation_id
-    ):
-        raise RuntimeError(
-            "malformed persisted project operation approval link"
-        )
+    _operation_approval_certification_row(conn, operation)
     return operation
 
 
@@ -2509,39 +3656,24 @@ def _operation_pending_for_turn(
         is None
     ):
         return None
-    rows = conn.execute(
-        """
-        SELECT operation_id
-        FROM project_operations
-        WHERE project_id = ? AND turn_id = ?
-        ORDER BY operation_id
-        """,
-        (project_id, turn_id),
+    if conn.execute(
+        _OPERATION_TURN_UNSAFE_SQL, (project_id, turn_id)
+    ).fetchone() is not None:
+        return None
+    unresolved = conn.execute(
+        _OPERATION_TURN_UNRESOLVED_SQL,
+        (project_id, turn_id, 2),
     ).fetchall()
-    unresolved: list[ProjectOperationRecord] = []
-    for row in rows:
-        try:
-            operation = _project_operation_for_id(
-                conn,
-                project_id=project_id,
-                operation_id=row["operation_id"],
-            )
-        except (LegacyOperationUnmanagedError, RuntimeError):
-            return None
-        if operation is None:
-            return None
-        if operation.status in _OPERATION_PENDING_STATUSES:
-            unresolved.append(operation)
-        elif operation.status == "reconciled":
-            continue
-        elif (
-            operation.status == "blocked"
-            and operation.blocked_reason in _PRE_EFFECT_BLOCK_REASONS
-        ):
-            continue
-        else:
-            return None
-    return unresolved[0] if len(unresolved) == 1 else None
+    if len(unresolved) != 1:
+        return None
+    try:
+        return _project_operation_for_id(
+            conn,
+            project_id=project_id,
+            operation_id=unresolved[0]["operation_id"],
+        )
+    except (LegacyOperationUnmanagedError, RuntimeError):
+        return None
 
 
 def _turn_allows_new_unresolved_operation(
@@ -2551,35 +3683,16 @@ def _turn_allows_new_unresolved_operation(
     turn_id: str,
 ) -> bool:
     """Allow history, but reject a second or unsafe unresolved authority."""
-    rows = conn.execute(
-        """
-        SELECT operation_id
-        FROM project_operations
-        WHERE project_id = ? AND turn_id = ?
-        ORDER BY operation_id
-        """,
-        (project_id, turn_id),
-    ).fetchall()
-    for row in rows:
-        try:
-            operation = _project_operation_for_id(
-                conn,
-                project_id=project_id,
-                operation_id=row["operation_id"],
-            )
-        except (LegacyOperationUnmanagedError, RuntimeError):
-            return False
-        if operation is None:
-            return False
-        if operation.status == "reconciled":
-            continue
-        if (
-            operation.status == "blocked"
-            and operation.blocked_reason in _PRE_EFFECT_BLOCK_REASONS
-        ):
-            continue
+    unsafe = conn.execute(
+        _OPERATION_TURN_UNSAFE_SQL, (project_id, turn_id)
+    ).fetchone()
+    if unsafe is not None:
         return False
-    return True
+    unresolved = conn.execute(
+        _OPERATION_TURN_UNRESOLVED_SQL,
+        (project_id, turn_id, 1),
+    ).fetchone()
+    return unresolved is None
 
 
 def _operation_pending_candidates(
@@ -2603,13 +3716,17 @@ def _operation_pending_candidates(
             _OPERATION_PENDING_BRANCH_SQL, (status, limit)
         ).fetchall()
         for row in rows:
-            operation = _operation_pending_for_turn(
-                conn,
-                project_id=row["project_id"],
-                turn_id=row["turn_id"],
-            )
+            try:
+                operation = _project_operation_for_id(
+                    conn,
+                    project_id=row["project_id"],
+                    operation_id=row["operation_id"],
+                )
+            except (LegacyOperationUnmanagedError, RuntimeError):
+                operation = None
             if not (
                 operation is not None
+                and operation.turn_id == row["turn_id"]
                 and operation.operation_id == row["operation_id"]
                 and operation.status == status
             ):
@@ -2631,6 +3748,45 @@ def _operation_pending_candidates(
     )
 
 
+def _validated_operation_maintenance_state(
+    conn: sqlite3.Connection,
+) -> sqlite3.Row:
+    rows = conn.execute(
+        """
+        SELECT singleton, approval_scan_after, next_lane,
+               operation_validation_migration_complete,
+               approval_scan_after_seq,
+               approval_scan_high_water_seq,
+               approval_scan_epoch,
+               next_operation_approval_seq
+        FROM project_operation_maintenance
+        """
+    ).fetchall()
+    if len(rows) != 1:
+        raise RuntimeError("invalid operation maintenance state")
+    state = rows[0]
+    if not (
+        type(state["singleton"]) is int
+        and state["singleton"] == 1
+        and type(state["approval_scan_after"]) is str
+        and type(state["next_lane"]) is int
+        and state["next_lane"] in {0, 1}
+        and type(
+            state["operation_validation_migration_complete"]
+        )
+        is int
+        and state["operation_validation_migration_complete"] in {0, 1}
+        and _stored_int(state["approval_scan_after_seq"])
+        and _stored_int(state["approval_scan_high_water_seq"])
+        and _stored_int(state["approval_scan_epoch"])
+        and _stored_int(
+            state["next_operation_approval_seq"], minimum=1
+        )
+    ):
+        raise RuntimeError("invalid operation maintenance state")
+    return state
+
+
 def _select_operation_approval_maintenance(
     conn: sqlite3.Connection,
     *,
@@ -2638,54 +3794,104 @@ def _select_operation_approval_maintenance(
     limit: int,
 ) -> tuple[str, ...]:
     """Choose one durable alternating lane inside caller write scope."""
-    state = conn.execute(
-        """
-        SELECT approval_scan_after, next_lane
-        FROM project_operation_maintenance
-        WHERE singleton = 1
-        """
-    ).fetchone()
-    if state is None or not (
-        type(state["approval_scan_after"]) is str
-        and type(state["next_lane"]) is int
-        and state["next_lane"] in {0, 1}
-    ):
-        raise RuntimeError("invalid operation maintenance state")
-    scan_after = state["approval_scan_after"]
+    state = _validated_operation_maintenance_state(conn)
     lane = state["next_lane"]
+    after_sequence = state["approval_scan_after_seq"]
+    high_water = state["approval_scan_high_water_seq"]
+    epoch = state["approval_scan_epoch"]
     if lane == 0:
         rows = conn.execute(
             _APPROVAL_DUE_MAINTENANCE_SQL, (now, limit)
         ).fetchall()
-        next_scan_after = scan_after
+        next_after_sequence = after_sequence
+        next_high_water = high_water
+        next_epoch = epoch
     else:
-        rows = list(
+        if high_water == 0:
+            if after_sequence != 0:
+                raise RuntimeError(
+                    "invalid operation maintenance epoch"
+                )
+            captured = conn.execute(
+                _APPROVAL_STALE_HIGH_WATER_SQL
+            ).fetchone()
+            high_water = (
+                captured["operation_maintenance_seq"]
+                if captured is not None
+                else 0
+            )
+            after_sequence = 0
+        if not _stored_int(high_water):
+            raise RuntimeError("invalid operation maintenance epoch")
+        rows = (
             conn.execute(
                 _APPROVAL_STALE_MAINTENANCE_SQL,
-                (scan_after, limit),
+                (after_sequence, high_water, limit),
             ).fetchall()
+            if high_water > 0
+            else []
         )
-        if len(rows) < limit:
-            rows.extend(
+        last_sequence = (
+            rows[-1]["operation_maintenance_seq"]
+            if rows
+            else after_sequence
+        )
+        if not _stored_int(last_sequence):
+            raise RuntimeError("invalid operation maintenance epoch")
+        complete = len(rows) < limit
+        if not complete:
+            complete = (
                 conn.execute(
-                    _APPROVAL_STALE_MAINTENANCE_WRAP_SQL,
-                    (scan_after, limit - len(rows)),
-                ).fetchall()
+                    _APPROVAL_STALE_REMAINING_SQL,
+                    (last_sequence, high_water),
+                ).fetchone()
+                is None
             )
-        next_scan_after = (
-            rows[-1]["approval_id"] if rows else ""
-        )
+        if complete:
+            if epoch >= _SQLITE_INT_MAX:
+                raise RuntimeError(
+                    "operation maintenance epoch exhausted"
+                )
+            next_after_sequence = 0
+            next_high_water = 0
+            next_epoch = epoch + 1
+        else:
+            next_after_sequence = last_sequence
+            next_high_water = high_water
+            next_epoch = epoch
     updated = conn.execute(
         """
         UPDATE project_operation_maintenance
-        SET approval_scan_after = ?, next_lane = ?, singleton = 1
-        WHERE singleton = 1
-          AND approval_scan_after = ? AND next_lane = ?
+        SET approval_scan_after_seq = ?,
+            approval_scan_high_water_seq = ?,
+            approval_scan_epoch = ?,
+            next_lane = ?
+        WHERE singleton IS ?
+          AND approval_scan_after IS ?
+          AND next_lane IS ?
+          AND operation_validation_migration_complete IS ?
+          AND approval_scan_after_seq IS ?
+          AND approval_scan_high_water_seq IS ?
+          AND approval_scan_epoch IS ?
+          AND next_operation_approval_seq IS ?
         """,
-        (next_scan_after, 1 - lane, scan_after, lane),
+        (
+            next_after_sequence,
+            next_high_water,
+            next_epoch,
+            1 - lane,
+            state["singleton"],
+            state["approval_scan_after"],
+            state["next_lane"],
+            state["operation_validation_migration_complete"],
+            state["approval_scan_after_seq"],
+            state["approval_scan_high_water_seq"],
+            state["approval_scan_epoch"],
+            state["next_operation_approval_seq"],
+        ),
     )
     if updated.rowcount != 1:
-        raise RuntimeError("operation maintenance state changed")
+        return ()
     return tuple(row["approval_id"] for row in rows)
 
 
@@ -2775,10 +3981,11 @@ def _insert_project_operation(
             created_at, updated_at, guard_revision, canonical_action,
             batch_items_json, readback_kind, attempt_id, lease_generation,
             fencing_token, receipt_id, readback_json, blocked_reason,
-            remote_idempotency_supported, approval_fingerprint_json
+            remote_idempotency_supported, approval_fingerprint_json,
+            guard_validated
         ) VALUES (
             ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?,
-            NULL, NULL, ?, ?, ?
+            NULL, NULL, ?, ?, ?, 0
         )
         ON CONFLICT DO NOTHING
         """,
@@ -2819,16 +4026,56 @@ def _link_project_operation_approval(
     fencing_token: int,
     now: int,
 ) -> bool:
+    maintenance = _validated_operation_maintenance_state(conn)
+    operation_sequence = maintenance[
+        "next_operation_approval_seq"
+    ]
+    if operation_sequence >= _SQLITE_INT_MAX:
+        raise RuntimeError(
+            "operation approval maintenance sequence exhausted"
+        )
+    if conn.execute(
+        """
+        UPDATE project_operation_maintenance
+        SET next_operation_approval_seq = ?
+        WHERE singleton IS ?
+          AND approval_scan_after IS ?
+          AND next_lane IS ?
+          AND operation_validation_migration_complete IS ?
+          AND approval_scan_after_seq IS ?
+          AND approval_scan_high_water_seq IS ?
+          AND approval_scan_epoch IS ?
+          AND next_operation_approval_seq IS ?
+        """,
+        (
+            operation_sequence + 1,
+            maintenance["singleton"],
+            maintenance["approval_scan_after"],
+            maintenance["next_lane"],
+            maintenance[
+                "operation_validation_migration_complete"
+            ],
+            maintenance["approval_scan_after_seq"],
+            maintenance["approval_scan_high_water_seq"],
+            maintenance["approval_scan_epoch"],
+            operation_sequence,
+        ),
+    ).rowcount != 1:
+        raise RuntimeError(
+            "operation approval maintenance sequence changed"
+        )
     approval = conn.execute(
         """
         UPDATE project_approvals
-        SET operation_id = ?
+        SET operation_id = ?, operation_maintenance_seq = ?
         WHERE project_id = ? AND approval_id = ?
           AND turn_id = ? AND operation_id IS NULL
+          AND operation_maintenance_seq IS NULL
           AND status = 'pending' AND consumed_at IS NULL
         """,
         (
             operation_id,
+            operation_sequence,
             project_id,
             approval_id,
             turn_id,
@@ -2841,6 +4088,7 @@ def _link_project_operation_approval(
         UPDATE project_operations
         SET approval_id = ?, status = 'awaiting_approval', updated_at = ?
         WHERE project_id = ? AND operation_id = ? AND turn_id = ?
+          AND guard_validated = 0
           AND approval_id IS NULL AND status = 'approved'
           AND attempt_id = ? AND lease_generation = ? AND fencing_token = ?
         """,
@@ -2902,6 +4150,7 @@ def _approve_project_operation_approval(
         UPDATE project_operations
         SET status = 'approved', updated_at = ?
         WHERE project_id = ? AND operation_id = ? AND turn_id = ?
+          AND guard_validated = 0
           AND approval_id = ? AND status = 'awaiting_approval'
           AND attempt_id = ? AND lease_generation = ? AND fencing_token = ?
         """,
@@ -3026,6 +4275,7 @@ def _finalize_project_operation_approval_policy(
         UPDATE project_operations
         SET status = 'blocked', blocked_reason = ?, updated_at = ?
         WHERE project_id = ? AND operation_id = ? AND turn_id = ?
+          AND guard_validated = 0
           AND approval_id = ? AND status = 'awaiting_approval'
           AND attempt_id = ? AND lease_generation = ? AND fencing_token = ?
         """,
@@ -3223,6 +4473,7 @@ def _rehydrate_project_operation_claim(
         SET attempt_id = ?, lease_generation = ?, fencing_token = ?,
             readback_json = NULL, updated_at = ?
         WHERE project_id = ? AND operation_id = ? AND turn_id = ?
+          AND guard_validated = 0
           AND status = 'approved'
           AND attempt_id = ? AND lease_generation = ? AND fencing_token = ?
         """,
@@ -3288,6 +4539,7 @@ def _mark_project_operation_started(
         UPDATE project_operations
         SET status = 'effect_started', updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND operation_id = ?
+          AND guard_validated = 0
           AND status = 'approved'
           AND attempt_id = ? AND lease_generation = ? AND fencing_token = ?
         """,
@@ -3323,6 +4575,7 @@ def _record_project_operation_receipt(
         SET status = 'receipt_recorded', receipt_id = ?,
             receipt_json = ?, updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND operation_id = ?
+          AND guard_validated = 0
           AND status = 'effect_started'
           AND receipt_id IS NULL AND receipt_json IS NULL
           AND attempt_id = ? AND lease_generation = ? AND fencing_token = ?
@@ -3378,6 +4631,7 @@ def _park_project_operation_unknown(
         SET status = 'unknown', readback_json = NULL,
             blocked_reason = NULL, updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND operation_id = ?
+          AND guard_validated = 0
           AND status = ?
           AND attempt_id = ? AND lease_generation = ? AND fencing_token = ?
         """,
@@ -3417,6 +4671,7 @@ def _finalize_project_operation_readback(
         SET status = ?, receipt_id = ?, receipt_json = ?,
             readback_json = ?, blocked_reason = ?, updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND operation_id = ?
+          AND guard_validated = 0
           AND status = 'unknown'
           AND attempt_id = ? AND lease_generation = ? AND fencing_token = ?
         """,
@@ -4961,6 +6216,7 @@ def _link_approval_to_claimed_turn(
         """
         UPDATE project_approvals SET turn_id = ?
         WHERE approval_id = ? AND project_id = ? AND turn_id IS NULL
+          AND operation_id IS NULL
         """,
         (turn_id, approval_id, project_id),
     ).rowcount != 1:
@@ -5691,7 +6947,10 @@ def _create_approval_request(
         except sqlite3.IntegrityError as exc:
             raise ApprovalConflictError("approval persistence conflict") from exc
         row = conn.execute(
-            "SELECT * FROM project_approvals WHERE approval_id = ?",
+            """
+            SELECT * FROM project_approvals
+            WHERE approval_id = ? AND operation_id IS NULL
+            """,
             (request.approval_id,),
         ).fetchone()
         if row is None or not _row_matches_immutable_request(
@@ -5735,7 +6994,8 @@ def _expire_approvals(conn: sqlite3.Connection, now: int) -> None:
         """
         UPDATE project_approvals
         SET status = 'expired'
-        WHERE expires_at <= ?
+        WHERE operation_id IS NULL
+          AND expires_at <= ?
           AND consumed_at IS NULL
           AND status IN ('pending', 'approved')
         """,
@@ -5777,6 +7037,7 @@ def resolve_approval(
             UPDATE project_approvals AS approval
             SET status = ?, resolved_at = ?, resolved_by_actor_id = ?
             WHERE approval_id = ?
+              AND approval.operation_id IS NULL
               AND actor_id = ?
               AND authorization_actor_id = ?
               AND canonical_action IS NOT NULL
@@ -5819,7 +7080,10 @@ def resolve_approval(
         if cursor.rowcount != 1:
             return None
         row = conn.execute(
-            "SELECT * FROM project_approvals WHERE approval_id = ?",
+            """
+            SELECT * FROM project_approvals
+            WHERE approval_id = ? AND operation_id IS NULL
+            """,
             (approval_id,),
         ).fetchone()
     assert row is not None
@@ -5942,6 +7206,7 @@ def consume_approval_authorization(
             UPDATE project_approvals AS approval
             SET consumed_at = ?
             WHERE approval_id = ?
+              AND approval.operation_id IS NULL
               AND project_id = ?
               AND authorization_actor_id = ?
               AND canonical_action = ?

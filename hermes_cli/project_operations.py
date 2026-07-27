@@ -347,6 +347,9 @@ class ProjectOperationGuard:
         approval: object,
         intent: OperationIntent,
     ) -> tuple[Decision, OperationApprovalSpec | None]:
+        expected_class = approval_class_for_action(
+            intent.canonical_action
+        )
         if (
             type(policy) is not PolicyDecision
             or type(policy.decision) is not Decision
@@ -362,19 +365,23 @@ class ProjectOperationGuard:
                 intent=intent,
             )
         if policy.decision is Decision.ALLOW:
+            if expected_class is not None:
+                raise ProjectOperationGuard._error(
+                    OperationErrorCode.OPERATION_POLICY_DENIED,
+                    intent=intent,
+                )
             if approval is not None or policy.approval_class is not None:
                 raise ValueError("allow cannot carry approval")
             return policy.decision, None
         if not (
-            type(approval) is OperationApprovalSpec
+            expected_class is not None
+            and type(approval) is OperationApprovalSpec
             and type(policy.approval_class) is str
-            and policy.approval_class
+            and policy.approval_class == expected_class
             and type(approval.approval_id) is str
             and approval.approval_id
             and type(approval.approval_class) is str
             and approval.approval_class == policy.approval_class
-            and approval.approval_class
-            == approval_class_for_action(intent.canonical_action)
             and type(approval.expires_at) is int
             and approval.expires_at >= 0
             and type(approval.authorization) is ActorContext
@@ -567,44 +574,6 @@ class ProjectOperationGuard:
                     intent if type(intent) is OperationIntent else None
                 ),
             ) from exc
-        capability_supported = (
-            intent.remote_idempotency_supported
-            and intent.readback_kind is not None
-        )
-        replay_fingerprint: str | None = None
-        if (
-            type(policy) is PolicyDecision
-            and policy.decision is Decision.REQUIRE_APPROVAL
-        ):
-            try:
-                replay_fingerprint = (
-                    self._approval_fingerprint_storage(approval)
-                )
-            except ValueError:
-                replay_fingerprint = None
-        replay_approval_id = (
-            approval.approval_id
-            if (
-                capability_supported
-                and replay_fingerprint is not None
-                and type(approval) is OperationApprovalSpec
-            )
-            else None
-        )
-        existing = self._existing_operation(
-            claim=claim,
-            intent=intent,
-            targets_json=targets_json,
-            batch_items_json=batch_items_json,
-            payload_json=payload_json,
-            approval_id=replay_approval_id,
-            approval_fingerprint_json=replay_fingerprint,
-            remote_idempotency_supported=(
-                intent.remote_idempotency_supported
-            ),
-        )
-        if existing is not None:
-            return self._public_operation(existing)
         try:
             decision, approval_spec = self._validate_policy(
                 policy, approval, intent
@@ -621,12 +590,30 @@ class ProjectOperationGuard:
                 OperationErrorCode.INVALID_OPERATION_ARGUMENT,
                 intent=intent,
             ) from exc
+        capability_supported = (
+            intent.remote_idempotency_supported
+            and intent.readback_kind is not None
+        )
         approval_id = (
             approval_spec.approval_id
             if decision is Decision.REQUIRE_APPROVAL
             and capability_supported
             else None
         )
+        existing = self._existing_operation(
+            claim=claim,
+            intent=intent,
+            targets_json=targets_json,
+            batch_items_json=batch_items_json,
+            payload_json=payload_json,
+            approval_id=approval_id,
+            approval_fingerprint_json=approval_fingerprint_json,
+            remote_idempotency_supported=(
+                intent.remote_idempotency_supported
+            ),
+        )
+        if existing is not None:
+            return self._public_operation(existing)
 
         now = self._runtime._now()
         with runtime_db.write_transaction(self._conn):
@@ -789,13 +776,16 @@ class ProjectOperationGuard:
                 },
                 now,
             )
-            stored = runtime_db._project_operation_for_id(
-                self._conn,
-                project_id=intent.project_id,
-                operation_id=intent.operation_id,
-            )
-            if stored is None:
-                raise RuntimeError("operation insert disappeared")
+            try:
+                stored = runtime_db._certify_project_operation(
+                    self._conn,
+                    project_id=intent.project_id,
+                    operation_id=intent.operation_id,
+                )
+            except Exception as exc:
+                raise self._operation_state_conflict(
+                    claim, intent.operation_id, updated_state.version
+                ) from exc
             return self._public_operation(stored)
 
     def resolve_operation_approval(
@@ -842,6 +832,38 @@ class ProjectOperationGuard:
                 )
             ),
         )
+
+    def _decertify_for_approval(
+        self,
+        *,
+        row: sqlite3.Row,
+        operation: runtime_db.ProjectOperationRecord,
+    ) -> None:
+        try:
+            runtime_db._decertify_project_operation(
+                self._conn, operation
+            )
+        except Exception as exc:
+            raise self._approval_conflict(
+                row=row, operation=operation
+            ) from exc
+
+    def _certify_for_approval(
+        self,
+        *,
+        row: sqlite3.Row,
+        operation: runtime_db.ProjectOperationRecord,
+    ) -> runtime_db.ProjectOperationRecord:
+        try:
+            return runtime_db._certify_project_operation(
+                self._conn,
+                project_id=operation.project_id,
+                operation_id=operation.operation_id,
+            )
+        except Exception as exc:
+            raise self._approval_conflict(
+                row=row, operation=operation
+            ) from exc
 
     def _resolver_matches(
         self,
@@ -1103,13 +1125,10 @@ class ProjectOperationGuard:
             },
             now,
         )
-        stored = runtime_db._project_operation_for_id(
-            self._conn,
-            project_id=operation.project_id,
-            operation_id=operation.operation_id,
+        stored = self._certify_for_approval(
+            row=row,
+            operation=operation,
         )
-        if stored is None:
-            raise RuntimeError("finalized operation disappeared")
         return self._public_operation(stored)
 
     def _resolve_operation_approval(
@@ -1165,6 +1184,9 @@ class ProjectOperationGuard:
                 stale,
             ) = self._pending_approval_context(row, operation)
             if now >= row["expires_at"]:
+                self._decertify_for_approval(
+                    row=row, operation=operation
+                )
                 return self._finalize_approval_policy(
                     row=row,
                     operation=operation,
@@ -1179,6 +1201,9 @@ class ProjectOperationGuard:
                     now=now,
                 )
             if stale:
+                self._decertify_for_approval(
+                    row=row, operation=operation
+                )
                 return self._finalize_approval_policy(
                     row=row,
                     operation=operation,
@@ -1201,6 +1226,9 @@ class ProjectOperationGuard:
                     row=row, operation=operation
                 )
             if outcome == "denied":
+                self._decertify_for_approval(
+                    row=row, operation=operation
+                )
                 return self._finalize_approval_policy(
                     row=row,
                     operation=operation,
@@ -1214,6 +1242,9 @@ class ProjectOperationGuard:
                     event_reason="denied",
                     now=now,
                 )
+            self._decertify_for_approval(
+                row=row, operation=operation
+            )
             released = runtime_db._approve_project_operation_approval(
                 self._conn,
                 approval_id=row["approval_id"],
@@ -1270,13 +1301,10 @@ class ProjectOperationGuard:
                     },
                     now,
                 )
-            stored = runtime_db._project_operation_for_id(
-                self._conn,
-                project_id=operation.project_id,
-                operation_id=operation.operation_id,
+            stored = self._certify_for_approval(
+                row=row,
+                operation=operation,
             )
-            if stored is None:
-                raise RuntimeError("approved operation disappeared")
             return self._public_operation(stored)
 
     def expire_due_operation_approvals(
@@ -1523,34 +1551,46 @@ class ProjectOperationGuard:
             generation = turn.lease_generation + 1
             fence = turn.fencing_token + 1
             expires_at = now + lease_seconds
-            stored_turn, stored_lease = (
-                runtime_db._rehydrate_project_operation_claim(
-                    self._conn,
-                    project_id=project_id,
-                    operation_id=operation_id,
-                    turn_id=operation.turn_id,
-                    source_turn_status=turn.status,
-                    old_attempt_id=turn.attempt_id,
-                    old_lease_generation=turn.lease_generation,
-                    old_fencing_token=turn.fencing_token,
-                    old_control_version=control.control_version,
-                    old_worker_id=control.claim_worker_id,
-                    old_lease_expires_at=(
-                        control.claim_lease_expires_at
-                    ),
-                    old_canonical_session_id=(
-                        control.claim_canonical_session_id
-                    ),
-                    old_lease_present=lease is not None,
-                    new_attempt_id=new_attempt_id,
-                    new_worker_id=worker_id,
-                    new_lease_generation=generation,
-                    new_fencing_token=fence,
-                    new_lease_expires_at=expires_at,
-                    canonical_session_id=state.conversation_tip_id,
-                    now=now,
+            try:
+                runtime_db._decertify_project_operation(
+                    self._conn, operation
                 )
-            )
+                stored_turn, stored_lease = (
+                    runtime_db._rehydrate_project_operation_claim(
+                        self._conn,
+                        project_id=project_id,
+                        operation_id=operation_id,
+                        turn_id=operation.turn_id,
+                        source_turn_status=turn.status,
+                        old_attempt_id=turn.attempt_id,
+                        old_lease_generation=turn.lease_generation,
+                        old_fencing_token=turn.fencing_token,
+                        old_control_version=control.control_version,
+                        old_worker_id=control.claim_worker_id,
+                        old_lease_expires_at=(
+                            control.claim_lease_expires_at
+                        ),
+                        old_canonical_session_id=(
+                            control.claim_canonical_session_id
+                        ),
+                        old_lease_present=lease is not None,
+                        new_attempt_id=new_attempt_id,
+                        new_worker_id=worker_id,
+                        new_lease_generation=generation,
+                        new_fencing_token=fence,
+                        new_lease_expires_at=expires_at,
+                        canonical_session_id=state.conversation_tip_id,
+                        now=now,
+                    )
+                )
+            except Exception as exc:
+                raise ProjectOperationError(
+                    OperationErrorCode.OPERATION_STATE_CONFLICT,
+                    project_id=project_id,
+                    turn_id=operation.turn_id,
+                    operation_id=operation_id,
+                    current_version=state.version,
+                ) from exc
             updated = self._runtime._advance_state(state, now)
             self._runtime._event(
                 project_id,
@@ -1580,6 +1620,20 @@ class ProjectOperationGuard:
                 },
                 now,
             )
+            try:
+                runtime_db._certify_project_operation(
+                    self._conn,
+                    project_id=project_id,
+                    operation_id=operation_id,
+                )
+            except Exception as exc:
+                raise ProjectOperationError(
+                    OperationErrorCode.OPERATION_STATE_CONFLICT,
+                    project_id=project_id,
+                    turn_id=operation.turn_id,
+                    operation_id=operation_id,
+                    current_version=updated.version,
+                ) from exc
             return TurnClaim(
                 turn_id=operation.turn_id,
                 project_id=project_id,
@@ -1721,6 +1775,38 @@ class ProjectOperationGuard:
             operation_id=operation_id,
             current_version=current_version,
         )
+
+    def _decertify_for_claim(
+        self,
+        operation: runtime_db.ProjectOperationRecord,
+        claim: TurnClaim,
+        current_version: int,
+    ) -> None:
+        try:
+            runtime_db._decertify_project_operation(
+                self._conn, operation
+            )
+        except Exception as exc:
+            raise self._operation_state_conflict(
+                claim, operation.operation_id, current_version
+            ) from exc
+
+    def _certify_for_claim(
+        self,
+        claim: TurnClaim,
+        operation_id: str,
+        current_version: int,
+    ) -> runtime_db.ProjectOperationRecord:
+        try:
+            return runtime_db._certify_project_operation(
+                self._conn,
+                project_id=claim.project_id,
+                operation_id=operation_id,
+            )
+        except Exception as exc:
+            raise self._operation_state_conflict(
+                claim, operation_id, current_version
+            ) from exc
 
     @staticmethod
     def _operation_receipt_conflict(
@@ -2073,6 +2159,9 @@ class ProjectOperationGuard:
                 raise self._operation_state_conflict(
                     claim, operation_id, state.version
                 )
+            self._decertify_for_claim(
+                operation, claim, state.version
+            )
             if not runtime_db._mark_project_operation_started(
                 self._conn,
                 project_id=claim.project_id,
@@ -2096,9 +2185,10 @@ class ProjectOperationGuard:
                 ),
                 now,
             )
-            return self._stored_public_operation(
-                claim.project_id, operation_id
+            stored = self._certify_for_claim(
+                claim, operation_id, updated.version
             )
+            return self._public_operation(stored)
 
     def record_receipt(
         self,
@@ -2143,6 +2233,9 @@ class ProjectOperationGuard:
                 raise self._operation_receipt_conflict(
                     claim, operation_id, state.version
                 )
+            self._decertify_for_claim(
+                operation, claim, state.version
+            )
             try:
                 recorded = runtime_db._record_project_operation_receipt(
                     self._conn,
@@ -2176,9 +2269,10 @@ class ProjectOperationGuard:
                 ),
                 now,
             )
-            return self._stored_public_operation(
-                claim.project_id, operation_id
+            stored = self._certify_for_claim(
+                claim, operation_id, updated.version
             )
+            return self._public_operation(stored)
 
     def reconcile(
         self,
@@ -2223,6 +2317,9 @@ class ProjectOperationGuard:
             if operation.receipt_id is not None:
                 parked_receipt = self._receipt_from_record(operation)
             if operation.status != "unknown":
+                self._decertify_for_claim(
+                    operation, claim, state.version
+                )
                 if not runtime_db._park_project_operation_unknown(
                     self._conn,
                     project_id=claim.project_id,
@@ -2246,6 +2343,9 @@ class ProjectOperationGuard:
                         claim, operation_id, updated.version
                     ),
                     now,
+                )
+                self._certify_for_claim(
+                    claim, operation_id, updated.version
                 )
             request = self._readback_request(
                 operation, parked_receipt
@@ -2315,6 +2415,9 @@ class ProjectOperationGuard:
                     readback_json = None
                     blocked_reason = "operation_readback_ambiguous"
                     event_kind = "operation.blocked"
+            self._decertify_for_claim(
+                current, claim, state.version
+            )
             try:
                 finalized = (
                     runtime_db._finalize_project_operation_readback(
@@ -2404,9 +2507,10 @@ class ProjectOperationGuard:
                 payload,
                 phase_c_now,
             )
-            return self._stored_public_operation(
-                claim.project_id, operation_id
+            stored = self._certify_for_claim(
+                claim, operation_id, updated.version
             )
+            return self._public_operation(stored)
 
     def block_unknown(
         self,
@@ -2433,6 +2537,9 @@ class ProjectOperationGuard:
             reason = "operation_readback_ambiguous"
             receipt_id = operation.receipt_id
             receipt_json = operation.receipt_json
+            self._decertify_for_claim(
+                operation, claim, state.version
+            )
             if not runtime_db._finalize_project_operation_readback(
                 self._conn,
                 project_id=claim.project_id,
@@ -2463,9 +2570,10 @@ class ProjectOperationGuard:
                 payload,
                 now,
             )
-            return self._stored_public_operation(
-                claim.project_id, operation_id
+            stored = self._certify_for_claim(
+                claim, operation_id, updated.version
             )
+            return self._public_operation(stored)
 
     def disposition_for_turn(
         self,

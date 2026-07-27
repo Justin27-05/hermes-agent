@@ -1774,7 +1774,10 @@ class ProjectRuntime:
                     turn_id=turn_id,
                 )
             existing = self._conn.execute(
-                "SELECT * FROM project_approvals WHERE approval_id = ?",
+                """
+                SELECT * FROM project_approvals
+                WHERE approval_id = ? AND operation_id IS NULL
+                """,
                 (request.approval_id,),
             ).fetchone()
             if existing is not None:
@@ -1793,6 +1796,20 @@ class ProjectRuntime:
                     and existing["turn_id"] == turn_id
                 ):
                     return TurnApproval(turn_id=turn_id, approval=stored)
+                raise ProjectRuntimeError(
+                    RuntimeErrorCode.APPROVAL_CONFLICT,
+                    project_id=project_id,
+                    turn_id=turn_id,
+                )
+            linked_collision = self._conn.execute(
+                """
+                SELECT 1 FROM project_approvals
+                WHERE approval_id = ? AND operation_id IS NOT NULL
+                LIMIT 1
+                """,
+                (request.approval_id,),
+            ).fetchone()
+            if linked_collision is not None:
                 raise ProjectRuntimeError(
                     RuntimeErrorCode.APPROVAL_CONFLICT,
                     project_id=project_id,

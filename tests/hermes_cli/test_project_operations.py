@@ -2042,6 +2042,222 @@ def test_linked_approval_id_never_replays_through_generic_apis(
     assert _linked_authority_snapshot(operation_env) == linked_before
 
 
+def test_generic_consume_cannot_consume_linked_approved_authority(
+    operation_env,
+):
+    _prepare_critical(operation_env)
+    operation_env["guard"].resolve_operation_approval(
+        "approval-1",
+        operation_env["actor"],
+        outcome="approved",
+    )
+    row = operation_env["conn"].execute(
+        """
+        SELECT * FROM project_approvals
+        WHERE approval_id = 'approval-1'
+        """
+    ).fetchone()
+    request = prdb._approval_from_row(row)
+    before = _transition_authority_snapshot(operation_env)
+
+    assert not prdb.consume_approval_authorization(
+        operation_env["conn"],
+        **_generic_authorization_args(request, now=101),
+    )
+    assert _transition_authority_snapshot(operation_env) == before
+
+
+def test_private_linker_refuses_linked_approval_on_valid_claimed_turn(
+    operation_env_not_started,
+):
+    _prepare_critical(operation_env_not_started)
+    claim = operation_env_not_started["claim"]
+    operation_env_not_started["conn"].execute(
+        """
+        UPDATE project_turns SET status = 'claimed'
+        WHERE project_id = ? AND turn_id = ?
+        """,
+        (
+            operation_env_not_started["project_id"],
+            operation_env_not_started["turn"].turn_id,
+        ),
+    )
+    operation_env_not_started["conn"].commit()
+    turn = prdb._runtime_turn_for_project(
+        operation_env_not_started["conn"],
+        project_id=operation_env_not_started["project_id"],
+        turn_id=operation_env_not_started["turn"].turn_id,
+    )
+    assert turn is not None
+    assert turn.status == "claimed"
+    before = _transition_authority_snapshot(
+        operation_env_not_started
+    )
+
+    assert not prdb._link_approval_to_claimed_turn(
+        operation_env_not_started["conn"],
+        approval_id="approval-1",
+        project_id=operation_env_not_started["project_id"],
+        turn_id=turn.turn_id,
+        expected_attempt_id=claim.attempt_id,
+        expected_lease_generation=claim.lease_generation,
+        expected_fencing_token=claim.fencing_token,
+        now=101,
+    )
+    assert (
+        _transition_authority_snapshot(operation_env_not_started)
+        == before
+    )
+
+
+def _secondary_claimed_turn(operation_env):
+    conn = operation_env["conn"]
+    project_id = projects_db.create_project(
+        conn,
+        name="Secondary claimed project",
+        folders=("C:/work/secondary-claimed",),
+    )
+    prdb.create_project_conversation(
+        conn,
+        project_id=project_id,
+        conversation_id="secondary-session",
+        current_phase="implementation",
+        now=1,
+    )
+    prdb.bind_surface(
+        conn,
+        binding_id="secondary-owner",
+        project_id=project_id,
+        surface="desktop",
+        external_binding_id="secondary-window",
+        actor_id="owner-1",
+        now=1,
+    )
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    runtime = runtime_module.ProjectRuntime(
+        conn, clock=lambda: operation_env["now"][0]
+    )
+    actor = ActorContext(
+        "owner-1", "desktop", "secondary-owner", True
+    )
+    turn = runtime.enqueue_turn(
+        project_id,
+        {"message": "secondary approval"},
+        actor,
+        idempotency_key="secondary-turn",
+        expected_version=0,
+    )
+    claim = runtime.claim_next_turn(
+        project_id, "secondary-worker", lease_seconds=30
+    )
+    assert claim is not None
+    return runtime, actor, turn, claim
+
+
+def _claimed_project_snapshot(conn, project_id, turn_id):
+    return (
+        prdb.runtime_state_for_project(conn, project_id),
+        prdb._runtime_turn_for_project(
+            conn, project_id=project_id, turn_id=turn_id
+        ),
+        prdb._runtime_control_for_turn(
+            conn, project_id=project_id, turn_id=turn_id
+        ),
+        prdb._current_worker_lease_for_turn(
+            conn, project_id=project_id, turn_id=turn_id
+        ),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_events
+                WHERE project_id = ? ORDER BY sequence
+                """,
+                (project_id,),
+            )
+        ),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_approvals
+                WHERE project_id = ? ORDER BY approval_id
+                """,
+                (project_id,),
+            )
+        ),
+    )
+
+
+def test_linked_id_conflict_precedes_separate_valid_claimed_turn(
+    operation_env,
+    monkeypatch,
+):
+    _prepare_critical(operation_env)
+    conn = operation_env["conn"]
+    linked_row = conn.execute(
+        """
+        SELECT * FROM project_approvals
+        WHERE approval_id = 'approval-1'
+        """
+    ).fetchone()
+    linked_request = prdb._approval_from_row(linked_row)
+    runtime, actor, turn, claim = _secondary_claimed_turn(
+        operation_env
+    )
+    state = prdb.runtime_state_for_project(conn, claim.project_id)
+    assert state is not None
+    request = replace(
+        linked_request,
+        project_id=claim.project_id,
+        expected_runtime_version=state.version,
+        expected_lifecycle=state.lifecycle,
+        expected_phase=state.current_phase,
+    )
+    linked_before = _linked_authority_snapshot(operation_env)
+    secondary_before = _claimed_project_snapshot(
+        conn, claim.project_id, turn.turn_id
+    )
+    original_mapper = prdb._approval_from_row
+
+    def reject_linked_mapping(row):
+        if row["operation_id"] is not None:
+            raise AssertionError(
+                "generic request replay mapped a linked approval"
+            )
+        return original_mapper(row)
+
+    monkeypatch.setattr(
+        prdb, "_approval_from_row", reject_linked_mapping
+    )
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    with pytest.raises(
+        runtime_module.ProjectRuntimeError
+    ) as conflict:
+        runtime.request_turn_approval(
+            turn.turn_id,
+            request,
+            actor,
+            expected_control_version=1,
+        )
+
+    assert (
+        conflict.value.code
+        is runtime_module.RuntimeErrorCode.APPROVAL_CONFLICT
+    )
+    assert _linked_authority_snapshot(operation_env) == linked_before
+    assert (
+        _claimed_project_snapshot(
+            conn, claim.project_id, turn.turn_id
+        )
+        == secondary_before
+    )
+
+
 def _assert_policy_failure(
     operation_env,
     *,
@@ -2702,6 +2918,370 @@ def _finish_operation_probe(process, *, timeout=15):
     except BaseException as exc:
         _OPERATION_PROBES.cleanup(exc)
         raise
+
+
+def _run_operation_probe_race(operation_env, specifications):
+    processes = []
+    try:
+        for specification in specifications:
+            processes.append(
+                _start_operation_probe(
+                    operation_env,
+                    mode=specification["mode"],
+                    now=specification["now"],
+                    outcome=specification.get(
+                        "outcome", "approved"
+                    ),
+                    binding_id=specification.get(
+                        "binding_id", "desktop-owner"
+                    ),
+                )
+            )
+        for process in processes:
+            _release_operation_probe(process)
+        return tuple(
+            _finish_operation_probe(process)
+            for process in processes
+        )
+    except BaseException as exc:
+        _OPERATION_PROBES.cleanup(exc)
+        raise
+
+
+@pytest.mark.parametrize("_iteration", range(25))
+@pytest.mark.parametrize(
+    ("race_case", "generic_mode", "linked_mode", "now"),
+    (
+        ("due", "generic_expire", "expire", 105),
+        ("stale", "generic_resolve", "resolve", 101),
+        ("owner", "generic_consume", "resolve", 101),
+    ),
+)
+def test_fresh_generic_helpers_cannot_cross_linked_finalization(
+    operation_env,
+    race_case,
+    generic_mode,
+    linked_mode,
+    now,
+    _iteration,
+):
+    _prepare_critical(
+        operation_env,
+        expires_at=105 if race_case == "due" else 1_000,
+    )
+    conn = operation_env["conn"]
+    if race_case == "stale":
+        conn.execute(
+            """
+            UPDATE project_runtime_state SET version = version + 1
+            WHERE project_id = ?
+            """,
+            (operation_env["project_id"],),
+        )
+        conn.commit()
+    before_version = prdb.runtime_state_for_project(
+        conn, operation_env["project_id"]
+    ).version
+    before_events = conn.execute(
+        """
+        SELECT COUNT(*) FROM project_events WHERE project_id = ?
+        """,
+        (operation_env["project_id"],),
+    ).fetchone()[0]
+
+    generic_result, linked_result = _run_operation_probe_race(
+        operation_env,
+        (
+            {"mode": generic_mode, "now": now},
+            {
+                "mode": linked_mode,
+                "now": now,
+                "binding_id": (
+                    "missing-binding"
+                    if race_case == "stale"
+                    else "desktop-owner"
+                ),
+            },
+        ),
+    )
+
+    if generic_mode == "generic_expire":
+        assert generic_result == {"generic_completed": True}
+    elif generic_mode == "generic_resolve":
+        assert generic_result == {"generic_resolved": False}
+    else:
+        assert generic_result == {"generic_consumed": False}
+    assert linked_result["operation_status"] in {
+        "approved",
+        "blocked",
+    }
+    approval = conn.execute(
+        """
+        SELECT status, consumed_at, operation_id
+        FROM project_approvals WHERE approval_id = 'approval-1'
+        """
+    ).fetchone()
+    operation = conn.execute(
+        """
+        SELECT status, blocked_reason, guard_validated
+        FROM project_operations WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()
+    if race_case == "owner":
+        assert tuple(approval) == (
+            "approved",
+            now,
+            "operation-1",
+        )
+        assert tuple(operation) == ("approved", None, 1)
+    else:
+        assert tuple(approval) == (
+            "expired",
+            None,
+            "operation-1",
+        )
+        assert tuple(operation) == (
+            "blocked",
+            (
+                "approval_time_expired"
+                if race_case == "due"
+                else "approval_stale_boundary"
+            ),
+            1,
+        )
+    assert prdb.runtime_state_for_project(
+        conn, operation_env["project_id"]
+    ).version == before_version + 1
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM project_events WHERE project_id = ?
+        """,
+        (operation_env["project_id"],),
+    ).fetchone()[0] == before_events + 3
+
+
+@pytest.mark.parametrize("_iteration", range(5))
+def test_two_fresh_generic_creators_share_one_unlinked_request(
+    operation_env,
+    _iteration,
+):
+    conn = operation_env["conn"]
+    project_id = operation_env["project_id"]
+    before_state = prdb.runtime_state_for_project(conn, project_id)
+    before_turn = prdb._runtime_turn_for_project(
+        conn,
+        project_id=project_id,
+        turn_id=operation_env["turn"].turn_id,
+    )
+    before_control = prdb._runtime_control_for_turn(
+        conn,
+        project_id=project_id,
+        turn_id=operation_env["turn"].turn_id,
+    )
+    before_lease = prdb._current_worker_lease_for_turn(
+        conn,
+        project_id=project_id,
+        turn_id=operation_env["turn"].turn_id,
+    )
+    before_events = conn.execute(
+        """
+        SELECT COUNT(*) FROM project_events WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()[0]
+
+    results = _run_operation_probe_race(
+        operation_env,
+        (
+            {
+                "mode": "generic_create",
+                "now": 100,
+                "outcome": "generic-race",
+            },
+            {
+                "mode": "generic_create",
+                "now": 100,
+                "outcome": "generic-race",
+            },
+        ),
+    )
+
+    assert results == (
+        {"approval_id": "generic-race"},
+        {"approval_id": "generic-race"},
+    )
+    assert tuple(
+        conn.execute(
+            """
+            SELECT approval_id, operation_id, turn_id, status
+            FROM project_approvals
+            WHERE approval_id = 'generic-race'
+            """
+        ).fetchone()
+    ) == ("generic-race", None, None, "pending")
+    assert prdb.runtime_state_for_project(conn, project_id) == before_state
+    assert prdb._runtime_turn_for_project(
+        conn,
+        project_id=project_id,
+        turn_id=operation_env["turn"].turn_id,
+    ) == before_turn
+    assert prdb._runtime_control_for_turn(
+        conn,
+        project_id=project_id,
+        turn_id=operation_env["turn"].turn_id,
+    ) == before_control
+    assert prdb._current_worker_lease_for_turn(
+        conn,
+        project_id=project_id,
+        turn_id=operation_env["turn"].turn_id,
+    ) == before_lease
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM project_events WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()[0] == before_events
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM project_operations WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("_iteration", range(5))
+@pytest.mark.parametrize(
+    "generic_mode", ("generic_create", "request_turn")
+)
+def test_fresh_generic_create_or_request_races_guard_staging_safely(
+    operation_env,
+    generic_mode,
+    _iteration,
+):
+    conn = operation_env["conn"]
+    project_id = operation_env["project_id"]
+    turn_id = operation_env["turn"].turn_id
+    before_version = prdb.runtime_state_for_project(
+        conn, project_id
+    ).version
+    before_turn = prdb._runtime_turn_for_project(
+        conn, project_id=project_id, turn_id=turn_id
+    )
+    before_control = prdb._runtime_control_for_turn(
+        conn, project_id=project_id, turn_id=turn_id
+    )
+    before_lease = prdb._current_worker_lease_for_turn(
+        conn, project_id=project_id, turn_id=turn_id
+    )
+    assert before_turn is not None
+    assert before_control is not None
+    assert before_lease is not None
+    before_events = conn.execute(
+        """
+        SELECT COUNT(*) FROM project_events WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()[0]
+    generic_specification = {
+        "mode": generic_mode,
+        "now": 100,
+    }
+    if generic_mode == "generic_create":
+        generic_specification["outcome"] = "approval-1"
+
+    generic_result, guard_result = _run_operation_probe_race(
+        operation_env,
+        (
+            generic_specification,
+            {"mode": "stage_critical", "now": 100},
+        ),
+    )
+
+    approval = conn.execute(
+        """
+        SELECT approval_id, project_id, turn_id, operation_id,
+               operation_maintenance_seq
+        FROM project_approvals WHERE approval_id = 'approval-1'
+        """
+    ).fetchone()
+    assert approval is not None
+    operation = conn.execute(
+        """
+        SELECT approval_id, status, guard_validated
+        FROM project_operations WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()
+    successes = sum(
+        "error_code" not in result
+        for result in (generic_result, guard_result)
+    )
+    assert successes == 1
+    if operation is not None:
+        assert tuple(operation) == (
+            "approval-1",
+            "awaiting_approval",
+            1,
+        )
+        assert tuple(approval)[2:] == (
+            turn_id,
+            "operation-1",
+            approval["operation_maintenance_seq"],
+        )
+        assert (
+            type(approval["operation_maintenance_seq"]) is int
+            and approval["operation_maintenance_seq"] > 0
+        )
+        expected_event_delta = 2
+        expected_version_delta = 1
+        assert generic_result == {"error_code": "approval_conflict"}
+        assert guard_result == {
+            "operation_status": "awaiting_approval"
+        }
+    else:
+        assert approval["operation_id"] is None
+        assert approval["operation_maintenance_seq"] is None
+        if generic_mode == "generic_create":
+            assert approval["turn_id"] is None
+            expected_event_delta = 0
+            expected_version_delta = 0
+        else:
+            assert approval["turn_id"] == turn_id
+            expected_event_delta = 1
+            expected_version_delta = 1
+        assert generic_result == {"approval_id": "approval-1"}
+        if generic_mode == "generic_create":
+            assert guard_result["error_code"] in {
+                "operation_approval_conflict",
+                "operation_state_conflict",
+            }
+        else:
+            assert guard_result == {
+                "error_code": "stale_turn_claim"
+            }
+    assert prdb.runtime_state_for_project(
+        conn, project_id
+    ).version == before_version + expected_version_delta
+    final_turn = prdb._runtime_turn_for_project(
+        conn, project_id=project_id, turn_id=turn_id
+    )
+    if operation is None and generic_mode == "generic_create":
+        assert final_turn == before_turn
+    else:
+        assert final_turn == replace(
+            before_turn, status="awaiting_approval"
+        )
+    assert prdb._runtime_control_for_turn(
+        conn, project_id=project_id, turn_id=turn_id
+    ) == before_control
+    assert prdb._current_worker_lease_for_turn(
+        conn, project_id=project_id, turn_id=turn_id
+    ) == before_lease
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM project_events WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()[0] == before_events + expected_event_delta
 
 
 @pytest.fixture
@@ -3656,7 +4236,9 @@ def _transition_authority_snapshot(operation_env):
         ("block", 1),
         ("rehydrate", 1),
         ("approve", 1),
+        ("deny", 1),
         ("expire", 1),
+        ("stale", 1),
     ),
 )
 @pytest.mark.parametrize("fault_stage", ("decertify", "certify"))
@@ -3699,7 +4281,13 @@ def test_operation_transition_certification_fault_rolls_back_everything(
                 "operation-1",
                 CrashReadback(),
             )
-    if action in {"rehydrate", "approve", "expire"}:
+    if action in {
+        "rehydrate",
+        "approve",
+        "deny",
+        "expire",
+        "stale",
+    }:
         _prepare_critical(
             operation_env,
             expires_at=105 if action == "expire" else 1_000,
@@ -3713,6 +4301,15 @@ def test_operation_transition_certification_fault_rolls_back_everything(
         )
     if action == "expire":
         operation_env["now"][0] = 110
+    if action == "stale":
+        operation_env["conn"].execute(
+            """
+            UPDATE project_runtime_state SET version = version + 1
+            WHERE project_id = ?
+            """,
+            (operation_env["project_id"],),
+        )
+        operation_env["conn"].commit()
 
     before = _transition_authority_snapshot(operation_env)
     phase_c_before = [None]
@@ -3811,6 +4408,18 @@ def test_operation_transition_certification_fault_rolls_back_everything(
                 operation_env["actor"],
                 outcome="approved",
             )
+        elif action == "deny":
+            return guard.resolve_operation_approval(
+                "approval-1",
+                operation_env["actor"],
+                outcome="denied",
+            )
+        elif action == "stale":
+            return guard.resolve_operation_approval(
+                "approval-1",
+                operation_env["actor"],
+                outcome="approved",
+            )
         return guard.expire_due_operation_approvals(limit=1)
 
     if action == "expire":
@@ -3820,7 +4429,7 @@ def test_operation_transition_certification_fault_rolls_back_everything(
             invoke()
         expected_code = (
             module.OperationErrorCode.OPERATION_APPROVAL_CONFLICT
-            if action == "approve"
+            if action in {"approve", "deny", "stale"}
             else module.OperationErrorCode.OPERATION_STATE_CONFLICT
         )
         assert conflict.value.code is expected_code
@@ -3841,6 +4450,266 @@ def test_operation_transition_certification_fault_rolls_back_everything(
         WHERE operation_id = 'operation-1'
         """
     ).fetchone()[0] == 1
+
+
+class _InjectedMutationFault(RuntimeError):
+    pass
+
+
+_AUTHORITY_MUTATION_TABLES = frozenset(
+    {
+        "project_operations",
+        "project_approvals",
+        "project_turns",
+        "project_run_controls",
+        "project_worker_leases",
+        "project_runtime_state",
+        "project_events",
+    }
+)
+
+
+def _authority_mutation_table(statement):
+    normalized = " ".join(statement.lower().split())
+    for table in _AUTHORITY_MUTATION_TABLES:
+        if (
+            normalized.startswith(f"update {table}")
+            or normalized.startswith(f"delete from {table}")
+            or f" into {table} " in f" {normalized} "
+        ):
+            return table
+    return None
+
+
+class _MutationBoundaryConnection:
+    def __init__(self, conn, *, fail_at=None):
+        self._conn = conn
+        self.fail_at = fail_at
+        self.boundaries = []
+        self.failed = False
+
+    def execute(self, statement, parameters=()):
+        cursor = self._conn.execute(statement, parameters)
+        table = _authority_mutation_table(statement)
+        if table is not None:
+            self.boundaries.append(table)
+            if len(self.boundaries) == self.fail_at:
+                self.failed = True
+                raise _InjectedMutationFault(
+                    f"after {table} mutation"
+                )
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class _BoundaryPhaseACrash(BaseException):
+    pass
+
+
+class _BoundaryCrashReadback:
+    def read_operation(self, request):
+        raise _BoundaryPhaseACrash
+
+
+_MUTATION_BOUNDARY_ACTIONS = (
+    "prepare_allowed",
+    "prepare_critical",
+    "start",
+    "receipt",
+    "reconcile_phase_a",
+    "reconcile_phase_c",
+    "block",
+    "rehydrate",
+    "approve",
+    "deny",
+    "expire",
+    "stale",
+)
+
+
+def _setup_mutation_boundary_action(operation_env, action):
+    guard = operation_env["guard"]
+    if action in {
+        "start",
+        "receipt",
+        "reconcile_phase_a",
+        "reconcile_phase_c",
+        "block",
+    }:
+        _prepare_allowed(operation_env)
+    if action in {
+        "receipt",
+        "reconcile_phase_a",
+        "reconcile_phase_c",
+        "block",
+    }:
+        guard.mark_started(operation_env["claim"], "operation-1")
+    if action in {"reconcile_phase_c", "block"}:
+        with pytest.raises(_BoundaryPhaseACrash):
+            guard.reconcile(
+                operation_env["claim"],
+                "operation-1",
+                _BoundaryCrashReadback(),
+            )
+    if action in {
+        "rehydrate",
+        "approve",
+        "deny",
+        "expire",
+        "stale",
+    }:
+        _prepare_critical(
+            operation_env,
+            expires_at=105 if action == "expire" else 1_000,
+        )
+    if action == "rehydrate":
+        operation_env["now"][0] = 131
+        guard.resolve_operation_approval(
+            "approval-1",
+            operation_env["actor"],
+            outcome="approved",
+        )
+    elif action == "expire":
+        operation_env["now"][0] = 110
+    elif action == "stale":
+        operation_env["conn"].execute(
+            """
+            UPDATE project_runtime_state SET version = version + 1
+            WHERE project_id = ?
+            """,
+            (operation_env["project_id"],),
+        )
+        operation_env["conn"].commit()
+        operation_env["now"][0] = 101
+
+
+def _invoke_mutation_boundary_action(operation_env, action):
+    guard = operation_env["guard"]
+    if action == "prepare_allowed":
+        return _prepare_allowed(operation_env)
+    if action == "prepare_critical":
+        return _prepare_critical(operation_env)
+    if action == "start":
+        return guard.mark_started(
+            operation_env["claim"], "operation-1"
+        )
+    if action == "receipt":
+        return guard.record_receipt(
+            operation_env["claim"],
+            "operation-1",
+            _receipt(operation_env),
+        )
+    if action == "reconcile_phase_a":
+        try:
+            return guard.reconcile(
+                operation_env["claim"],
+                "operation-1",
+                _BoundaryCrashReadback(),
+            )
+        except _BoundaryPhaseACrash:
+            return None
+    if action == "reconcile_phase_c":
+        return guard.reconcile(
+            operation_env["claim"],
+            "operation-1",
+            _Readback(
+                operation_env["conn"],
+                _readback_result(
+                    operation_env,
+                    "applied",
+                    evidence={"ledger": "complete"},
+                    receipt=_receipt(operation_env),
+                ),
+            ),
+        )
+    if action == "block":
+        return guard.block_unknown(
+            operation_env["claim"], "operation-1"
+        )
+    if action == "rehydrate":
+        return guard._rehydrate_approved_operation(
+            operation_env["project_id"],
+            "operation-1",
+            worker_id="replacement-worker",
+            lease_seconds=30,
+        )
+    if action in {"approve", "deny", "stale"}:
+        return guard.resolve_operation_approval(
+            "approval-1",
+            operation_env["actor"],
+            outcome="denied" if action == "deny" else "approved",
+        )
+    return guard.expire_due_operation_approvals(limit=1)
+
+
+def _build_mutation_boundary_env(tmp_path, label, action):
+    path = tmp_path / label
+    path.mkdir()
+    operation_env = _build_operation_env(path, started=True)
+    _setup_mutation_boundary_action(operation_env, action)
+    return operation_env
+
+
+@pytest.mark.parametrize("action", _MUTATION_BOUNDARY_ACTIONS)
+def test_every_authority_mutation_boundary_rolls_back_atomically(
+    tmp_path,
+    action,
+):
+    recorded = _build_mutation_boundary_env(
+        tmp_path, f"{action}-record", action
+    )
+    try:
+        recorder = _MutationBoundaryConnection(recorded["conn"])
+        recorded["runtime"]._conn = recorder
+        recorded["guard"]._conn = recorder
+        _invoke_mutation_boundary_action(recorded, action)
+        boundaries = tuple(recorder.boundaries)
+    finally:
+        recorded["conn"].close()
+    assert boundaries
+
+    for ordinal in range(1, len(boundaries) + 1):
+        operation_env = _build_mutation_boundary_env(
+            tmp_path, f"{action}-fault-{ordinal}", action
+        )
+        try:
+            before = _transition_authority_snapshot(operation_env)
+            faulting = _MutationBoundaryConnection(
+                operation_env["conn"], fail_at=ordinal
+            )
+            operation_env["runtime"]._conn = faulting
+            operation_env["guard"]._conn = faulting
+            try:
+                result = _invoke_mutation_boundary_action(
+                    operation_env, action
+                )
+            except (
+                _InjectedMutationFault,
+                operation_env["module"].ProjectOperationError,
+            ):
+                pass
+            else:
+                assert action == "expire"
+                assert result == ()
+            assert faulting.failed
+            assert (
+                _transition_authority_snapshot(operation_env)
+                == before
+            )
+            marker = operation_env["conn"].execute(
+                """
+                SELECT guard_validated FROM project_operations
+                WHERE operation_id = 'operation-1'
+                """
+            ).fetchone()
+            if action.startswith("prepare_"):
+                assert marker is None
+            else:
+                assert marker[0] == 1
+        finally:
+            operation_env["conn"].close()
 
 
 def test_critical_prepare_certification_failure_rolls_back_whole_pair(
@@ -5751,6 +6620,7 @@ def _insert_raw_unresolved_operation(
     operation_id="current-unresolved",
     status="approved",
     updated_at=100,
+    guard_validated=0,
 ):
     conn = operation_env["conn"]
     conn.execute(
@@ -5761,11 +6631,11 @@ def _insert_raw_unresolved_operation(
             created_at, updated_at, guard_revision, canonical_action,
             batch_items_json, readback_kind, attempt_id,
             lease_generation, fencing_token,
-            remote_idempotency_supported
+            remote_idempotency_supported, guard_validated
         ) VALUES (
             ?, ?, ?, ?, 1, '["c:/work/current"]', '{}', ?,
             1, ?, 1, 'local_code_edit', '["current"]', 'ledger', ?,
-            1, 1, 1
+            1, 1, 1, ?
         )
         """,
         (
@@ -5776,6 +6646,7 @@ def _insert_raw_unresolved_operation(
             status,
             updated_at,
             operation_env["claim"].attempt_id,
+            guard_validated,
         ),
     )
     conn.commit()
@@ -5927,6 +6798,254 @@ def test_prepare_gate_is_bounded_and_does_not_map_allowed_history(
         for operation_id in mapped
     )
     assert steps < 4_000
+
+
+_UNSAFE_LARGE_HISTORY_SHAPES = (
+    "marker0_malformed",
+    "revision0",
+    "post_effect_blocked",
+    "marker_null",
+    "marker_wrong_type",
+    "revision_null",
+    "revision_wrong_type",
+)
+
+
+def _relax_operation_not_null_for_corruption(
+    operation_env,
+    column,
+):
+    conn = operation_env["conn"]
+    database_path = conn.execute(
+        "PRAGMA database_list"
+    ).fetchone()["file"]
+    row = conn.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'project_operations'
+        """
+    ).fetchone()
+    assert row is not None
+    original_sql = row["sql"]
+    search_after = 0
+    constraint_offset = None
+    while True:
+        column_offset = original_sql.find(column, search_after)
+        assert column_offset >= 0
+        suffix_offset = column_offset + len(column)
+        suffix = original_sql[suffix_offset:]
+        whitespace = len(suffix) - len(suffix.lstrip())
+        candidate = suffix_offset + whitespace
+        if original_sql.startswith("INTEGER NOT NULL", candidate):
+            constraint_offset = candidate
+            break
+        search_after = suffix_offset
+    assert constraint_offset is not None
+    relaxed_sql = (
+        original_sql[:constraint_offset]
+        + "INTEGER"
+        + original_sql[constraint_offset + len("INTEGER NOT NULL") :]
+    )
+    schema_version = conn.execute(
+        "PRAGMA schema_version"
+    ).fetchone()[0]
+    conn.execute("PRAGMA writable_schema=ON")
+    try:
+        conn.execute(
+            """
+            UPDATE sqlite_master SET sql = ?
+            WHERE type = 'table' AND name = 'project_operations'
+            """,
+            (relaxed_sql,),
+        )
+    finally:
+        conn.execute("PRAGMA writable_schema=OFF")
+    conn.commit()
+    conn.execute(f"PRAGMA schema_version = {schema_version + 1}")
+    conn.close()
+
+    reopened = sqlite3.connect(database_path)
+    reopened.row_factory = sqlite3.Row
+    reopened.execute("PRAGMA foreign_keys=ON")
+    operation_env["conn"] = reopened
+    operation_env["runtime"]._conn = reopened
+    operation_env["guard"]._conn = reopened
+
+
+def _insert_large_history_unsafe_row(operation_env, shape):
+    if shape in {"marker_null", "revision_null"}:
+        _relax_operation_not_null_for_corruption(
+            operation_env,
+            (
+                "guard_validated"
+                if shape == "marker_null"
+                else "guard_revision"
+            ),
+        )
+    marker = {
+        "marker0_malformed": 0,
+        "revision0": 0,
+        "post_effect_blocked": 1,
+        "marker_null": None,
+        "marker_wrong_type": "wrong",
+        "revision_null": 1,
+        "revision_wrong_type": 1,
+    }[shape]
+    revision = {
+        "marker0_malformed": 1,
+        "revision0": 0,
+        "post_effect_blocked": 1,
+        "marker_null": 1,
+        "marker_wrong_type": 1,
+        "revision_null": None,
+        "revision_wrong_type": "wrong",
+    }[shape]
+    post_effect = shape == "post_effect_blocked"
+    targets_json = (
+        "{"
+        if shape == "marker0_malformed"
+        else '["c:/work/unsafe"]'
+    )
+    conn = operation_env["conn"]
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    try:
+        conn.execute(
+            """
+            INSERT INTO project_operations (
+                operation_id, project_id, turn_id, idempotency_key,
+                approval_id, command_revision, targets_json,
+                payload_json, status, receipt_json, created_at,
+                updated_at, guard_revision, guard_validated,
+                canonical_action, batch_items_json, readback_kind,
+                attempt_id, lease_generation, fencing_token,
+                receipt_id, readback_json, blocked_reason,
+                remote_idempotency_supported,
+                approval_fingerprint_json
+            ) VALUES (
+                ?, ?, ?, ?, NULL, 1, ?, '{}', 'blocked', ?,
+                1, 1, ?, ?, 'local_code_edit', '["unsafe"]', ?,
+                ?, 1, 1, ?, NULL, ?, ?, NULL
+            )
+            """,
+            (
+                f"unsafe-{shape}",
+                operation_env["project_id"],
+                operation_env["turn"].turn_id,
+                f"unsafe-key-{shape}",
+                targets_json,
+                (
+                    '{"provider_sequence":1}'
+                    if post_effect
+                    else None
+                ),
+                revision,
+                marker,
+                "ledger" if post_effect else None,
+                operation_env["claim"].attempt_id,
+                "unsafe-receipt" if post_effect else None,
+                (
+                    "operation_readback_ambiguous"
+                    if post_effect
+                    else "operation_capability_unsupported"
+                ),
+                1 if post_effect else 0,
+            ),
+        )
+    finally:
+        conn.execute("PRAGMA ignore_check_constraints=OFF")
+    conn.commit()
+
+
+@pytest.mark.parametrize("unsafe_shape", _UNSAFE_LARGE_HISTORY_SHAPES)
+def test_unsafe_large_history_is_indexed_bounded_and_fail_closed(
+    operation_env,
+    monkeypatch,
+    unsafe_shape,
+):
+    _insert_large_allowed_operation_history(operation_env)
+    _certify_operation_fixture_rows(operation_env)
+    _insert_large_history_unsafe_row(operation_env, unsafe_shape)
+    conn = operation_env["conn"]
+    before = _transition_authority_snapshot(operation_env)
+
+    def rejected_prepare():
+        with pytest.raises(
+            operation_env["module"].ProjectOperationError
+        ) as conflict:
+            operation_env["guard"].prepare(
+                operation_env["claim"],
+                _intent(operation_env),
+                policy=PolicyDecision(
+                    Decision.ALLOW,
+                    "policy.allow.local",
+                    "allowed",
+                ),
+                approval=None,
+            )
+        return conflict.value.code
+
+    code, prepare_steps = _with_sql_progress_budget(
+        conn,
+        budget=4_000,
+        action=rejected_prepare,
+    )
+    assert (
+        code
+        is operation_env[
+            "module"
+        ].OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert prepare_steps < 4_000
+    assert _transition_authority_snapshot(operation_env) == before
+
+    _insert_raw_unresolved_operation(
+        operation_env,
+        guard_validated=1,
+    )
+    _park_raw_operation_turn(operation_env)
+    mapped = []
+    original_mapper = prdb._project_operation_for_id
+
+    def recording_mapper(
+        selected_conn,
+        *,
+        project_id,
+        operation_id,
+    ):
+        mapped.append(operation_id)
+        return original_mapper(
+            selected_conn,
+            project_id=project_id,
+            operation_id=operation_id,
+        )
+
+    monkeypatch.setattr(
+        prdb, "_project_operation_for_id", recording_mapper
+    )
+    candidates, recovery_steps = _with_sql_progress_budget(
+        conn,
+        budget=2_000,
+        action=lambda: prdb._operation_pending_candidates(
+            conn, limit=1
+        ),
+    )
+
+    assert candidates == ()
+    assert mapped == []
+    assert recovery_steps < 2_000
+    standalone_plan = conn.execute(
+        "EXPLAIN QUERY PLAN " + prdb._OPERATION_TURN_UNSAFE_SQL,
+        (
+            operation_env["project_id"],
+            operation_env["turn"].turn_id,
+        ),
+    ).fetchall()
+    details = " ".join(row["detail"] for row in standalone_plan)
+    assert "SEARCH project_operations" in details
+    assert "idx_project_operations_turn_unsafe" in details
+    assert "<expr>=?" in details
+    assert "SCAN project_operations" not in details
+    assert "USE TEMP B-TREE" not in details
 
 
 def test_operation_pending_selector_is_four_branch_bounded_and_global(
@@ -7433,10 +8552,119 @@ def test_operation_intent_requires_exact_builtin_remote_capability(
         replace(intent, remote_idempotency_supported=None)
 
 
-def test_task6_static_critical_map_exactly_matches_task2_policy_authority():
+def test_task6_static_critical_map_exactly_matches_task2_policy_authority(
+    operation_conn,
+):
     assert prdb.TASK6_CRITICAL_ACTION_APPROVAL_CLASSES == (
         CRITICAL_ACTION_CASES
     )
+    assert tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            f"""
+            SELECT column1, column2
+            FROM (
+                VALUES
+                {prdb._TASK6_CRITICAL_ACTION_VALUES_SQL}
+            )
+            """
+        )
+    ) == CRITICAL_ACTION_CASES
+    assert (
+        prdb._TASK6_CRITICAL_AUTHORITY_PREDICATE_SQL.count(
+            prdb._TASK6_CRITICAL_ACTION_VALUES_SQL
+        )
+        == 1
+    )
+    assert (
+        prdb.TASK6_TRIGGER_SQL.count(
+            prdb._TASK6_CRITICAL_ACTION_VALUES_SQL
+        )
+        == 2
+    )
+
+
+def _operation_task6_trigger_definitions(conn):
+    return {
+        row["name"]: row["sql"]
+        for row in conn.execute(
+            """
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name IN (
+                  'trg_project_operations_task6_insert',
+                  'trg_project_operations_task6_update'
+              )
+            ORDER BY name
+            """
+        )
+    }
+
+
+def _without_inverse_approval_clause(trigger_sql):
+    fingerprint_match = trigger_sql.index(
+        "NEW.approval_id = json_extract"
+    )
+    exists_start = trigger_sql.index(
+        "AND EXISTS (", fingerprint_match
+    )
+    opening = trigger_sql.index("(", exists_start)
+    depth = 0
+    exists_end = None
+    for offset in range(opening, len(trigger_sql)):
+        character = trigger_sql[offset]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                exists_end = offset + 1
+                break
+    assert exists_end is not None
+    old_sql = (
+        trigger_sql[:exists_start]
+        + "AND 1"
+        + trigger_sql[exists_end:]
+    )
+    assert "inverse_approval.operation_id" not in old_sql
+    return old_sql
+
+
+def test_ensure_replaces_old_task6_triggers_and_repeat_is_stable(
+    operation_conn,
+):
+    canonical = _operation_task6_trigger_definitions(operation_conn)
+    assert set(canonical) == {
+        "trg_project_operations_task6_insert",
+        "trg_project_operations_task6_update",
+    }
+    assert all(
+        "inverse_approval.operation_id" in sql
+        for sql in canonical.values()
+    )
+    old = {
+        name: _without_inverse_approval_clause(sql)
+        for name, sql in canonical.items()
+    }
+    for name in canonical:
+        operation_conn.execute(f"DROP TRIGGER {name}")
+    for sql in old.values():
+        operation_conn.execute(sql)
+    operation_conn.commit()
+    assert _operation_task6_trigger_definitions(operation_conn) == old
+
+    prdb.ensure_schema(operation_conn)
+
+    upgraded = _operation_task6_trigger_definitions(operation_conn)
+    assert upgraded == canonical
+    assert all(
+        "inverse_approval.operation_id" in sql
+        for sql in upgraded.values()
+    )
+    prdb.ensure_schema(operation_conn)
+    assert _operation_task6_trigger_definitions(
+        operation_conn
+    ) == upgraded
 
 
 @pytest.mark.parametrize(
@@ -7581,6 +8809,198 @@ def _raw_critical_fingerprint(
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _stage_noninverse_critical_approval(
+    operation_env,
+    *,
+    approval_id,
+    link_shape,
+):
+    conn = operation_env["conn"]
+    project_id = operation_env["project_id"]
+    if link_shape == "crossed":
+        other_operation_id = f"{approval_id}-other-operation"
+        assert prdb._insert_project_operation(
+            conn,
+            operation_id=other_operation_id,
+            project_id=project_id,
+            turn_id=operation_env["turn"].turn_id,
+            idempotency_key=f"{other_operation_id}-key",
+            command_revision=1,
+            targets_json='["c:/work/operations/other.py"]',
+            payload_json="{}",
+            status="approved",
+            canonical_action="local_code_edit",
+            batch_items_json='["other"]',
+            readback_kind="remote-ledger",
+            attempt_id=operation_env["claim"].attempt_id,
+            lease_generation=(
+                operation_env["claim"].lease_generation
+            ),
+            fencing_token=operation_env["claim"].fencing_token,
+            blocked_reason=None,
+            remote_idempotency_supported=True,
+            approval_fingerprint_json=None,
+            now=operation_env["now"][0],
+        )
+        _insert_migration_approval(
+            conn,
+            project_id,
+            approval_id,
+            other_operation_id,
+            1,
+            maintenance_seq=10_000,
+        )
+    else:
+        _insert_migration_approval(
+            conn,
+            project_id,
+            approval_id,
+            None,
+            1,
+        )
+    conn.commit()
+    return _raw_critical_fingerprint(
+        "publish", approval_id=approval_id
+    )
+
+
+@pytest.mark.parametrize("authority_path", ("insert", "update"))
+@pytest.mark.parametrize("link_shape", ("generic", "crossed"))
+def test_task6_trigger_rejects_noninverse_critical_approval_authority(
+    operation_env,
+    authority_path,
+    link_shape,
+):
+    conn = operation_env["conn"]
+    approval_id = f"{authority_path}-{link_shape}-approval"
+    if authority_path == "update":
+        _prepare_critical(operation_env)
+    fingerprint = _stage_noninverse_critical_approval(
+        operation_env,
+        approval_id=approval_id,
+        link_shape=link_shape,
+    )
+    if authority_path == "update":
+        operation = prdb._project_operation_for_id(
+            conn,
+            project_id=operation_env["project_id"],
+            operation_id="operation-1",
+        )
+        assert operation is not None
+        prdb._decertify_project_operation(conn, operation)
+        conn.execute(
+            """
+            UPDATE project_operations
+            SET approval_id = ?, approval_fingerprint_json = ?
+            WHERE operation_id = 'operation-1'
+              AND guard_validated = 0
+            """,
+            (approval_id, fingerprint),
+        )
+        conn.commit()
+    before = _operation_snapshot(operation_env)
+
+    conn.execute("SAVEPOINT noninverse_critical_authority")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            if authority_path == "insert":
+                conn.execute(
+                    """
+                    INSERT INTO project_operations (
+                        operation_id, project_id, turn_id,
+                        idempotency_key, approval_id,
+                        command_revision, targets_json, payload_json,
+                        status, created_at, updated_at, guard_revision,
+                        guard_validated, canonical_action,
+                        batch_items_json, readback_kind, attempt_id,
+                        lease_generation, fencing_token,
+                        remote_idempotency_supported,
+                        approval_fingerprint_json
+                    ) VALUES (
+                        'raw-noninverse-insert', ?, ?,
+                        'raw-noninverse-insert-key', ?,
+                        1, '["c:/work/operations/file.py"]', '{}',
+                        'approved', 100, 100, 1,
+                        1, 'publish', '["publish"]',
+                        'remote-ledger', ?, 1, 1, 1, ?
+                    )
+                    """,
+                    (
+                        operation_env["project_id"],
+                        operation_env["turn"].turn_id,
+                        approval_id,
+                        operation_env["claim"].attempt_id,
+                        fingerprint,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE project_operations
+                    SET guard_validated = 1
+                    WHERE operation_id = 'operation-1'
+                      AND guard_validated = 0
+                    """
+                )
+    finally:
+        conn.execute(
+            "ROLLBACK TO noninverse_critical_authority"
+        )
+        conn.execute("RELEASE noninverse_critical_authority")
+
+    assert before == _operation_snapshot(operation_env)
+    if authority_path == "insert":
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM project_operations
+            WHERE operation_id = 'raw-noninverse-insert'
+            """
+        ).fetchone()[0] == 0
+    else:
+        assert conn.execute(
+            """
+            SELECT guard_validated FROM project_operations
+            WHERE operation_id = 'operation-1'
+            """
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "authority_shape",
+    ("exact-inverse", "capability-blocked"),
+)
+def test_marker_certification_accepts_only_valid_critical_exceptions(
+    operation_env,
+    authority_shape,
+):
+    if authority_shape == "exact-inverse":
+        _prepare_critical(operation_env)
+    else:
+        _critical_capability_block(operation_env)
+    conn = operation_env["conn"]
+    operation = prdb._project_operation_for_id(
+        conn,
+        project_id=operation_env["project_id"],
+        operation_id="operation-1",
+    )
+    assert operation is not None
+    prdb._decertify_project_operation(conn, operation)
+
+    assert conn.execute(
+        """
+        UPDATE project_operations
+        SET guard_validated = 1
+        WHERE operation_id = 'operation-1'
+          AND guard_validated = 0
+        """
+    ).rowcount == 1
+    assert prdb._project_operation_for_id(
+        conn,
+        project_id=operation_env["project_id"],
+        operation_id="operation-1",
+    ) is not None
 
 
 def test_static_trigger_rejects_every_uncertified_critical_authority_shape(

@@ -50,6 +50,20 @@ TASK6_CRITICAL_ACTION_APPROVAL_CLASSES = (
     ("live_canary", "live_canary"),
     ("final_acceptance", "final_acceptance"),
 )
+
+
+def _task6_sql_text(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+_TASK6_CRITICAL_ACTION_VALUES_SQL = ",\n".join(
+    "                ({}, {})".format(
+        _task6_sql_text(action),
+        _task6_sql_text(approval_class),
+    )
+    for action, approval_class
+    in TASK6_CRITICAL_ACTION_APPROVAL_CLASSES
+)
 _TASK6_CRITICAL_APPROVAL_CLASS_BY_ACTION = dict(
     TASK6_CRITICAL_ACTION_APPROVAL_CLASSES
 )
@@ -660,6 +674,16 @@ COALESCE(
                         NEW.approval_fingerprint_json,
                         '$.approval_id'
                     )
+                    AND EXISTS (
+                        SELECT 1
+                        FROM project_approvals AS inverse_approval
+                        WHERE inverse_approval.project_id
+                            = NEW.project_id
+                          AND inverse_approval.approval_id
+                            = NEW.approval_id
+                          AND inverse_approval.operation_id
+                            = NEW.operation_id
+                    )
                 )
             )
             )
@@ -667,26 +691,7 @@ COALESCE(
             END
         FROM (
             VALUES
-                ('credentials', 'credentials'),
-                ('money_quota', 'money_quota'),
-                ('money', 'money_quota'),
-                ('quota', 'money_quota'),
-                (
-                    'external_communication',
-                    'external_communication'
-                ),
-                ('publish', 'publish'),
-                ('push', 'publish'),
-                ('pull_request', 'publish'),
-                ('release', 'publish'),
-                ('production', 'production'),
-                ('admin_service', 'admin_service'),
-                ('admin', 'admin_service'),
-                ('service', 'admin_service'),
-                ('startup', 'admin_service'),
-                ('destructive', 'destructive'),
-                ('live_canary', 'live_canary'),
-                ('final_acceptance', 'final_acceptance')
+__TASK6_CRITICAL_ACTION_VALUES__
         ) AS critical
         WHERE critical.column1 = NEW.canonical_action
     ),
@@ -695,7 +700,10 @@ COALESCE(
         AND NEW.approval_id IS NULL
     )
 )
-"""
+""".replace(
+    "__TASK6_CRITICAL_ACTION_VALUES__",
+    _TASK6_CRITICAL_ACTION_VALUES_SQL,
+)
 
 TASK6_TRIGGER_SQL = """
 CREATE TRIGGER IF NOT EXISTS trg_project_operations_task6_insert
@@ -2561,6 +2569,8 @@ def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
                 or "approval_fingerprint_json"
                 not in trigger["sql"]
                 or "critical.column2" not in trigger["sql"]
+                or "inverse_approval.operation_id"
+                not in trigger["sql"]
             ):
                 conn.execute(f"DROP TRIGGER {trigger_name}")
 

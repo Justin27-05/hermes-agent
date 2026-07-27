@@ -16,12 +16,18 @@ if str(ROOT) not in sys.path:
 from hermes_cli import project_runtime_db as runtime_db  # noqa: E402
 from hermes_cli import projects_db  # noqa: E402
 from hermes_cli.project_operations import (  # noqa: E402
+    OperationApprovalSpec,
+    OperationIntent,
     OperationReadbackResult,
     OperationReceipt,
     ProjectOperationError,
     ProjectOperationGuard,
 )
-from hermes_cli.project_policy import ActorContext  # noqa: E402
+from hermes_cli.project_policy import (  # noqa: E402
+    ActorContext,
+    Decision,
+    PolicyDecision,
+)
 from hermes_cli.project_runtime import (  # noqa: E402
     ProjectRuntime,
     ProjectRuntimeError,
@@ -101,6 +107,89 @@ def _operation_claim(
         fencing_token=turn.fencing_token,
         lease_expires_at=lease.expires_at,
         canonical_session_id=state.conversation_tip_id,
+    )
+
+
+def _live_turn_claim(conn: sqlite3.Connection) -> TurnClaim:
+    row = conn.execute(
+        """
+        SELECT project_id, turn_id
+        FROM project_turns
+        WHERE attempt_id IS NOT NULL
+          AND status IN ('claimed', 'started', 'awaiting_approval')
+        ORDER BY project_id, sequence, turn_id
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("probe live turn is missing")
+    state = runtime_db.runtime_state_for_project(
+        conn, row["project_id"]
+    )
+    turn = runtime_db._runtime_turn_for_project(
+        conn,
+        project_id=row["project_id"],
+        turn_id=row["turn_id"],
+    )
+    control = runtime_db._runtime_control_for_turn(
+        conn,
+        project_id=row["project_id"],
+        turn_id=row["turn_id"],
+    )
+    lease = runtime_db._current_worker_lease_for_turn(
+        conn,
+        project_id=row["project_id"],
+        turn_id=row["turn_id"],
+    )
+    if (
+        state is None
+        or turn is None
+        or control is None
+        or lease is None
+        or turn.attempt_id is None
+        or control.claim_worker_id is None
+    ):
+        raise RuntimeError("probe live claim is incomplete")
+    return TurnClaim(
+        turn_id=turn.turn_id,
+        project_id=turn.project_id,
+        sequence=turn.sequence,
+        worker_id=control.claim_worker_id,
+        attempt_id=turn.attempt_id,
+        lease_generation=turn.lease_generation,
+        fencing_token=turn.fencing_token,
+        lease_expires_at=lease.expires_at,
+        canonical_session_id=state.conversation_tip_id,
+    )
+
+
+def _race_approval_request(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: str,
+):
+    claim = _live_turn_claim(conn)
+    state = runtime_db.runtime_state_for_project(
+        conn, claim.project_id
+    )
+    if state is None:
+        raise RuntimeError("probe runtime state is missing")
+    return runtime_db.ApprovalRequest(
+        approval_id=approval_id,
+        project_id=claim.project_id,
+        requester_actor_id="owner-1",
+        authorization_actor_id="owner-1",
+        canonical_action="publish",
+        approval_class="publish",
+        command_revision=1,
+        expected_runtime_version=state.version,
+        expected_lifecycle=state.lifecycle,
+        expected_phase=state.current_phase,
+        targets=("C:/work/operations/file.py",),
+        batch_id="operation-1",
+        batch_items=("write-file",),
+        status="pending",
+        expires_at=1_000,
     )
 
 
@@ -284,6 +373,12 @@ def main() -> int:
         "start",
         "reconcile",
         "rehydrate_config",
+        "generic_expire",
+        "generic_resolve",
+        "generic_consume",
+        "generic_create",
+        "request_turn",
+        "stage_critical",
         "no_ready",
         "early_exit",
         "malformed_ready",
@@ -318,7 +413,112 @@ def main() -> int:
         actor = ActorContext(
             "owner-1", "desktop", binding_id, True
         )
-        if mode in {
+        if mode == "generic_expire":
+            with runtime_db.write_transaction(conn):
+                runtime_db._expire_approvals(conn, now)
+            result = {"generic_completed": True}
+        elif mode == "generic_resolve":
+            approval = runtime_db.resolve_approval(
+                conn,
+                approval_id="approval-1",
+                resolver=actor,
+                outcome=outcome,
+                now=now,
+            )
+            result = {"generic_resolved": approval is not None}
+        elif mode == "generic_consume":
+            row = conn.execute(
+                """
+                SELECT * FROM project_approvals
+                WHERE approval_id = 'approval-1'
+                """
+            ).fetchone()
+            if row is None:
+                return 2
+            request = runtime_db._approval_from_row(row)
+            consumed = runtime_db.consume_approval_authorization(
+                conn,
+                approval_id=request.approval_id,
+                project_id=request.project_id,
+                authorization_actor_id=(
+                    request.authorization_actor_id
+                ),
+                canonical_action=request.canonical_action,
+                approval_class=request.approval_class,
+                command_revision=request.command_revision,
+                expected_runtime_version=(
+                    request.expected_runtime_version
+                ),
+                expected_lifecycle=request.expected_lifecycle,
+                expected_phase=request.expected_phase,
+                targets=request.targets,
+                batch_id=request.batch_id,
+                batch_items=request.batch_items,
+                now=now,
+            )
+            result = {"generic_consumed": consumed}
+        elif mode == "generic_create":
+            approval_id = (
+                outcome if outcome != "approved" else "generic-race"
+            )
+            request = _race_approval_request(
+                conn, approval_id=approval_id
+            )
+            created = runtime_db.create_approval_request(
+                conn, request, now=now
+            )
+            result = {"approval_id": created.approval_id}
+        elif mode == "request_turn":
+            claim = _live_turn_claim(conn)
+            request = _race_approval_request(
+                conn, approval_id="approval-1"
+            )
+            control = runtime_db._runtime_control_for_turn(
+                conn,
+                project_id=claim.project_id,
+                turn_id=claim.turn_id,
+            )
+            if control is None:
+                return 2
+            approval = runtime.request_turn_approval(
+                claim.turn_id,
+                request,
+                actor,
+                expected_control_version=control.control_version,
+            )
+            result = {"approval_id": approval.approval.approval_id}
+        elif mode == "stage_critical":
+            claim = _live_turn_claim(conn)
+            operation = guard.prepare(
+                claim,
+                OperationIntent(
+                    operation_id="operation-1",
+                    project_id=claim.project_id,
+                    turn_id=claim.turn_id,
+                    idempotency_key="remote-operation-1",
+                    canonical_action="publish",
+                    command_revision=1,
+                    targets=("C:/work/operations/file.py",),
+                    batch_items=("write-file",),
+                    payload={"content_digest": "sha256:abc"},
+                    readback_kind="remote-ledger",
+                    remote_idempotency_supported=True,
+                ),
+                policy=PolicyDecision(
+                    Decision.REQUIRE_APPROVAL,
+                    "policy.approval.publish",
+                    "publish is critical",
+                    "publish",
+                ),
+                approval=OperationApprovalSpec(
+                    "approval-1",
+                    "publish",
+                    1_000,
+                    actor,
+                ),
+            )
+            result = {"operation_status": operation.status}
+        elif mode in {
             "execute",
             "complete",
             "start",
@@ -500,6 +700,9 @@ def main() -> int:
         return 0
     except (ProjectOperationError, ProjectRuntimeError) as exc:
         _emit({"error_code": exc.code.value})
+        return 0
+    except runtime_db.ApprovalConflictError:
+        _emit({"error_code": "approval_conflict"})
         return 0
     finally:
         if conn:

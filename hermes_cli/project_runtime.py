@@ -1,8 +1,8 @@
-"""Durable, per-project FIFO command runtime.
+"""Durable per-project FIFO, lease, fencing, and recovery authority.
 
-This module deliberately stops at durable queue/control state.  It does not
-load history, construct agents, call providers, deliver to a surface, or try
-to recover expired workers.  Those are later-task concerns.
+This module does not load history, construct agents, call providers, or
+deliver to a surface. Concrete worker/readback wiring remains a later-task
+adapter concern.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Callable, Literal, Mapping
+from typing import Callable, Literal, Mapping, Protocol
 
 from hermes_cli import project_runtime_db as runtime_db
 from hermes_cli.project_policy import ActorContext
@@ -45,7 +45,12 @@ ControlState = Literal[
     "resume_requested",
     "terminal",
 ]
+TerminalTurnStatus = Literal["succeeded", "failed"]
+ExecutionState = Literal["not_started", "started"]
+RecoverySourceStatus = Literal["claimed", "stop_requested"]
+ReadbackOutcome = Literal["succeeded", "failed", "stopped", "unknown"]
 ApprovalRequest = runtime_db.ApprovalRequest
+SQLITE_INT_MAX = (1 << 63) - 1
 
 
 class RuntimeErrorCode(str, Enum):
@@ -67,6 +72,9 @@ class RuntimeErrorCode(str, Enum):
     TURN_NOT_RESUMABLE = "turn_not_resumable"
     TURN_RECOVERY_BLOCKED = "turn_recovery_blocked"
     APPROVAL_CONFLICT = "approval_conflict"
+    STALE_TURN_CLAIM = "stale_turn_claim"
+    TURN_EXECUTION_NOT_STARTED = "turn_execution_not_started"
+    TERMINAL_RESULT_CONFLICT = "terminal_result_conflict"
 
 
 class ProjectRuntimeError(RuntimeError):
@@ -127,6 +135,40 @@ class TurnClaim:
     fencing_token: int
     lease_expires_at: int
     canonical_session_id: str
+
+
+@dataclass(frozen=True)
+class CanonicalTurnResult:
+    status: TerminalTurnStatus
+    result_id: str
+
+
+@dataclass(frozen=True)
+class TurnReadbackRequest:
+    project_id: str
+    turn_id: str
+    sequence: int
+    worker_id: str
+    attempt_id: str
+    lease_generation: int
+    fencing_token: int
+    lease_expires_at: int
+    canonical_session_id: str
+    source_status: RecoverySourceStatus
+    execution_state: ExecutionState | None
+
+
+@dataclass(frozen=True)
+class TurnReadbackResult:
+    outcome: ReadbackOutcome
+    result_id: str | None = None
+
+
+class TurnReadbackPort(Protocol):
+    def read_turn(
+        self,
+        request: TurnReadbackRequest,
+    ) -> TurnReadbackResult: ...
 
 
 @dataclass(frozen=True)
@@ -404,7 +446,8 @@ class ProjectRuntime:
             and control.turn_id == claim.turn_id
             and control.attempt_id == claim.attempt_id
             and control.claim_worker_id == claim.worker_id
-            and control.claim_lease_expires_at == claim.lease_expires_at
+            and type(control.claim_lease_expires_at) is int
+            and claim.lease_expires_at <= control.claim_lease_expires_at
             and control.claim_canonical_session_id
             == claim.canonical_session_id
         )
@@ -422,8 +465,601 @@ class ProjectRuntime:
             and lease.worker_id == claim.worker_id
             and lease.lease_generation == claim.lease_generation
             and lease.fencing_token == claim.fencing_token
-            and lease.expires_at == claim.lease_expires_at
+            and claim.lease_expires_at <= lease.expires_at
         )
+
+    @staticmethod
+    def _require_turn_claim(claim: object) -> TurnClaim:
+        if (
+            type(claim) is not TurnClaim
+            or not all(
+                _is_text(value)
+                for value in (
+                    claim.project_id,
+                    claim.turn_id,
+                    claim.worker_id,
+                    claim.attempt_id,
+                    claim.canonical_session_id,
+                )
+            )
+            or not all(
+                type(value) is int and value > 0
+                for value in (
+                    claim.sequence,
+                    claim.lease_generation,
+                    claim.fencing_token,
+                )
+            )
+            or not _is_nonnegative_int(claim.lease_expires_at)
+        ):
+            raise ProjectRuntimeError(RuntimeErrorCode.INVALID_ARGUMENT)
+        return claim
+
+    @staticmethod
+    def _stale_turn_claim(claim: TurnClaim) -> ProjectRuntimeError:
+        return ProjectRuntimeError(
+            RuntimeErrorCode.STALE_TURN_CLAIM,
+            project_id=claim.project_id,
+            turn_id=claim.turn_id,
+        )
+
+    def _live_claim_records(
+        self,
+        claim: TurnClaim,
+        *,
+        now: int,
+    ) -> tuple[
+        runtime_db.RuntimeState,
+        runtime_db.RuntimeTurnRecord,
+        runtime_db.RuntimeControlRecord,
+        runtime_db.WorkerLeaseRecord,
+    ]:
+        state = runtime_db.runtime_state_for_project(
+            self._conn, claim.project_id
+        )
+        turn = runtime_db._runtime_turn_for_project(
+            self._conn,
+            project_id=claim.project_id,
+            turn_id=claim.turn_id,
+        )
+        control = runtime_db._runtime_control_for_turn(
+            self._conn,
+            project_id=claim.project_id,
+            turn_id=claim.turn_id,
+        )
+        lease = runtime_db._current_worker_lease_for_turn(
+            self._conn,
+            project_id=claim.project_id,
+            turn_id=claim.turn_id,
+        )
+        if not (
+            state is not None
+            and state.lifecycle == "active"
+            and state.conversation_tip_id == claim.canonical_session_id
+            and turn is not None
+            and control is not None
+            and lease is not None
+            and self._stored_claim_matches(turn, control, claim)
+            and self._current_lease_matches(lease, claim)
+            and control.claim_lease_expires_at == lease.expires_at
+            and lease.expires_at > now
+        ):
+            raise self._stale_turn_claim(claim)
+        return state, turn, control, lease
+
+    @staticmethod
+    def _claim_at_horizon(
+        claim: TurnClaim,
+        lease_expires_at: int,
+    ) -> TurnClaim:
+        return TurnClaim(
+            turn_id=claim.turn_id,
+            project_id=claim.project_id,
+            sequence=claim.sequence,
+            worker_id=claim.worker_id,
+            attempt_id=claim.attempt_id,
+            lease_generation=claim.lease_generation,
+            fencing_token=claim.fencing_token,
+            lease_expires_at=lease_expires_at,
+            canonical_session_id=claim.canonical_session_id,
+        )
+
+    def heartbeat_turn(
+        self,
+        claim: TurnClaim,
+        *,
+        lease_seconds: int,
+    ) -> TurnClaim:
+        claim = self._require_turn_claim(claim)
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise ProjectRuntimeError(RuntimeErrorCode.INVALID_ARGUMENT)
+        now = self._now()
+        if now > SQLITE_INT_MAX - lease_seconds:
+            raise ProjectRuntimeError(RuntimeErrorCode.INVALID_ARGUMENT)
+        requested_expires_at = now + lease_seconds
+        with runtime_db.write_transaction(self._conn):
+            _, turn, control, lease = self._live_claim_records(
+                claim, now=now
+            )
+            allowed = {
+                ("claimed", "running"),
+                ("awaiting_approval", "running"),
+                ("stop_requested", "stop_requested"),
+            }
+            if (
+                (turn.status, control.control_state) not in allowed
+                or turn.execution_state not in {"not_started", "started"}
+            ):
+                raise self._stale_turn_claim(claim)
+            new_expires_at = max(lease.expires_at, requested_expires_at)
+            renewed = runtime_db._heartbeat_runtime_turn(
+                self._conn,
+                project_id=claim.project_id,
+                turn_id=claim.turn_id,
+                sequence=claim.sequence,
+                turn_status=turn.status,
+                control_state=control.control_state,
+                attempt_id=claim.attempt_id,
+                worker_id=claim.worker_id,
+                lease_generation=claim.lease_generation,
+                fencing_token=claim.fencing_token,
+                canonical_session_id=claim.canonical_session_id,
+                old_expires_at=lease.expires_at,
+                new_expires_at=new_expires_at,
+                now=now,
+            )
+            if renewed is None or renewed.expires_at != new_expires_at:
+                raise self._stale_turn_claim(claim)
+            return self._claim_at_horizon(claim, renewed.expires_at)
+
+    def mark_turn_started(
+        self,
+        claim: TurnClaim,
+    ) -> TurnClaim:
+        claim = self._require_turn_claim(claim)
+        now = self._now()
+        with runtime_db.write_transaction(self._conn):
+            _, turn, control, lease = self._live_claim_records(
+                claim, now=now
+            )
+            if not (
+                turn.status == "claimed"
+                and control.control_state == "running"
+                and turn.execution_state in {"not_started", "started"}
+            ):
+                raise self._stale_turn_claim(claim)
+            current_claim = self._claim_at_horizon(claim, lease.expires_at)
+            if turn.execution_state == "started":
+                return current_claim
+            if not runtime_db._mark_runtime_turn_started(
+                self._conn,
+                project_id=claim.project_id,
+                turn_id=claim.turn_id,
+                sequence=claim.sequence,
+                attempt_id=claim.attempt_id,
+                worker_id=claim.worker_id,
+                lease_generation=claim.lease_generation,
+                fencing_token=claim.fencing_token,
+                canonical_session_id=claim.canonical_session_id,
+                expires_at=lease.expires_at,
+                now=now,
+            ):
+                raise self._stale_turn_claim(claim)
+            return current_claim
+
+    def commit_turn(
+        self,
+        claim: TurnClaim,
+        result: CanonicalTurnResult,
+    ) -> ProjectTurn:
+        claim = self._require_turn_claim(claim)
+        if not (
+            type(result) is CanonicalTurnResult
+            and type(result.status) is str
+            and result.status in {"succeeded", "failed"}
+            and _is_text(result.result_id)
+        ):
+            raise ProjectRuntimeError(RuntimeErrorCode.INVALID_ARGUMENT)
+        now = self._now()
+        with runtime_db.write_transaction(self._conn):
+            state = runtime_db.runtime_state_for_project(
+                self._conn, claim.project_id
+            )
+            turn = runtime_db._runtime_turn_for_project(
+                self._conn,
+                project_id=claim.project_id,
+                turn_id=claim.turn_id,
+            )
+            control = runtime_db._runtime_control_for_turn(
+                self._conn,
+                project_id=claim.project_id,
+                turn_id=claim.turn_id,
+            )
+            lease = runtime_db._current_worker_lease_for_turn(
+                self._conn,
+                project_id=claim.project_id,
+                turn_id=claim.turn_id,
+            )
+            if (
+                turn is not None
+                and control is not None
+                and turn.status in {"succeeded", "failed"}
+            ):
+                same_claim = (
+                    state is not None
+                    and control.control_state == "terminal"
+                    and lease is None
+                    and turn.execution_state == "started"
+                    and self._stored_claim_matches(turn, control, claim)
+                )
+                if not same_claim or turn.terminal_result_id is None:
+                    raise self._stale_turn_claim(claim)
+                if (
+                    turn.status == result.status
+                    and turn.terminal_result_id == result.result_id
+                ):
+                    return self._turn_from_record(turn)
+                raise ProjectRuntimeError(
+                    RuntimeErrorCode.TERMINAL_RESULT_CONFLICT,
+                    project_id=claim.project_id,
+                    turn_id=claim.turn_id,
+                )
+
+            state, turn, control, lease = self._live_claim_records(
+                claim, now=now
+            )
+            if not (
+                turn.status == "claimed"
+                and control.control_state == "running"
+            ):
+                raise self._stale_turn_claim(claim)
+            if turn.execution_state == "not_started":
+                raise ProjectRuntimeError(
+                    RuntimeErrorCode.TURN_EXECUTION_NOT_STARTED,
+                    project_id=claim.project_id,
+                    turn_id=claim.turn_id,
+                )
+            if turn.execution_state != "started":
+                raise self._stale_turn_claim(claim)
+            committed = runtime_db._commit_runtime_turn(
+                self._conn,
+                project_id=claim.project_id,
+                turn_id=claim.turn_id,
+                sequence=claim.sequence,
+                terminal_status=result.status,
+                terminal_result_id=result.result_id,
+                attempt_id=claim.attempt_id,
+                worker_id=claim.worker_id,
+                lease_generation=claim.lease_generation,
+                fencing_token=claim.fencing_token,
+                canonical_session_id=claim.canonical_session_id,
+                expires_at=lease.expires_at,
+                expected_control_version=control.control_version,
+                now=now,
+            )
+            if committed is None:
+                raise self._stale_turn_claim(claim)
+            updated_state = self._advance_state(state, now)
+            self._event(
+                claim.project_id,
+                f"turn.{result.status}",
+                claim.turn_id,
+                {
+                    "attempt_id": claim.attempt_id,
+                    "fencing_token": claim.fencing_token,
+                    "lease_generation": claim.lease_generation,
+                    "turn_id": claim.turn_id,
+                    "version": updated_state.version,
+                },
+                now,
+            )
+            return self._turn_from_record(committed)
+
+    def reconcile_inflight_turns(
+        self,
+        readback: TurnReadbackPort,
+        *,
+        limit: int,
+    ) -> tuple[ProjectTurn, ...]:
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 100
+            or not callable(getattr(readback, "read_turn", None))
+            or self._conn.in_transaction
+        ):
+            raise ProjectRuntimeError(RuntimeErrorCode.INVALID_ARGUMENT)
+        now = self._now()
+        candidates = runtime_db._recovery_candidates(
+            self._conn, now=now, limit=limit
+        )
+        parked: list[
+            ProjectTurn | runtime_db.RecoveryCandidateRecord
+        ] = []
+        for selected in candidates:
+            candidate = self._park_recovery_candidate(selected, now=now)
+            if candidate is None:
+                current = runtime_db._runtime_turn_for_project(
+                    self._conn,
+                    project_id=selected.project_id,
+                    turn_id=selected.turn_id,
+                )
+                if current is not None and current.status not in {
+                    "claimed",
+                    "stop_requested",
+                    "awaiting_approval",
+                }:
+                    parked.append(self._turn_from_record(current))
+                continue
+            parked.append(candidate)
+
+        recovered: list[ProjectTurn] = []
+        for item in parked:
+            if type(item) is ProjectTurn:
+                recovered.append(item)
+                continue
+            candidate = item
+            result_id = None
+            if candidate.execution_state == "not_started":
+                if candidate.source_status == "stop_requested":
+                    outcome = "stopped"
+                elif candidate.lifecycle == "active":
+                    outcome = "queued"
+                else:
+                    recovered.append(
+                        self._block_recovery(candidate, now=now)
+                    )
+                    continue
+            else:
+                request = TurnReadbackRequest(
+                    project_id=candidate.project_id,
+                    turn_id=candidate.turn_id,
+                    sequence=candidate.sequence,
+                    worker_id=candidate.worker_id,
+                    attempt_id=candidate.attempt_id,
+                    lease_generation=candidate.lease_generation,
+                    fencing_token=candidate.fencing_token,
+                    lease_expires_at=candidate.lease_expires_at,
+                    canonical_session_id=candidate.canonical_session_id,
+                    source_status=candidate.source_status,
+                    execution_state=candidate.execution_state,
+                )
+                try:
+                    result = readback.read_turn(request)
+                except Exception:
+                    recovered.append(
+                        self._block_recovery(candidate, now=now)
+                    )
+                    continue
+                if not self._valid_readback_result(
+                    result, source_status=candidate.source_status
+                ):
+                    recovered.append(
+                        self._block_recovery(candidate, now=now)
+                    )
+                    continue
+                if result.outcome == "unknown":
+                    recovered.append(
+                        self._block_recovery(candidate, now=now)
+                    )
+                    continue
+                outcome = result.outcome
+                if outcome in {"succeeded", "failed"}:
+                    result_id = result.result_id
+            recovered.append(
+                self._finalize_recovery(
+                    candidate,
+                    outcome=outcome,
+                    result_id=result_id,
+                    now=now,
+                )
+            )
+        return tuple(recovered)
+
+    @staticmethod
+    def _valid_readback_result(
+        result: object,
+        *,
+        source_status: str,
+    ) -> bool:
+        if type(result) is not TurnReadbackResult:
+            return False
+        if result.outcome in {"succeeded", "failed"}:
+            return _is_text(result.result_id)
+        if result.outcome not in {"stopped", "unknown"}:
+            return False
+        if result.result_id is not None:
+            return False
+        return result.outcome != "stopped" or source_status == "stop_requested"
+
+    def _park_recovery_candidate(
+        self,
+        selected: runtime_db.RecoveryCandidateRecord,
+        *,
+        now: int,
+    ) -> runtime_db.RecoveryCandidateRecord | None:
+        with runtime_db.write_transaction(self._conn):
+            turn = runtime_db._runtime_turn_for_project(
+                self._conn,
+                project_id=selected.project_id,
+                turn_id=selected.turn_id,
+            )
+            if turn is not None and turn.status in {
+                "claimed",
+                "stop_requested",
+            }:
+                parked = runtime_db._park_expired_runtime_turn(
+                    self._conn, candidate=selected, now=now
+                )
+                if parked is not None:
+                    state = runtime_db.runtime_state_for_project(
+                        self._conn, selected.project_id
+                    )
+                    if state is None:
+                        raise RuntimeError(
+                            "recovery candidate has no runtime state"
+                        )
+                    updated_state = self._advance_state(state, now)
+                    self._event(
+                        selected.project_id,
+                        "turn.reconciling",
+                        selected.turn_id,
+                        {
+                            "attempt_id": selected.attempt_id,
+                            "fencing_token": selected.fencing_token,
+                            "lease_generation": selected.lease_generation,
+                            "source_status": selected.source_status,
+                            "turn_id": selected.turn_id,
+                            "version": updated_state.version,
+                        },
+                        now,
+                    )
+            candidate = runtime_db._recovery_candidate_for_attempt(
+                self._conn,
+                project_id=selected.project_id,
+                turn_id=selected.turn_id,
+                attempt_id=selected.attempt_id,
+                lease_generation=selected.lease_generation,
+                fencing_token=selected.fencing_token,
+            )
+            if candidate is None or runtime_db._recovery_block_exists(
+                self._conn,
+                project_id=selected.project_id,
+                turn_id=selected.turn_id,
+                attempt_id=selected.attempt_id,
+                lease_generation=selected.lease_generation,
+                fencing_token=selected.fencing_token,
+            ):
+                return None
+            return candidate
+
+    def _finalize_recovery(
+        self,
+        candidate: runtime_db.RecoveryCandidateRecord,
+        *,
+        outcome: str,
+        result_id: str | None,
+        now: int,
+    ) -> ProjectTurn:
+        with runtime_db.write_transaction(self._conn):
+            current_candidate = runtime_db._recovery_candidate_for_attempt(
+                self._conn,
+                project_id=candidate.project_id,
+                turn_id=candidate.turn_id,
+                attempt_id=candidate.attempt_id,
+                lease_generation=candidate.lease_generation,
+                fencing_token=candidate.fencing_token,
+            )
+            if current_candidate is None:
+                current = self._turn(
+                    candidate.project_id, candidate.turn_id
+                )
+                return self._turn_from_record(current)
+            updated = runtime_db._apply_recovery_outcome(
+                self._conn,
+                candidate=current_candidate,
+                outcome=outcome,
+                terminal_result_id=result_id,
+                now=now,
+            )
+            if updated is None:
+                return self._turn_from_record(
+                    self._turn(candidate.project_id, candidate.turn_id)
+                )
+            state = runtime_db.runtime_state_for_project(
+                self._conn, candidate.project_id
+            )
+            if state is None:
+                raise RuntimeError("recovery candidate has no runtime state")
+            updated_state = self._advance_state(state, now)
+            event_kind = {
+                "queued": "turn.requeued",
+                "stopped": "run.stopped",
+                "succeeded": "turn.succeeded",
+                "failed": "turn.failed",
+            }[outcome]
+            self._event(
+                candidate.project_id,
+                event_kind,
+                candidate.turn_id,
+                {
+                    "attempt_id": candidate.attempt_id,
+                    "fencing_token": candidate.fencing_token,
+                    "lease_generation": candidate.lease_generation,
+                    "source_status": candidate.source_status,
+                    "turn_id": candidate.turn_id,
+                    "version": updated_state.version,
+                },
+                now,
+            )
+            return self._turn_from_record(updated)
+
+    def _block_recovery(
+        self,
+        candidate: runtime_db.RecoveryCandidateRecord,
+        *,
+        now: int,
+    ) -> ProjectTurn:
+        with runtime_db.write_transaction(self._conn):
+            current_candidate = runtime_db._recovery_candidate_for_attempt(
+                self._conn,
+                project_id=candidate.project_id,
+                turn_id=candidate.turn_id,
+                attempt_id=candidate.attempt_id,
+                lease_generation=candidate.lease_generation,
+                fencing_token=candidate.fencing_token,
+            )
+            if current_candidate is None:
+                return self._turn_from_record(
+                    self._turn(candidate.project_id, candidate.turn_id)
+                )
+            if not runtime_db._recovery_block_exists(
+                self._conn,
+                project_id=candidate.project_id,
+                turn_id=candidate.turn_id,
+                attempt_id=candidate.attempt_id,
+                lease_generation=candidate.lease_generation,
+                fencing_token=candidate.fencing_token,
+            ):
+                state = runtime_db.runtime_state_for_project(
+                    self._conn, candidate.project_id
+                )
+                if state is None:
+                    raise RuntimeError(
+                        "recovery candidate has no runtime state"
+                    )
+                updated_state = self._advance_state(state, now)
+                payload = {
+                    "attempt_id": candidate.attempt_id,
+                    "fencing_token": candidate.fencing_token,
+                    "lease_generation": candidate.lease_generation,
+                    "source_status": candidate.source_status,
+                    "turn_id": candidate.turn_id,
+                    "version": updated_state.version,
+                }
+                identity = canonical_json_object(
+                    {
+                        "attempt_id": candidate.attempt_id,
+                        "fencing_token": candidate.fencing_token,
+                        "lease_generation": candidate.lease_generation,
+                        "project_id": candidate.project_id,
+                        "turn_id": candidate.turn_id,
+                    }
+                )
+                runtime_db._append_runtime_event(
+                    self._conn,
+                    event_id=(
+                        "recovery-blocked-"
+                        f"{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
+                    ),
+                    project_id=candidate.project_id,
+                    kind="turn.recovery_blocked",
+                    turn_id=candidate.turn_id,
+                    payload_json=canonical_json_object(payload),
+                    created_at=now,
+                )
+            return self._turn_from_record(
+                self._turn(candidate.project_id, candidate.turn_id)
+            )
 
     def enqueue_turn(
         self,
@@ -498,6 +1134,8 @@ class ProjectRuntime:
         if type(lease_seconds) is not int or lease_seconds <= 0:
             raise ProjectRuntimeError(RuntimeErrorCode.INVALID_ARGUMENT)
         now = self._now()
+        if now > SQLITE_INT_MAX - lease_seconds:
+            raise ProjectRuntimeError(RuntimeErrorCode.INVALID_ARGUMENT)
         with runtime_db.write_transaction(self._conn):
             state = self._require_state(project_id)
             self._require_active(state)
@@ -799,6 +1437,7 @@ class ProjectRuntime:
                 and state.conversation_tip_id == claim.canonical_session_id
                 and stored_claim_matches
                 and self._current_lease_matches(lease, claim)
+                and lease.expires_at > now
             ):
                 raise ProjectRuntimeError(
                     RuntimeErrorCode.TURN_NOT_STOP_REQUESTED,
@@ -824,7 +1463,7 @@ class ProjectRuntime:
                 attempt_id=claim.attempt_id, worker_id=claim.worker_id,
                 lease_generation=claim.lease_generation,
                 fencing_token=claim.fencing_token,
-                lease_expires_at=claim.lease_expires_at,
+                lease_expires_at=lease.expires_at,
             ):
                 raise ProjectRuntimeError(
                     RuntimeErrorCode.TURN_NOT_STOP_REQUESTED,
@@ -968,6 +1607,7 @@ class ProjectRuntime:
                 and lease.lease_generation == turn.lease_generation
                 and lease.fencing_token == turn.fencing_token
                 and lease.expires_at == control.claim_lease_expires_at
+                and lease.expires_at > now
             ):
                 raise ProjectRuntimeError(
                     RuntimeErrorCode.TURN_NOT_CLAIMED,

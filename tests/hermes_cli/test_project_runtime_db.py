@@ -1163,6 +1163,26 @@ def _consumed_at(conn, request):
     ).fetchone()[0]
 
 
+def _link_approval_without_control_proof(conn, request):
+    _insert_turn(
+        conn,
+        turn_id="legacy-turn",
+        project_id=request.project_id,
+        sequence=1,
+        idempotency_key="legacy-turn",
+    )
+    conn.execute(
+        """
+        UPDATE project_approvals
+        SET turn_id = 'legacy-turn',
+            turn_expected_control_version = NULL
+        WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    )
+    conn.commit()
+
+
 def _insert_completed_operation(conn, operation_id):
     conn.execute(
         """
@@ -1382,6 +1402,15 @@ def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
     request = prdb.create_approval_request(
         runtime_conn, _approval_request(), now=10
     )
+    generic_boundary = runtime_conn.execute(
+        """
+        SELECT turn_id, turn_expected_control_version
+        FROM project_approvals
+        WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    ).fetchone()
+    assert tuple(generic_boundary) == (None, None)
 
     rejected = prdb.resolve_approval(
         runtime_conn,
@@ -1406,6 +1435,72 @@ def test_owner_resolution_and_single_consumption_bind_the_full_approval_batch(
     authorization = _authorization_args(request)
     assert prdb.consume_approval_authorization(runtime_conn, **authorization) is True
     assert prdb.consume_approval_authorization(runtime_conn, **authorization) is False
+
+
+@pytest.mark.parametrize("outcome", ["approved", "denied"])
+def test_linked_approval_without_control_proof_cannot_be_resolved(
+    runtime_conn, outcome
+):
+    _insert_approval_project(runtime_conn)
+    _insert_owner_binding(runtime_conn)
+    request = prdb.create_approval_request(
+        runtime_conn, _approval_request(), now=10
+    )
+    _link_approval_without_control_proof(runtime_conn, request)
+    before = tuple(runtime_conn.execute(
+        """
+        SELECT status, resolved_at, resolved_by_actor_id
+        FROM project_approvals
+        WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    ).fetchone())
+
+    resolved = _resolve_as_owner(
+        runtime_conn, request, outcome=outcome, now=11
+    )
+
+    after = tuple(runtime_conn.execute(
+        """
+        SELECT status, resolved_at, resolved_by_actor_id
+        FROM project_approvals
+        WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    ).fetchone())
+    assert resolved is None
+    assert before == after == ("pending", None, None)
+
+
+def test_linked_approved_approval_without_control_proof_cannot_be_consumed(
+    runtime_conn,
+):
+    _insert_approval_project(runtime_conn)
+    request = _create_approved_request(runtime_conn)
+    _link_approval_without_control_proof(runtime_conn, request)
+    before = tuple(runtime_conn.execute(
+        """
+        SELECT status, consumed_at
+        FROM project_approvals
+        WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    ).fetchone())
+
+    consumed = prdb.consume_approval_authorization(
+        runtime_conn, **_authorization_args(request, now=12)
+    )
+
+    after = tuple(runtime_conn.execute(
+        """
+        SELECT status, consumed_at
+        FROM project_approvals
+        WHERE approval_id = ?
+        """,
+        (request.approval_id,),
+    ).fetchone())
+    assert consumed is False
+    assert before == after == ("approved", None)
 
 
 @pytest.mark.parametrize("malformed_value", UNHASHABLE_ENUM_VALUES)

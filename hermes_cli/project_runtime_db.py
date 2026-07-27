@@ -2146,6 +2146,10 @@ def resolve_approval(
               AND actor_id = ?
               AND authorization_actor_id = ?
               AND canonical_action IS NOT NULL
+              AND (
+                  approval.turn_id IS NULL
+                  OR approval.turn_expected_control_version IS NOT NULL
+              )
               AND status = 'pending'
               AND expires_at > ?
               AND EXISTS (
@@ -2314,6 +2318,10 @@ def consume_approval_authorization(
               AND expected_phase = ?
               AND targets_json = ?
               AND batch_boundary_json = ?
+              AND (
+                  approval.turn_id IS NULL
+                  OR approval.turn_expected_control_version IS NOT NULL
+              )
               AND status = 'approved'
               AND expires_at > ?
               AND consumed_at IS NULL

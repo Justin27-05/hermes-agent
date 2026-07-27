@@ -284,8 +284,23 @@ def main() -> int:
         "start",
         "reconcile",
         "rehydrate_config",
+        "no_ready",
+        "early_exit",
+        "malformed_ready",
+        "wrong_ready",
     }:
         return 2
+    if mode == "early_exit":
+        return 3
+    if mode == "malformed_ready":
+        print("{not-json", flush=True)
+        return 3
+    if mode == "wrong_ready":
+        _emit({"phase": "not-ready", "pid": os.getpid()})
+        return 3
+    if mode == "no_ready":
+        sys.stdin.readline()
+        return 3
     _emit({"phase": "ready", "pid": os.getpid()})
     try:
         command = json.loads(sys.stdin.readline())

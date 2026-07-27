@@ -5,9 +5,11 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import queue
 import sqlite3
 import subprocess
 import sys
+import threading
 from dataclasses import FrozenInstanceError, fields, replace
 from enum import Enum
 from types import MappingProxyType
@@ -36,6 +38,8 @@ TASK6_COLUMNS = {
     "receipt_id",
     "readback_json",
     "blocked_reason",
+    "remote_idempotency_supported",
+    "approval_fingerprint_json",
 }
 
 TASK6_INDEXES = {
@@ -235,6 +239,7 @@ def test_public_operation_contract_is_exact_frozen_and_secret_safe():
         "batch_items",
         "payload",
         "readback_kind",
+        "remote_idempotency_supported",
     )
     assert tuple(field.name for field in fields(module.OperationReceipt)) == (
         "receipt_id",
@@ -316,6 +321,7 @@ def test_public_operation_contract_is_exact_frozen_and_secret_safe():
         batch_items=("write-file",),
         payload=payload,
         readback_kind="remote-ledger",
+        remote_idempotency_supported=True,
     )
     payload["nested"][1]["ok"] = False
     assert intent.payload == {"nested": (1, MappingProxyType({"ok": True}))}
@@ -433,11 +439,12 @@ def test_managed_operation_mapper_rejects_noncanonical_json(operation_conn):
             command_revision, targets_json, payload_json, status,
             created_at, updated_at, guard_revision, canonical_action,
             batch_items_json, readback_kind, attempt_id,
-            lease_generation, fencing_token
+            lease_generation, fencing_token,
+            remote_idempotency_supported
         ) VALUES (
             'malformed-managed', ?, 'turn', 'remote-key', 1,
             '[ "C:/work" ]', '{}', 'approved', 1, 1, 1,
-            'local_code_edit', '["item"]', 'ledger', 'attempt', 1, 1
+            'local_code_edit', '["item"]', 'ledger', 'attempt', 1, 1, 1
         )
         """,
         (project_id,),
@@ -557,6 +564,8 @@ def test_operation_mapper_rejects_exact_type_impostors(mutation):
         "receipt_id": None,
         "readback_json": None,
         "blocked_reason": None,
+        "remote_idempotency_supported": 1,
+        "approval_fingerprint_json": None,
     }
     row.update(mutation)
 
@@ -574,6 +583,7 @@ def _intent(
     batch_items=("write-file",),
     payload=None,
     readback_kind="remote-ledger",
+    remote_idempotency_supported=True,
 ):
     module = operation_env["module"]
     return module.OperationIntent(
@@ -587,6 +597,9 @@ def _intent(
         batch_items=batch_items,
         payload=payload or {"content_digest": "sha256:abc"},
         readback_kind=readback_kind,
+        remote_idempotency_supported=(
+            remote_idempotency_supported
+        ),
     )
 
 
@@ -1400,6 +1413,186 @@ def test_stale_boundary_finalizes_before_actor_validation(
     )
 
 
+class _OperationProbeHandle:
+    def __init__(self, process):
+        self.process = process
+        self.stdout = queue.Queue()
+        self.stderr = []
+        self.threads = [
+            threading.Thread(
+                target=self._pump_stdout,
+                name=f"operation-probe-stdout-{process.pid}",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._pump_stderr,
+                name=f"operation-probe-stderr-{process.pid}",
+                daemon=True,
+            ),
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def _pump_stdout(self):
+        assert self.process.stdout is not None
+        for line in self.process.stdout:
+            self.stdout.put(line)
+        self.stdout.put(None)
+
+    def _pump_stderr(self):
+        assert self.process.stderr is not None
+        self.stderr.extend(self.process.stderr)
+
+    def expect_ready_line(self, *, timeout):
+        try:
+            line = self.stdout.get(timeout=timeout)
+        except queue.Empty as exc:
+            raise AssertionError(
+                "operation probe timed out waiting for ready"
+            ) from exc
+        if line is None:
+            raise AssertionError(
+                "operation probe exited before ready; "
+                f"returncode={self.process.poll()}; "
+                f"stderr={''.join(self.stderr)!r}"
+            )
+        return line
+
+    def join_readers(self):
+        for thread in self.threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive(), (
+                f"operation probe reader {thread.name} did not stop"
+            )
+
+    def drain_stdout(self):
+        lines = []
+        while True:
+            try:
+                line = self.stdout.get_nowait()
+            except queue.Empty:
+                break
+            if line is not None:
+                lines.append(line)
+        return lines
+
+
+class _OperationProbeSet:
+    def __init__(self):
+        self.processes = []
+        self.handles = {}
+
+    def register(self, process):
+        self.processes.append(process)
+        self.handles[process] = None
+        handle = _OperationProbeHandle(process)
+        self.handles[process] = handle
+        return handle
+
+    @staticmethod
+    def _close_streams(process):
+        for stream in (
+            process.stdin,
+            process.stdout,
+            process.stderr,
+        ):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+    def _remove(self, process):
+        if process in self.processes:
+            self.processes.remove(process)
+        self.handles.pop(process, None)
+
+    def discard_finished(self):
+        for process in tuple(self.processes):
+            if process.poll() is not None:
+                self.collect(process, timeout=5)
+
+    def collect(self, process, *, timeout):
+        handle = self.handles[process]
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError(
+                "operation probe timed out while finishing"
+            ) from exc
+        if handle is not None:
+            handle.join_readers()
+            lines = handle.drain_stdout()
+            stderr = "".join(handle.stderr)
+        else:
+            lines = []
+            stderr = ""
+        self._close_streams(process)
+        self._remove(process)
+        return returncode, lines, stderr
+
+    def cleanup(self, primary_exception=None):
+        errors = []
+        processes = tuple(self.processes)
+
+        for index, process in enumerate(processes):
+            try:
+                alive = process.poll() is None
+            except BaseException as exc:
+                errors.append(f"process {index} poll: {exc!r}")
+                alive = True
+            if alive:
+                try:
+                    process.kill()
+                except BaseException as exc:
+                    errors.append(f"process {index} kill: {exc!r}")
+
+        for index, process in enumerate(processes):
+            try:
+                process.wait(timeout=5)
+            except BaseException as exc:
+                errors.append(f"process {index} wait: {exc!r}")
+
+        for index, process in enumerate(processes):
+            try:
+                self._close_streams(process)
+            except BaseException as exc:
+                errors.append(f"process {index} stream close: {exc!r}")
+
+        for index, process in enumerate(processes):
+            handle = self.handles.get(process)
+            if handle is None:
+                continue
+            for thread_index, thread in enumerate(handle.threads):
+                try:
+                    thread.join(timeout=5)
+                    if thread.is_alive():
+                        errors.append(
+                            f"process {index} reader {thread_index} "
+                            "did not stop"
+                        )
+                except BaseException as exc:
+                    errors.append(
+                        f"process {index} reader {thread_index}: {exc!r}"
+                    )
+
+        for process in processes:
+            try:
+                if process.poll() is not None:
+                    self._remove(process)
+            except BaseException as exc:
+                errors.append(f"process final poll: {exc!r}")
+
+        if errors:
+            message = "operation probe cleanup failed: " + "; ".join(
+                errors
+            )
+            if primary_exception is not None:
+                primary_exception.add_note(message)
+            else:
+                raise AssertionError(message)
+
+
+_OPERATION_PROBES = _OperationProbeSet()
+
+
 def _start_operation_probe(
     operation_env,
     *,
@@ -1407,48 +1600,267 @@ def _start_operation_probe(
     now,
     outcome="approved",
     binding_id="desktop-owner",
+    ready_timeout=15,
 ):
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            str(OPERATION_PROBE),
-            str(operation_env["conn"].execute(
-                "PRAGMA database_list"
-            ).fetchone()["file"]),
-            mode,
-            str(now),
-            outcome,
-            binding_id,
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-    )
-    assert process.stdout is not None
-    ready = json.loads(process.stdout.readline())
-    assert ready["phase"] == "ready"
-    return process
+    try:
+        _OPERATION_PROBES.discard_finished()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(OPERATION_PROBE),
+                str(
+                    operation_env["conn"]
+                    .execute("PRAGMA database_list")
+                    .fetchone()["file"]
+                ),
+                mode,
+                str(now),
+                outcome,
+                binding_id,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        handle = _OPERATION_PROBES.register(process)
+        line = handle.expect_ready_line(timeout=ready_timeout)
+        try:
+            ready = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"operation probe returned invalid ready payload: {line!r}"
+            ) from exc
+        if not isinstance(ready, dict) or ready.get("phase") != "ready":
+            raise AssertionError(
+                "operation probe returned unexpected ready payload: "
+                f"{ready!r}"
+            )
+        return process
+    except BaseException as exc:
+        _OPERATION_PROBES.cleanup(exc)
+        raise
 
 
 def _release_operation_probe(process):
-    assert process.stdin is not None
-    process.stdin.write('{"command":"go"}\n')
-    process.stdin.flush()
-
-
-def _finish_operation_probe(process):
     try:
-        stdout, stderr = process.communicate(timeout=15)
+        if process.stdin is None or process.stdin.closed:
+            raise ValueError("operation probe stdin is unavailable")
+        process.stdin.write('{"command":"go"}\n')
+        process.stdin.flush()
+    except BaseException as exc:
+        failure = AssertionError(
+            f"operation probe release failed: {exc!r}"
+        )
+        _OPERATION_PROBES.cleanup(failure)
+        raise failure from exc
+
+
+def _finish_operation_probe(process, *, timeout=15):
+    try:
+        returncode, lines, stderr = _OPERATION_PROBES.collect(
+            process, timeout=timeout
+        )
+        assert returncode == 0, stderr
+        assert len(lines) == 1, lines
+        try:
+            return json.loads(lines[0])
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                "operation probe returned invalid result payload: "
+                f"{lines[0]!r}"
+            ) from exc
+    except BaseException as exc:
+        _OPERATION_PROBES.cleanup(exc)
+        raise
+
+
+@pytest.fixture
+def recorded_operation_probe_processes(monkeypatch):
+    original_popen = subprocess.Popen
+    record = {"processes": [], "fail_next": False}
+
+    def recording_popen(*args, **kwargs):
+        if record["fail_next"]:
+            record["fail_next"] = False
+            raise OSError("operation probe spawn failed")
+        process = original_popen(*args, **kwargs)
+        record["processes"].append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    try:
+        yield record
     finally:
-        if process.poll() is None:
-            process.kill()
+        for process in record["processes"]:
+            if process.poll() is None:
+                process.kill()
+        for process in record["processes"]:
             process.wait(timeout=5)
-    assert process.returncode == 0, stderr
-    lines = [line for line in stdout.splitlines() if line]
-    assert len(lines) == 1
-    return json.loads(lines[0])
+            for stream in (
+                process.stdin,
+                process.stdout,
+                process.stderr,
+            ):
+                if stream is not None and not stream.closed:
+                    stream.close()
+
+
+def _assert_operation_probes_reaped(record, *, expected_count):
+    processes = record["processes"]
+    assert len(processes) == expected_count
+    for process in processes:
+        assert process.poll() is not None
+        assert process.wait(timeout=5) == process.returncode
+        assert all(
+            stream is None or stream.closed
+            for stream in (
+                process.stdin,
+                process.stdout,
+                process.stderr,
+            )
+        )
+
+
+def test_probe_ready_timeout_reaps_no_ready_child(
+    operation_env, recorded_operation_probe_processes
+):
+    with pytest.raises(
+        AssertionError, match="timed out waiting for ready"
+    ):
+        _start_operation_probe(
+            operation_env,
+            mode="no_ready",
+            now=100,
+            ready_timeout=0.2,
+        )
+
+    _assert_operation_probes_reaped(
+        recorded_operation_probe_processes,
+        expected_count=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        pytest.param(
+            "early_exit", "exited before ready", id="early-exit"
+        ),
+        pytest.param(
+            "malformed_ready",
+            "invalid ready payload",
+            id="malformed",
+        ),
+        pytest.param(
+            "wrong_ready",
+            "unexpected ready payload",
+            id="wrong-phase",
+        ),
+    ],
+)
+def test_probe_ready_failure_reaps_existing_sibling_and_failed_child(
+    operation_env,
+    recorded_operation_probe_processes,
+    mode,
+    message,
+):
+    _start_operation_probe(
+        operation_env,
+        mode="resolve",
+        now=100,
+    )
+
+    with pytest.raises(AssertionError, match=message):
+        _start_operation_probe(
+            operation_env,
+            mode=mode,
+            now=100,
+            ready_timeout=2,
+        )
+
+    _assert_operation_probes_reaped(
+        recorded_operation_probe_processes,
+        expected_count=2,
+    )
+
+
+def test_probe_partial_spawn_failure_reaps_existing_sibling(
+    operation_env, recorded_operation_probe_processes
+):
+    _start_operation_probe(
+        operation_env,
+        mode="resolve",
+        now=100,
+    )
+    recorded_operation_probe_processes["fail_next"] = True
+
+    with pytest.raises(OSError, match="operation probe spawn failed"):
+        _start_operation_probe(
+            operation_env,
+            mode="expire",
+            now=100,
+        )
+
+    _assert_operation_probes_reaped(
+        recorded_operation_probe_processes,
+        expected_count=1,
+    )
+
+
+def test_probe_release_failure_reaps_whole_childset(
+    operation_env, recorded_operation_probe_processes
+):
+    processes = [
+        _start_operation_probe(
+            operation_env,
+            mode="resolve",
+            now=100,
+        ),
+        _start_operation_probe(
+            operation_env,
+            mode="expire",
+            now=100,
+        ),
+    ]
+    assert processes[0].stdin is not None
+    processes[0].stdin.close()
+
+    with pytest.raises(AssertionError, match="release failed"):
+        _release_operation_probe(processes[0])
+
+    _assert_operation_probes_reaped(
+        recorded_operation_probe_processes,
+        expected_count=2,
+    )
+
+
+def test_probe_finish_timeout_reaps_whole_childset(
+    operation_env, recorded_operation_probe_processes
+):
+    processes = [
+        _start_operation_probe(
+            operation_env,
+            mode="resolve",
+            now=100,
+        ),
+        _start_operation_probe(
+            operation_env,
+            mode="expire",
+            now=100,
+        ),
+    ]
+
+    with pytest.raises(
+        AssertionError, match="timed out while finishing"
+    ):
+        _finish_operation_probe(processes[0], timeout=0.2)
+
+    _assert_operation_probes_reaped(
+        recorded_operation_probe_processes,
+        expected_count=2,
+    )
 
 
 @pytest.mark.parametrize("_iteration", range(25))
@@ -1586,16 +1998,14 @@ def test_resolution_process_crash_before_and_after_commit_is_durable(
         operation_env, mode="crash_before", now=101
     )
     _release_operation_probe(before_crash)
-    before_crash.wait(timeout=15)
-    assert before_crash.returncode == 71
+    _finish_crashed_probe(before_crash, 71)
     assert before == _operation_snapshot(operation_env)
 
     after_crash = _start_operation_probe(
         operation_env, mode="crash_after", now=101
     )
     _release_operation_probe(after_crash)
-    after_crash.wait(timeout=15)
-    assert after_crash.returncode == 72
+    _finish_crashed_probe(after_crash, 72)
     operation = prdb._project_operation_for_id(
         conn,
         project_id=operation_env["project_id"],
@@ -1639,6 +2049,8 @@ def test_mapper_accepts_authoritative_not_applied_evidence_on_approved_operation
             '"outcome":"not_applied"}'
         ),
         "blocked_reason": None,
+        "remote_idempotency_supported": 1,
+        "approval_fingerprint_json": None,
     }
 
     operation = prdb.project_operation_from_row(row)
@@ -2899,7 +3311,10 @@ def test_task5_recovery_uses_operation_guard_without_turn_readback(
             turn_id=operation_env["turn"].turn_id,
         )
         assert stored is not None
-        assert stored.recovery_block_key is not None
+        if operation_state == "approved":
+            assert stored.recovery_block_key is None
+        else:
+            assert stored.recovery_block_key is not None
 
 
 def _operation_db_path(operation_env):
@@ -2960,12 +3375,14 @@ def _start_config_probe(
 
 def _finish_crashed_probe(process, expected_code):
     try:
-        stdout, stderr = process.communicate(timeout=15)
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=5)
-    assert process.returncode == expected_code, (stdout, stderr)
+        returncode, lines, stderr = _OPERATION_PROBES.collect(
+            process, timeout=15
+        )
+        assert returncode == expected_code, (lines, stderr)
+        assert lines == []
+    except BaseException as exc:
+        _OPERATION_PROBES.cleanup(exc)
+        raise
 
 
 @pytest.mark.parametrize(
@@ -3201,3 +3618,1511 @@ def test_stale_starter_loses_to_fresh_rehydration_process(
     assert len(claims) == 1
     assert claims[0]["lease_generation"] == 2
     assert claims[0]["fencing_token"] == 2
+
+
+class _PhaseACrash(BaseException):
+    pass
+
+
+class _CrashAfterPhaseA:
+    def read_operation(self, request):
+        raise _PhaseACrash
+
+
+@pytest.mark.parametrize(
+    "readback_case",
+    [
+        pytest.param("equal", id="equal"),
+        pytest.param("mismatch", id="mismatch"),
+        pytest.param("missing", id="missing"),
+        pytest.param("not_applied", id="not-applied"),
+    ],
+)
+def test_phase_a_crash_preserves_receipt_authority_across_restart(
+    operation_env, readback_case
+):
+    _prepare_allowed(operation_env)
+    operation_env["guard"].mark_started(
+        operation_env["claim"], "operation-1"
+    )
+    original = _receipt(
+        operation_env,
+        receipt_id="receipt-original",
+        payload={"provider_sequence": 1},
+    )
+    operation_env["guard"].record_receipt(
+        operation_env["claim"], "operation-1", original
+    )
+
+    with pytest.raises(_PhaseACrash):
+        operation_env["guard"].reconcile(
+            operation_env["claim"],
+            "operation-1",
+            _CrashAfterPhaseA(),
+        )
+
+    stored = operation_env["conn"].execute(
+        """
+        SELECT status, receipt_id, receipt_json
+        FROM project_operations WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()
+    assert tuple(stored) == (
+        "unknown",
+        "receipt-original",
+        '{"provider_sequence":1}',
+    )
+    db_path = _operation_db_path(operation_env)
+    operation_env["conn"].close()
+    reopened = projects_db.connect(db_path)
+    operation_env["conn"] = reopened
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    runtime = runtime_module.ProjectRuntime(
+        reopened, clock=lambda: 101
+    )
+    guard = operation_env["module"].ProjectOperationGuard(runtime)
+    if readback_case == "equal":
+        result = _readback_result(
+            operation_env,
+            "applied",
+            evidence={"ledger": "complete"},
+            receipt=original,
+        )
+    elif readback_case == "mismatch":
+        result = _readback_result(
+            operation_env,
+            "applied",
+            evidence={"ledger": "complete"},
+            receipt=_receipt(
+                operation_env,
+                receipt_id="receipt-conflicting",
+                payload={"provider_sequence": 999},
+            ),
+        )
+    elif readback_case == "missing":
+        result = _readback_result(
+            operation_env,
+            "applied",
+            evidence={"ledger": "complete"},
+            receipt=None,
+        )
+    else:
+        result = _readback_result(
+            operation_env,
+            "not_applied",
+            evidence={"ledger": "complete", "present": False},
+            receipt=None,
+        )
+    port = _Readback(reopened, result)
+
+    resolved = guard.reconcile(
+        operation_env["claim"], "operation-1", port
+    )
+
+    assert port.requests[0].receipt == original
+    assert resolved.status == (
+        "reconciled" if readback_case == "equal" else "blocked"
+    )
+    assert resolved.receipt_id == "receipt-original"
+    persisted = reopened.execute(
+        """
+        SELECT receipt_id, receipt_json
+        FROM project_operations WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()
+    assert tuple(persisted) == (
+        "receipt-original",
+        '{"provider_sequence":1}',
+    )
+    if readback_case != "equal":
+        assert reopened.execute(
+            """
+            SELECT COUNT(*) FROM project_events
+            WHERE project_id = ? AND kind = 'operation.blocked'
+            """,
+            (operation_env["project_id"],),
+        ).fetchone()[0] == 1
+
+
+def test_not_applied_revokes_old_claim_and_only_fresh_fence_restarts(
+    operation_env,
+):
+    _prepare_allowed(operation_env)
+    first = operation_env["guard"].mark_started(
+        operation_env["claim"], "operation-1"
+    )
+    before_control = prdb._runtime_control_for_turn(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+    )
+    assert before_control is not None
+
+    approved = operation_env["guard"].reconcile(
+        operation_env["claim"],
+        "operation-1",
+        _Readback(
+            operation_env["conn"],
+            _readback_result(
+                operation_env,
+                "not_applied",
+                evidence={"ledger": "complete", "present": False},
+                receipt=None,
+            ),
+        ),
+    )
+
+    assert approved.status == "approved"
+    turn = prdb._runtime_turn_for_project(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+    )
+    control = prdb._runtime_control_for_turn(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+    )
+    assert turn is not None and control is not None
+    assert turn.status == "reconciling"
+    assert turn.recovery_block_key is None
+    assert control.control_version == before_control.control_version + 1
+    assert prdb._current_worker_lease_for_turn(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+    ) is None
+    with pytest.raises(
+        operation_env["module"].ProjectOperationError
+    ) as old_start:
+        operation_env["guard"].mark_started(
+            operation_env["claim"], "operation-1"
+        )
+    assert (
+        old_start.value.code
+        is operation_env[
+            "module"
+        ].OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+
+    fresh = operation_env[
+        "guard"
+    ]._rehydrate_approved_operation(
+        operation_env["project_id"],
+        "operation-1",
+        worker_id="worker-fresh",
+        lease_seconds=30,
+    )
+    assert fresh is not None
+    assert fresh.attempt_id != first.attempt_id
+    assert fresh.lease_generation == first.lease_generation + 1
+    assert fresh.fencing_token == first.fencing_token + 1
+    restarted = operation_env["guard"].mark_started(
+        fresh, "operation-1"
+    )
+    assert restarted.status == "effect_started"
+    assert restarted.attempt_id == fresh.attempt_id
+
+
+def _prepare_reconciled_receipt_owner(
+    operation_env, *, receipt_id="shared-receipt"
+):
+    _prepare_allowed(operation_env)
+    operation_env["guard"].mark_started(
+        operation_env["claim"], "operation-1"
+    )
+    receipt = _receipt(
+        operation_env,
+        receipt_id=receipt_id,
+        payload={"provider_sequence": 1},
+    )
+    operation_env["guard"].record_receipt(
+        operation_env["claim"], "operation-1", receipt
+    )
+    operation_env["guard"].reconcile(
+        operation_env["claim"],
+        "operation-1",
+        _Readback(
+            operation_env["conn"],
+            _readback_result(
+                operation_env,
+                "applied",
+                evidence={"ledger": "complete"},
+                receipt=receipt,
+            ),
+        ),
+    )
+    return receipt
+
+
+def _prepare_second_allowed_operation(operation_env):
+    operation_env["guard"].prepare(
+        operation_env["claim"],
+        _intent(
+            operation_env,
+            operation_id="operation-2",
+            idempotency_key="remote-operation-2",
+            batch_items=("write-second",),
+        ),
+        policy=PolicyDecision(
+            Decision.ALLOW, "policy.allow.local", "allowed"
+        ),
+        approval=None,
+    )
+    operation_env["guard"].mark_started(
+        operation_env["claim"], "operation-2"
+    )
+
+
+def test_cross_operation_receipt_collision_is_stable_and_write_free(
+    operation_env,
+):
+    shared = _prepare_reconciled_receipt_owner(operation_env)
+    _prepare_second_allowed_operation(operation_env)
+    before = _operation_snapshot(operation_env)
+
+    with pytest.raises(
+        operation_env["module"].ProjectOperationError
+    ) as collision:
+        operation_env["guard"].record_receipt(
+            operation_env["claim"], "operation-2", shared
+        )
+
+    assert (
+        collision.value.code
+        is operation_env[
+            "module"
+        ].OperationErrorCode.OPERATION_RECEIPT_CONFLICT
+    )
+    assert before == _operation_snapshot(operation_env)
+
+
+def test_readback_receipt_collision_blocks_once_without_raw_sqlite(
+    operation_env,
+):
+    shared = _prepare_reconciled_receipt_owner(operation_env)
+    _prepare_second_allowed_operation(operation_env)
+    port = _Readback(
+        operation_env["conn"],
+        _readback_result(
+            operation_env,
+            "applied",
+            evidence={"ledger": "complete"},
+            receipt=shared,
+        ),
+    )
+
+    blocked = operation_env["guard"].reconcile(
+        operation_env["claim"], "operation-2", port
+    )
+    after_first = _operation_snapshot(operation_env)
+    replay = operation_env["guard"].reconcile(
+        operation_env["claim"], "operation-2", port
+    )
+
+    assert blocked == replay
+    assert blocked.status == "blocked"
+    assert blocked.blocked_reason == "operation_readback_ambiguous"
+    assert blocked.receipt_id is None
+    assert operation_env["conn"].execute(
+        """
+        SELECT COUNT(*) FROM project_events
+        WHERE project_id = ? AND kind = 'operation.blocked'
+        """,
+        (operation_env["project_id"],),
+    ).fetchone()[0] == 1
+    assert after_first == _operation_snapshot(operation_env)
+
+
+def _operation_to_pending_status(operation_env, status):
+    _prepare_allowed(operation_env)
+    if status == "approved":
+        return
+    operation_env["guard"].mark_started(
+        operation_env["claim"], "operation-1"
+    )
+    if status == "effect_started":
+        return
+    if status == "receipt_recorded":
+        operation_env["guard"].record_receipt(
+            operation_env["claim"],
+            "operation-1",
+            _receipt(operation_env),
+        )
+        return
+    with pytest.raises(_PhaseACrash):
+        operation_env["guard"].reconcile(
+            operation_env["claim"],
+            "operation-1",
+            _CrashAfterPhaseA(),
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["approved", "effect_started", "receipt_recorded", "unknown"],
+)
+def test_task5_parks_operation_pending_without_owning_recovery(
+    operation_env, status
+):
+    _operation_to_pending_status(operation_env, status)
+    before_operation = prdb._project_operation_for_id(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        operation_id="operation-1",
+    )
+    operation_env["now"][0] = 131
+
+    class NoTurnReadback:
+        calls = 0
+
+        def read_turn(self, request):
+            self.calls += 1
+            raise AssertionError(
+                "Task-5 must not read an operation-pending turn"
+            )
+
+    readback = NoTurnReadback()
+    recovered = operation_env["runtime"].reconcile_inflight_turns(
+        readback, limit=10
+    )
+
+    assert len(recovered) == 1
+    assert recovered[0].status == "reconciling"
+    stored_turn = prdb._runtime_turn_for_project(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+    )
+    stored_operation = prdb._project_operation_for_id(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        operation_id="operation-1",
+    )
+    assert stored_turn is not None and stored_operation is not None
+    assert stored_turn.recovery_block_key is None
+    assert prdb._current_worker_lease_for_turn(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+    ) is None
+    assert stored_operation == before_operation
+    assert readback.calls == 0
+    assert operation_env["conn"].execute(
+        """
+        SELECT COUNT(*) FROM project_events
+        WHERE project_id = ? AND kind IN (
+            'turn.recovery_blocked', 'turn.requeued',
+            'turn.succeeded', 'turn.failed'
+        )
+        """,
+        (operation_env["project_id"],),
+    ).fetchone()[0] == 0
+
+
+def _prepare_and_reconcile_named_operation(
+    operation_env,
+    *,
+    operation_id,
+    receipt_id,
+):
+    intent = _intent(
+        operation_env,
+        operation_id=operation_id,
+        idempotency_key=f"remote-{operation_id}",
+    )
+    operation_env["guard"].prepare(
+        operation_env["claim"],
+        intent,
+        policy=PolicyDecision(
+            Decision.ALLOW, "policy.allow.local", "allowed"
+        ),
+        approval=None,
+    )
+    operation_env["guard"].mark_started(
+        operation_env["claim"], operation_id
+    )
+    receipt = _receipt(
+        operation_env,
+        receipt_id=receipt_id,
+        payload={"provider_sequence": receipt_id},
+    )
+    operation_env["guard"].record_receipt(
+        operation_env["claim"], operation_id, receipt
+    )
+    operation_env["guard"].reconcile(
+        operation_env["claim"],
+        operation_id,
+        _Readback(
+            operation_env["conn"],
+            _readback_result(
+                operation_env,
+                "applied",
+                evidence={"ledger": "complete"},
+                receipt=receipt,
+            ),
+        ),
+    )
+
+
+def test_prepare_allows_terminal_history_but_second_unresolved_is_write_free(
+    operation_env,
+):
+    for ordinal in (1, 2):
+        _prepare_and_reconcile_named_operation(
+            operation_env,
+            operation_id=f"history-{ordinal}",
+            receipt_id=f"history-receipt-{ordinal}",
+        )
+    pre_effect = operation_env["guard"].prepare(
+        operation_env["claim"],
+        _intent(
+            operation_env,
+            operation_id="history-pre-effect",
+            idempotency_key="history-pre-effect-key",
+            readback_kind=None,
+        ),
+        policy=PolicyDecision(
+            Decision.ALLOW, "policy.allow.local", "allowed"
+        ),
+        approval=None,
+    )
+    assert (
+        pre_effect.status,
+        pre_effect.blocked_reason,
+    ) == ("blocked", "operation_capability_unsupported")
+    unresolved = operation_env["guard"].prepare(
+        operation_env["claim"],
+        _intent(
+            operation_env,
+            operation_id="current-unresolved",
+            idempotency_key="current-unresolved-key",
+        ),
+        policy=PolicyDecision(
+            Decision.ALLOW, "policy.allow.local", "allowed"
+        ),
+        approval=None,
+    )
+    assert unresolved.status == "approved"
+    before = _operation_snapshot(operation_env)
+
+    with pytest.raises(
+        operation_env["module"].ProjectOperationError
+    ) as conflict:
+        operation_env["guard"].prepare(
+            operation_env["claim"],
+            _intent(
+                operation_env,
+                operation_id="second-unresolved",
+                idempotency_key="second-unresolved-key",
+            ),
+            policy=PolicyDecision(
+                Decision.ALLOW, "policy.allow.local", "allowed"
+            ),
+            approval=None,
+        )
+
+    assert (
+        conflict.value.code
+        is operation_env["module"].OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert before == _operation_snapshot(operation_env)
+
+
+def _add_parked_operation_candidate(
+    conn,
+    *,
+    ordinal,
+    status,
+    updated_at,
+):
+    project_id = projects_db.create_project(
+        conn,
+        name=f"Pending {ordinal}",
+        folders=(f"C:/work/pending-{ordinal}",),
+    )
+    conversation_id = f"pending-session-{ordinal}"
+    prdb.create_project_conversation(
+        conn,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        current_phase="implementation",
+        now=1,
+    )
+    binding_id = f"pending-binding-{ordinal}"
+    prdb.bind_surface(
+        conn,
+        binding_id=binding_id,
+        project_id=project_id,
+        surface="desktop",
+        external_binding_id=f"window-{ordinal}",
+        actor_id="owner-1",
+        now=1,
+    )
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    module = importlib.import_module("hermes_cli.project_operations")
+    clock = [updated_at]
+    runtime = runtime_module.ProjectRuntime(
+        conn, clock=lambda: clock[0]
+    )
+    actor = ActorContext("owner-1", "desktop", binding_id, True)
+    turn = runtime.enqueue_turn(
+        project_id,
+        {"message": f"pending {ordinal}"},
+        actor,
+        idempotency_key=f"pending-turn-{ordinal}",
+        expected_version=0,
+    )
+    claim = runtime.claim_next_turn(
+        project_id, f"pending-worker-{ordinal}", lease_seconds=30
+    )
+    assert claim is not None
+    claim = runtime.mark_turn_started(claim)
+    guard = module.ProjectOperationGuard(runtime)
+    operation_id = f"pending-operation-{ordinal}"
+    intent = module.OperationIntent(
+        operation_id=operation_id,
+        project_id=project_id,
+        turn_id=turn.turn_id,
+        idempotency_key=f"pending-remote-{ordinal}",
+        canonical_action="local_code_edit",
+        command_revision=1,
+        targets=(f"C:/work/pending-{ordinal}/file.py",),
+        batch_items=("write-file",),
+        payload={"ordinal": ordinal},
+        readback_kind="remote-ledger",
+        remote_idempotency_supported=True,
+    )
+    guard.prepare(
+        claim,
+        intent,
+        policy=PolicyDecision(
+            Decision.ALLOW, "policy.allow.local", "allowed"
+        ),
+        approval=None,
+    )
+    if status != "approved":
+        guard.mark_started(claim, operation_id)
+    if status == "receipt_recorded":
+        guard.record_receipt(
+            claim,
+            operation_id,
+            module.OperationReceipt(
+                f"pending-receipt-{ordinal}",
+                {"provider_sequence": ordinal},
+            ),
+        )
+    elif status == "unknown":
+        with pytest.raises(_PhaseACrash):
+            guard.reconcile(claim, operation_id, _CrashAfterPhaseA())
+    selected = next(
+        candidate
+        for candidate in prdb._recovery_candidates(
+            conn, now=updated_at + 31, limit=100
+        )
+        if candidate.project_id == project_id
+        and candidate.turn_id == turn.turn_id
+    )
+    assert runtime._park_recovery_candidate(
+        selected, now=updated_at + 31
+    ) is not None
+    return operation_id
+
+
+def test_operation_pending_selector_is_four_branch_bounded_and_global(
+    operation_conn,
+):
+    expected = []
+    for ordinal, (status, updated_at) in enumerate(
+        (
+            ("approved", 40),
+            ("effect_started", 10),
+            ("receipt_recorded", 30),
+            ("unknown", 20),
+        ),
+        start=1,
+    ):
+        expected.append(
+            (
+                updated_at,
+                _add_parked_operation_candidate(
+                    operation_conn,
+                    ordinal=ordinal,
+                    status=status,
+                    updated_at=updated_at,
+                ),
+            )
+        )
+
+    candidates = prdb._operation_pending_candidates(
+        operation_conn, limit=4
+    )
+    assert [item.operation_id for item in candidates] == [
+        operation_id
+        for _, operation_id in sorted(expected)
+    ]
+    assert len(candidates) <= 4
+    for status in (
+        "approved",
+        "effect_started",
+        "receipt_recorded",
+        "unknown",
+    ):
+        plan = operation_conn.execute(
+            "EXPLAIN QUERY PLAN "
+            + prdb._OPERATION_PENDING_BRANCH_SQL,
+            (status, 4),
+        ).fetchall()
+        details = " ".join(row["detail"] for row in plan)
+        assert "idx_project_operations_recovery" in details
+        assert "USE TEMP B-TREE" not in details
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["approved", "effect_started", "receipt_recorded", "unknown"],
+)
+def test_task6_poll_owns_operation_pending_after_either_poll_order(
+    operation_env, status
+):
+    _operation_to_pending_status(operation_env, status)
+    receipt = (
+        _receipt(operation_env)
+        if status == "receipt_recorded"
+        else None
+    )
+    port = _Readback(
+        operation_env["conn"],
+        _readback_result(
+            operation_env,
+            "applied" if receipt is not None else "not_applied",
+            evidence={"ledger": "complete"},
+            receipt=receipt,
+        ),
+    )
+
+    assert operation_env["guard"]._recover_pending_operations(
+        port,
+        worker_id="recovery-worker",
+        lease_seconds=30,
+        limit=10,
+    ) == ()
+
+    operation_env["now"][0] = 131
+
+    class NoTurnReadback:
+        def read_turn(self, request):
+            raise AssertionError("Task-5 cannot own operation readback")
+
+    operation_env["runtime"].reconcile_inflight_turns(
+        NoTurnReadback(), limit=10
+    )
+    results = operation_env["guard"]._recover_pending_operations(
+        port,
+        worker_id="recovery-worker",
+        lease_seconds=30,
+        limit=10,
+    )
+
+    assert len(results) == 1
+    operation, fresh_claim = results[0]
+    if status == "approved":
+        assert fresh_claim is not None
+        assert operation.status == "approved"
+        assert port.requests == []
+    elif status == "receipt_recorded":
+        assert fresh_claim is None
+        assert operation.status == "reconciled"
+        assert len(port.requests) == 1
+        assert port.requests[0].receipt == receipt
+    else:
+        assert fresh_claim is None
+        assert operation.status == "approved"
+        assert len(port.requests) == 1
+
+
+def test_task5_pending_projection_keeps_query_work_bounded(
+    operation_conn,
+):
+    project_id = projects_db.create_project(
+        operation_conn,
+        name="Bounded Task 5",
+        folders=("C:/work/bounded-task5",),
+    )
+    pending_count = 2_000
+    operation_conn.executemany(
+        """
+        INSERT INTO project_turns (
+            turn_id, project_id, sequence, idempotency_key,
+            payload_json, status, attempt_id, lease_generation,
+            fencing_token, execution_state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, '{}', 'reconciling', ?, 1, 1,
+                  'started', 1, 1)
+        """,
+        (
+            (
+                f"pending-turn-{ordinal}",
+                project_id,
+                ordinal,
+                f"pending-turn-key-{ordinal}",
+                f"pending-attempt-{ordinal}",
+            )
+            for ordinal in range(1, pending_count + 1)
+        ),
+    )
+    operation_conn.executemany(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, turn_id, idempotency_key,
+            command_revision, targets_json, payload_json, status,
+            created_at, updated_at, guard_revision, canonical_action,
+            batch_items_json, readback_kind, attempt_id,
+            lease_generation, fencing_token,
+            remote_idempotency_supported
+        ) VALUES (?, ?, ?, ?, 1, '["C:/work/bounded-task5"]', '{}',
+                  'approved', 1, 1, 1, 'local_code_edit', '["item"]',
+                  'ledger', ?, 1, 1, 1)
+        """,
+        (
+            (
+                f"pending-operation-{ordinal}",
+                project_id,
+                f"pending-turn-{ordinal}",
+                f"pending-operation-key-{ordinal}",
+                f"pending-attempt-{ordinal}",
+            )
+            for ordinal in range(1, pending_count + 1)
+        ),
+    )
+    operation_conn.execute(
+        """
+        INSERT INTO project_turns (
+            turn_id, project_id, sequence, idempotency_key,
+            payload_json, status, attempt_id, lease_generation,
+            fencing_token, execution_state, created_at, updated_at
+        ) VALUES (
+            'ordinary-turn', ?, ?, 'ordinary-turn-key', '{}',
+            'reconciling', 'ordinary-attempt', 1, 1,
+            'started', 1, 1
+        )
+        """,
+        (project_id, pending_count + 1),
+    )
+    operation_conn.commit()
+    progress = [0]
+
+    def count_progress():
+        progress[0] += 1
+        return 0
+
+    operation_conn.set_progress_handler(count_progress, 1)
+    try:
+        rows = operation_conn.execute(
+            prdb._RECOVERY_RECONCILING_SQL, (1,)
+        ).fetchall()
+    finally:
+        operation_conn.set_progress_handler(None, 0)
+
+    assert len(rows) == 1
+    assert rows[0]["has_pending_operation"] == 1
+    assert progress[0] < 500
+    plan = operation_conn.execute(
+        "EXPLAIN QUERY PLAN " + prdb._RECOVERY_RECONCILING_SQL,
+        (1,),
+    ).fetchall()
+    details = " ".join(row["detail"] for row in plan)
+    assert "idx_project_turns_actionable_recovery" in details
+    assert "idx_project_operations_recovery" in details
+    assert "USE TEMP B-TREE" not in details
+
+
+def _maintenance_state(conn):
+    row = conn.execute(
+        """
+        SELECT singleton, approval_scan_after, next_lane
+        FROM project_operation_maintenance
+        """
+    ).fetchone()
+    return tuple(row) if row is not None else None
+
+
+def test_approval_maintenance_singleton_alternates_and_live_advances_cursor(
+    operation_env,
+):
+    _prepare_critical(operation_env, expires_at=1_000)
+    assert _maintenance_state(operation_env["conn"]) == (1, "", 0)
+
+    assert operation_env[
+        "guard"
+    ].expire_due_operation_approvals(limit=1) == ()
+    assert _maintenance_state(operation_env["conn"]) == (1, "", 1)
+
+    assert operation_env[
+        "guard"
+    ].expire_due_operation_approvals(limit=1) == ()
+    assert _maintenance_state(operation_env["conn"]) == (
+        1,
+        "approval-1",
+        0,
+    )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ("runtime_version", "lifecycle", "phase", "control_version"),
+)
+def test_bounded_stale_lane_finalizes_all_boundary_drift(
+    operation_env, drift
+):
+    _prepare_critical(operation_env, expires_at=1_000)
+    conn = operation_env["conn"]
+    project_id = operation_env["project_id"]
+    turn_id = operation_env["turn"].turn_id
+    statement, parameters = {
+        "runtime_version": (
+            """
+            UPDATE project_runtime_state SET version = version + 1
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ),
+        "lifecycle": (
+            """
+            UPDATE project_runtime_state
+            SET lifecycle = 'awaiting_acceptance'
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ),
+        "phase": (
+            """
+            UPDATE project_runtime_state
+            SET current_phase = 'verification'
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ),
+        "control_version": (
+            """
+            UPDATE project_run_controls
+            SET control_version = control_version + 1
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (project_id, turn_id),
+        ),
+    }[drift]
+    conn.execute(statement, parameters)
+    conn.commit()
+    prior_version = prdb.runtime_state_for_project(
+        conn, project_id
+    ).version
+    prior_control = prdb._runtime_control_for_turn(
+        conn, project_id=project_id, turn_id=turn_id
+    )
+    assert prior_control is not None
+
+    assert operation_env[
+        "guard"
+    ].expire_due_operation_approvals(limit=1) == ()
+    stale = operation_env[
+        "guard"
+    ].expire_due_operation_approvals(limit=1)
+
+    assert len(stale) == 1
+    assert stale[0].blocked_reason == "approval_stale_boundary"
+    _assert_policy_failure(
+        operation_env,
+        approval_status="expired",
+        blocked_reason="approval_stale_boundary",
+        event_reason="stale_boundary",
+        expected_execution_state="started",
+        prior_version=prior_version,
+        prior_control_version=prior_control.control_version,
+    )
+
+
+def test_approval_maintenance_queries_are_indexed_and_population_bounded(
+    operation_conn,
+):
+    indexes = {
+        row["name"]
+        for row in operation_conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'index' AND tbl_name = 'project_approvals'
+            """
+        )
+    }
+    assert {
+        "idx_project_approvals_operation_due",
+        "idx_project_approvals_operation_scan",
+    } <= indexes
+    due_plan = operation_conn.execute(
+        "EXPLAIN QUERY PLAN " + prdb._APPROVAL_DUE_MAINTENANCE_SQL,
+        (100, 10),
+    ).fetchall()
+    stale_plan = operation_conn.execute(
+        "EXPLAIN QUERY PLAN " + prdb._APPROVAL_STALE_MAINTENANCE_SQL,
+        ("", 10),
+    ).fetchall()
+    due_details = " ".join(row["detail"] for row in due_plan)
+    stale_details = " ".join(row["detail"] for row in stale_plan)
+    assert "idx_project_approvals_operation_due" in due_details
+    assert "idx_project_approvals_operation_scan" in stale_details
+    assert "USE TEMP B-TREE" not in due_details + stale_details
+
+    project_id = projects_db.create_project(
+        operation_conn,
+        name="Approval Maintenance Scale",
+        folders=("C:/work/approval-maintenance",),
+    )
+    operation_conn.commit()
+    operation_conn.execute("PRAGMA foreign_keys=OFF")
+    approval_rows = []
+    for ordinal in range(5_000):
+        approval_rows.append(
+            (
+                f"final-{ordinal:05d}",
+                project_id,
+                f"final-operation-{ordinal:05d}",
+                ordinal + 1,
+                f'["C:/final/{ordinal}"]',
+                f'{{"batch_id":"final-{ordinal}"}}',
+                "approved",
+                1,
+                1,
+                "owner-1",
+                1,
+            )
+        )
+        approval_rows.append(
+            (
+                f"live-{ordinal:05d}",
+                project_id,
+                f"live-operation-{ordinal:05d}",
+                ordinal + 10_001,
+                f'["C:/live/{ordinal}"]',
+                f'{{"batch_id":"live-{ordinal}"}}',
+                "pending",
+                10_000,
+                None,
+                None,
+                None,
+            )
+        )
+    operation_conn.executemany(
+        """
+        INSERT INTO project_approvals (
+            approval_id, project_id, turn_id, operation_id, actor_id,
+            authorization_actor_id, canonical_action, approval_class,
+            command_revision, expected_runtime_version,
+            effective_runtime_version, turn_expected_control_version,
+            expected_lifecycle, expected_phase, targets_json,
+            batch_boundary_json, status, expires_at, resolved_at,
+            resolved_by_actor_id, consumed_at, created_at
+        ) VALUES (
+            ?, ?, NULL, ?, 'owner-1', 'owner-1', 'publish', 'publish',
+            ?, 0, 0, NULL, 'active', 'implementation', ?, ?, ?, ?,
+            ?, ?, ?, 1
+        )
+        """,
+        approval_rows,
+    )
+    operation_conn.commit()
+    operation_conn.execute("PRAGMA foreign_keys=ON")
+
+    def progress_for(sql, parameters):
+        progress = [0]
+
+        def count_progress():
+            progress[0] += 1
+            return 0
+
+        operation_conn.set_progress_handler(count_progress, 1)
+        try:
+            rows = operation_conn.execute(
+                sql, parameters
+            ).fetchall()
+        finally:
+            operation_conn.set_progress_handler(None, 0)
+        return rows, progress[0]
+
+    due, due_steps = progress_for(
+        prdb._APPROVAL_DUE_MAINTENANCE_SQL, (100, 10)
+    )
+    stale, stale_steps = progress_for(
+        prdb._APPROVAL_STALE_MAINTENANCE_SQL, ("", 10)
+    )
+    assert due == []
+    assert len(stale) == 10
+    assert due_steps < 500
+    assert stale_steps < 500
+
+
+def _insert_migration_operation(
+    conn,
+    project_id,
+    operation_id,
+    approval_id,
+):
+    conn.execute(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, turn_id, idempotency_key,
+            approval_id, command_revision, targets_json, payload_json,
+            status, receipt_json, created_at, updated_at, guard_revision
+        ) VALUES (?, ?, NULL, ?, ?, 1, '[]', '{}', 'intent', NULL, 1, 1, 0)
+        """,
+        (
+            operation_id,
+            project_id,
+            f"migration-key-{operation_id}",
+            approval_id,
+        ),
+    )
+
+
+def _insert_migration_approval(
+    conn,
+    project_id,
+    approval_id,
+    operation_id,
+    revision,
+):
+    conn.execute(
+        """
+        INSERT INTO project_approvals (
+            approval_id, project_id, turn_id, operation_id, actor_id,
+            authorization_actor_id, canonical_action, approval_class,
+            command_revision, expected_runtime_version,
+            effective_runtime_version, turn_expected_control_version,
+            expected_lifecycle, expected_phase, targets_json,
+            batch_boundary_json, status, expires_at, resolved_at,
+            resolved_by_actor_id, consumed_at, created_at
+        ) VALUES (
+            ?, ?, NULL, ?, 'owner', 'owner', 'publish', 'publish', ?,
+            0, 0, NULL, 'active', 'implementation', ?, ?,
+            'pending', 100, NULL, NULL, NULL, 1
+        )
+        """,
+        (
+            approval_id,
+            project_id,
+            operation_id,
+            revision,
+            f'["C:/migration/{approval_id}"]',
+            f'{{"batch_id":"{approval_id}"}}',
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    (
+        "one_way_operation",
+        "one_way_approval",
+        "dangling_operation",
+        "dangling_approval",
+        "crossed",
+    ),
+)
+def test_migration_rejects_non_inverse_operation_approval_links(
+    operation_conn, shape
+):
+    project_id = _insert_project(operation_conn, f"migration-{shape}")
+    operation_conn.execute(
+        "DROP INDEX idx_project_operations_one_approval"
+    )
+    operation_conn.execute(
+        "DROP INDEX idx_project_approvals_one_operation"
+    )
+    operation_conn.commit()
+    operation_conn.execute("PRAGMA foreign_keys=OFF")
+    if shape == "one_way_operation":
+        _insert_migration_operation(
+            operation_conn, project_id, "operation-1", "approval-1"
+        )
+        _insert_migration_approval(
+            operation_conn, project_id, "approval-1", None, 1
+        )
+    elif shape == "one_way_approval":
+        _insert_migration_operation(
+            operation_conn, project_id, "operation-1", None
+        )
+        _insert_migration_approval(
+            operation_conn,
+            project_id,
+            "approval-1",
+            "operation-1",
+            1,
+        )
+    elif shape == "dangling_operation":
+        _insert_migration_operation(
+            operation_conn, project_id, "operation-1", "approval-missing"
+        )
+    elif shape == "dangling_approval":
+        _insert_migration_approval(
+            operation_conn,
+            project_id,
+            "approval-1",
+            "operation-missing",
+            1,
+        )
+    else:
+        _insert_migration_operation(
+            operation_conn, project_id, "operation-1", "approval-1"
+        )
+        _insert_migration_operation(
+            operation_conn, project_id, "operation-2", "approval-2"
+        )
+        _insert_migration_approval(
+            operation_conn,
+            project_id,
+            "approval-1",
+            "operation-2",
+            1,
+        )
+        _insert_migration_approval(
+            operation_conn,
+            project_id,
+            "approval-2",
+            "operation-1",
+            2,
+        )
+    operation_conn.commit()
+    operation_conn.execute("PRAGMA foreign_keys=ON")
+    before_operations = tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT operation_id, approval_id
+            FROM project_operations
+            WHERE project_id = ?
+            ORDER BY operation_id
+            """,
+            (project_id,),
+        )
+    )
+    before_approvals = tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT approval_id, operation_id
+            FROM project_approvals
+            WHERE project_id = ?
+            ORDER BY approval_id
+            """,
+            (project_id,),
+        )
+    )
+
+    with pytest.raises(prdb.OperationMigrationError):
+        prdb.ensure_schema(operation_conn)
+
+    assert before_operations == tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT operation_id, approval_id
+            FROM project_operations
+            WHERE project_id = ?
+            ORDER BY operation_id
+            """,
+            (project_id,),
+        )
+    )
+    assert before_approvals == tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT approval_id, operation_id
+            FROM project_approvals
+            WHERE project_id = ?
+            ORDER BY approval_id
+            """,
+            (project_id,),
+        )
+    )
+
+
+def test_approval_maintenance_schema_is_idempotent(operation_conn):
+    prdb.ensure_schema(operation_conn)
+    prdb.ensure_schema(operation_conn)
+    assert _maintenance_state(operation_conn) == (1, "", 0)
+    assert operation_conn.execute(
+        """
+        SELECT COUNT(*) FROM project_operation_maintenance
+        """
+    ).fetchone()[0] == 1
+
+
+def test_operation_intent_requires_exact_builtin_remote_capability(
+    operation_env,
+):
+    intent = _intent(operation_env)
+    assert intent.remote_idempotency_supported is True
+    with pytest.raises(TypeError):
+        replace(intent, remote_idempotency_supported=1)
+    with pytest.raises(TypeError):
+        replace(intent, remote_idempotency_supported=None)
+
+
+@pytest.mark.parametrize(
+    ("remote_supported", "readback_kind"),
+    (
+        (False, "remote-ledger"),
+        (True, None),
+        (False, None),
+    ),
+)
+def test_remote_capability_matrix_blocks_before_effect_authority(
+    operation_env,
+    remote_supported,
+    readback_kind,
+):
+    blocked = operation_env["guard"].prepare(
+        operation_env["claim"],
+        _intent(
+            operation_env,
+            readback_kind=readback_kind,
+            remote_idempotency_supported=remote_supported,
+        ),
+        policy=PolicyDecision(
+            Decision.ALLOW, "policy.allow.local", "allowed"
+        ),
+        approval=None,
+    )
+
+    assert blocked.status == "blocked"
+    assert blocked.blocked_reason == "operation_capability_unsupported"
+    row = operation_env["conn"].execute(
+        """
+        SELECT remote_idempotency_supported, approval_fingerprint_json,
+               idempotency_key
+        FROM project_operations
+        WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()
+    assert tuple(row) == (
+        int(remote_supported),
+        None,
+        "remote-operation-1",
+    )
+
+
+def _critical_capability_block(
+    operation_env,
+    *,
+    approval_id="approval-1",
+    approval_class="publish",
+    expires_at=1_000,
+    authorization=None,
+):
+    authorization = authorization or operation_env["actor"]
+    intent = _intent(
+        operation_env,
+        canonical_action="publish",
+        remote_idempotency_supported=False,
+    )
+    policy = PolicyDecision(
+        Decision.REQUIRE_APPROVAL,
+        "policy.approval.publish",
+        "publish is critical",
+        approval_class,
+    )
+    spec = operation_env["module"].OperationApprovalSpec(
+        approval_id,
+        approval_class,
+        expires_at,
+        authorization,
+    )
+    return operation_env["guard"].prepare(
+        operation_env["claim"],
+        intent,
+        policy=policy,
+        approval=spec,
+    )
+
+
+def test_capability_blocked_critical_persists_full_fingerprint_without_link(
+    operation_env,
+):
+    first = _critical_capability_block(operation_env)
+    expected = (
+        '{"approval_class":"publish","approval_id":"approval-1",'
+        '"authorization_actor_id":"owner-1","expires_at":1000,'
+        '"requires_owner":true}'
+    )
+
+    assert first.status == "blocked"
+    row = operation_env["conn"].execute(
+        """
+        SELECT approval_id, approval_fingerprint_json,
+               remote_idempotency_supported
+        FROM project_operations
+        WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()
+    assert tuple(row) == (None, expected, 0)
+    assert operation_env["conn"].execute(
+        """
+        SELECT COUNT(*) FROM project_approvals
+        WHERE project_id = ?
+        """,
+        (operation_env["project_id"],),
+    ).fetchone()[0] == 0
+
+    replay = _critical_capability_block(
+        operation_env,
+        authorization=operation_env["discord_actor"],
+    )
+    assert replay == first
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "approval_id",
+        "approval_class",
+        "expires_at",
+        "authorization_actor_id",
+        "requires_owner",
+    ),
+)
+def test_capability_blocked_critical_replay_rejects_every_fingerprint_drift(
+    operation_env, drift
+):
+    _critical_capability_block(operation_env)
+    values = {
+        "approval_id": "approval-1",
+        "approval_class": "publish",
+        "expires_at": 1_000,
+        "authorization": operation_env["actor"],
+    }
+    if drift == "approval_id":
+        values["approval_id"] = "approval-changed"
+    elif drift == "approval_class":
+        values["approval_class"] = "publish-changed"
+    elif drift == "expires_at":
+        values["expires_at"] = 2_000
+    elif drift == "authorization_actor_id":
+        values["authorization"] = ActorContext(
+            "owner-2", "desktop", "desktop-owner", True
+        )
+    else:
+        values["authorization"] = ActorContext(
+            "owner-1", "desktop", "desktop-owner", False
+        )
+    before = _operation_snapshot(operation_env)
+
+    with pytest.raises(
+        operation_env["module"].ProjectOperationError
+    ) as conflict:
+        _critical_capability_block(operation_env, **values)
+
+    assert (
+        conflict.value.code
+        is operation_env[
+            "module"
+        ].OperationErrorCode.OPERATION_IDEMPOTENCY_CONFLICT
+    )
+    assert before == _operation_snapshot(operation_env)
+
+
+def test_normal_critical_fingerprint_matches_inverse_and_other_binding_resolves(
+    operation_env,
+):
+    _prepare_critical(operation_env)
+    row = operation_env["conn"].execute(
+        """
+        SELECT operation.approval_fingerprint_json,
+               approval.approval_id, approval.approval_class,
+               approval.expires_at, approval.authorization_actor_id
+        FROM project_operations AS operation
+        JOIN project_approvals AS approval
+          ON approval.project_id = operation.project_id
+         AND approval.approval_id = operation.approval_id
+        WHERE operation.operation_id = 'operation-1'
+        """
+    ).fetchone()
+    assert row["approval_fingerprint_json"] == (
+        '{"approval_class":"publish","approval_id":"approval-1",'
+        '"authorization_actor_id":"owner-1","expires_at":1000,'
+        '"requires_owner":true}'
+    )
+
+    approved = operation_env["guard"].resolve_operation_approval(
+        "approval-1",
+        operation_env["discord_actor"],
+        outcome="approved",
+    )
+    assert approved.status == "approved"
+
+
+def test_revision_one_null_capability_is_not_backfilled_and_fails_closed(
+    operation_env,
+):
+    _prepare_allowed(operation_env)
+    operation_env["conn"].execute(
+        "DROP TRIGGER trg_project_operations_task6_update"
+    )
+    operation_env["conn"].execute(
+        """
+        UPDATE project_operations
+        SET remote_idempotency_supported = NULL
+        WHERE operation_id = 'operation-1'
+        """
+    )
+    operation_env["conn"].commit()
+
+    prdb.ensure_schema(operation_env["conn"])
+
+    assert operation_env["conn"].execute(
+        """
+        SELECT remote_idempotency_supported
+        FROM project_operations
+        WHERE operation_id = 'operation-1'
+        """
+    ).fetchone()[0] is None
+    with pytest.raises(
+        RuntimeError, match="malformed persisted project operation"
+    ):
+        prdb._project_operation_for_id(
+            operation_env["conn"],
+            project_id=operation_env["project_id"],
+            operation_id="operation-1",
+        )
+    assert prdb._project_operation_disposition_for_turn(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        turn_id=operation_env["turn"].turn_id,
+    ) == "post_effect_blocked"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "SET remote_idempotency_supported = NULL",
+        "SET remote_idempotency_supported = 2",
+        "SET remote_idempotency_supported = 0",
+        "SET approval_fingerprint_json = '{}'",
+    ),
+)
+def test_operation_trigger_rejects_capability_fingerprint_cross_breaks(
+    operation_env, statement
+):
+    _prepare_allowed(operation_env)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        operation_env["conn"].execute(
+            f"""
+            UPDATE project_operations
+            {statement}
+            WHERE operation_id = 'operation-1'
+            """
+        )
+    operation_env["conn"].rollback()

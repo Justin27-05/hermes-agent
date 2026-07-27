@@ -335,6 +335,8 @@ CREATE TABLE IF NOT EXISTS project_operations (
     receipt_id       TEXT,
     readback_json    TEXT,
     blocked_reason   TEXT,
+    remote_idempotency_supported INTEGER,
+    approval_fingerprint_json TEXT,
     UNIQUE (project_id, operation_id),
     UNIQUE (project_id, idempotency_key),
     FOREIGN KEY (project_id, turn_id)
@@ -357,6 +359,14 @@ CREATE TABLE IF NOT EXISTS project_worker_leases (
     UNIQUE (project_id, turn_id),
     FOREIGN KEY (project_id, turn_id)
         REFERENCES project_turns(project_id, turn_id)
+);
+
+CREATE TABLE IF NOT EXISTS project_operation_maintenance (
+    singleton           INTEGER PRIMARY KEY
+                        CHECK (singleton = 1),
+    approval_scan_after TEXT NOT NULL DEFAULT '',
+    next_lane           INTEGER NOT NULL DEFAULT 0
+                        CHECK (next_lane IN (0, 1))
 );
 """
 
@@ -420,13 +430,31 @@ ON project_operations(project_id, turn_id, status, operation_id)
 WHERE guard_revision = 1;
 
 CREATE INDEX IF NOT EXISTS idx_project_operations_recovery
-ON project_operations(status, updated_at, project_id, operation_id)
+ON project_operations(
+    status, updated_at, project_id, operation_id, turn_id
+)
 WHERE guard_revision = 1
-  AND status IN ('effect_started', 'receipt_recorded', 'unknown');
+  AND status IN (
+      'approved', 'effect_started', 'receipt_recorded', 'unknown'
+  );
 
 CREATE INDEX IF NOT EXISTS idx_project_operations_approved_rehydrate
 ON project_operations(project_id, turn_id, operation_id)
 WHERE guard_revision = 1 AND status = 'approved';
+
+CREATE INDEX IF NOT EXISTS idx_project_operations_turn_guard
+ON project_operations(
+    project_id, turn_id, guard_revision, status,
+    blocked_reason, operation_id
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_approvals_operation_due
+ON project_approvals(expires_at, project_id, approval_id)
+WHERE status = 'pending' AND operation_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_project_approvals_operation_scan
+ON project_approvals(approval_id)
+WHERE status = 'pending' AND operation_id IS NOT NULL;
 """
 
 TASK6_TRIGGER_SQL = """
@@ -452,6 +480,8 @@ WHEN NEW.guard_revision = 1
         AND NEW.lease_generation > 0
     AND typeof(NEW.fencing_token) = 'integer'
         AND NEW.fencing_token > 0
+    AND typeof(NEW.remote_idempotency_supported) = 'integer'
+        AND NEW.remote_idempotency_supported IN (0, 1)
     AND typeof(NEW.created_at) = 'integer' AND NEW.created_at >= 0
     AND typeof(NEW.updated_at) = 'integer' AND NEW.updated_at >= 0
     AND NEW.status IN (
@@ -474,7 +504,129 @@ WHEN NEW.guard_revision = 1
     )
     AND (
         (
-            NEW.status IN ('receipt_recorded', 'reconciled')
+            (
+                NEW.remote_idempotency_supported = 0
+                OR NEW.readback_kind IS NULL
+            )
+            AND NEW.status = 'blocked'
+            AND NEW.blocked_reason
+                = 'operation_capability_unsupported'
+            AND NEW.approval_id IS NULL
+        )
+        OR (
+            NEW.remote_idempotency_supported = 1
+            AND typeof(NEW.readback_kind) = 'text'
+            AND length(NEW.readback_kind) > 0
+            AND NOT (
+                NEW.status = 'blocked'
+                AND NEW.blocked_reason
+                    = 'operation_capability_unsupported'
+            )
+        )
+    )
+    AND (
+        (
+            NEW.canonical_action NOT IN (
+                'publish', 'push', 'pull_request', 'release'
+            )
+            AND NEW.approval_fingerprint_json IS NULL
+            AND NEW.approval_id IS NULL
+        )
+        OR (
+            NEW.canonical_action IN (
+                'publish', 'push', 'pull_request', 'release'
+            )
+            AND typeof(NEW.approval_fingerprint_json) = 'text'
+            AND NEW.approval_fingerprint_json = json_object(
+                'approval_class',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.approval_class'
+                ),
+                'approval_id',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.approval_id'
+                ),
+                'authorization_actor_id',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.authorization_actor_id'
+                ),
+                'expires_at',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.expires_at'
+                ),
+                'requires_owner',
+                json('true')
+            )
+            AND json_extract(
+                NEW.approval_fingerprint_json,
+                '$.approval_class'
+            ) = 'publish'
+            AND typeof(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.approval_id'
+            )) = 'text'
+            AND length(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.approval_id'
+            )) > 0
+            AND typeof(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.authorization_actor_id'
+            )) = 'text'
+            AND length(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.authorization_actor_id'
+            )) > 0
+            AND json_type(
+                NEW.approval_fingerprint_json,
+                '$.expires_at'
+            ) = 'integer'
+            AND json_extract(
+                NEW.approval_fingerprint_json,
+                '$.expires_at'
+            ) >= 0
+            AND json_type(
+                NEW.approval_fingerprint_json,
+                '$.requires_owner'
+            ) = 'true'
+            AND (
+                (
+                    NEW.approval_id IS NOT NULL
+                    AND NEW.approval_id = json_extract(
+                        NEW.approval_fingerprint_json,
+                        '$.approval_id'
+                    )
+                )
+                OR (
+                    NEW.approval_id IS NULL
+                    AND (
+                        (
+                            NEW.status = 'blocked'
+                            AND NEW.blocked_reason
+                                = 'operation_capability_unsupported'
+                        )
+                        OR NEW.status = 'approved'
+                    )
+                )
+            )
+        )
+    )
+    AND (
+        (
+            (
+                NEW.status IN (
+                    'receipt_recorded', 'unknown', 'reconciled'
+                )
+                OR (
+                    NEW.status = 'blocked'
+                    AND NEW.blocked_reason
+                        = 'operation_readback_ambiguous'
+                )
+            )
             AND typeof(NEW.receipt_id) = 'text'
             AND length(NEW.receipt_id) > 0
             AND typeof(NEW.receipt_json) = 'text'
@@ -545,6 +697,8 @@ WHEN NEW.guard_revision = 1
         AND NEW.lease_generation > 0
     AND typeof(NEW.fencing_token) = 'integer'
         AND NEW.fencing_token > 0
+    AND typeof(NEW.remote_idempotency_supported) = 'integer'
+        AND NEW.remote_idempotency_supported IN (0, 1)
     AND typeof(NEW.created_at) = 'integer' AND NEW.created_at >= 0
     AND typeof(NEW.updated_at) = 'integer' AND NEW.updated_at >= 0
     AND NEW.status IN (
@@ -567,7 +721,129 @@ WHEN NEW.guard_revision = 1
     )
     AND (
         (
-            NEW.status IN ('receipt_recorded', 'reconciled')
+            (
+                NEW.remote_idempotency_supported = 0
+                OR NEW.readback_kind IS NULL
+            )
+            AND NEW.status = 'blocked'
+            AND NEW.blocked_reason
+                = 'operation_capability_unsupported'
+            AND NEW.approval_id IS NULL
+        )
+        OR (
+            NEW.remote_idempotency_supported = 1
+            AND typeof(NEW.readback_kind) = 'text'
+            AND length(NEW.readback_kind) > 0
+            AND NOT (
+                NEW.status = 'blocked'
+                AND NEW.blocked_reason
+                    = 'operation_capability_unsupported'
+            )
+        )
+    )
+    AND (
+        (
+            NEW.canonical_action NOT IN (
+                'publish', 'push', 'pull_request', 'release'
+            )
+            AND NEW.approval_fingerprint_json IS NULL
+            AND NEW.approval_id IS NULL
+        )
+        OR (
+            NEW.canonical_action IN (
+                'publish', 'push', 'pull_request', 'release'
+            )
+            AND typeof(NEW.approval_fingerprint_json) = 'text'
+            AND NEW.approval_fingerprint_json = json_object(
+                'approval_class',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.approval_class'
+                ),
+                'approval_id',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.approval_id'
+                ),
+                'authorization_actor_id',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.authorization_actor_id'
+                ),
+                'expires_at',
+                json_extract(
+                    NEW.approval_fingerprint_json,
+                    '$.expires_at'
+                ),
+                'requires_owner',
+                json('true')
+            )
+            AND json_extract(
+                NEW.approval_fingerprint_json,
+                '$.approval_class'
+            ) = 'publish'
+            AND typeof(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.approval_id'
+            )) = 'text'
+            AND length(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.approval_id'
+            )) > 0
+            AND typeof(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.authorization_actor_id'
+            )) = 'text'
+            AND length(json_extract(
+                NEW.approval_fingerprint_json,
+                '$.authorization_actor_id'
+            )) > 0
+            AND json_type(
+                NEW.approval_fingerprint_json,
+                '$.expires_at'
+            ) = 'integer'
+            AND json_extract(
+                NEW.approval_fingerprint_json,
+                '$.expires_at'
+            ) >= 0
+            AND json_type(
+                NEW.approval_fingerprint_json,
+                '$.requires_owner'
+            ) = 'true'
+            AND (
+                (
+                    NEW.approval_id IS NOT NULL
+                    AND NEW.approval_id = json_extract(
+                        NEW.approval_fingerprint_json,
+                        '$.approval_id'
+                    )
+                )
+                OR (
+                    NEW.approval_id IS NULL
+                    AND (
+                        (
+                            NEW.status = 'blocked'
+                            AND NEW.blocked_reason
+                                = 'operation_capability_unsupported'
+                        )
+                        OR NEW.status = 'approved'
+                    )
+                )
+            )
+        )
+    )
+    AND (
+        (
+            (
+                NEW.status IN (
+                    'receipt_recorded', 'unknown', 'reconciled'
+                )
+                OR (
+                    NEW.status = 'blocked'
+                    AND NEW.blocked_reason
+                        = 'operation_readback_ambiguous'
+                )
+            )
             AND typeof(NEW.receipt_id) = 'text'
             AND length(NEW.receipt_id) > 0
             AND typeof(NEW.receipt_json) = 'text'
@@ -631,12 +907,120 @@ LIMIT ?
 """
 
 _RECOVERY_RECONCILING_SQL = """
-SELECT turn.project_id, turn.turn_id, turn.sequence
+SELECT turn.project_id, turn.turn_id, turn.sequence,
+       EXISTS (
+           SELECT 1
+           FROM project_operations AS operation
+                INDEXED BY idx_project_operations_recovery
+           WHERE operation.project_id = turn.project_id
+             AND operation.turn_id = turn.turn_id
+             AND operation.guard_revision = 1
+             AND operation.status IN (
+                 'approved', 'effect_started',
+                 'receipt_recorded', 'unknown'
+             )
+           LIMIT 1
+       ) AS has_pending_operation
 FROM project_turns AS turn
      INDEXED BY idx_project_turns_actionable_recovery
 WHERE turn.status = 'reconciling'
   AND turn.recovery_block_key IS NULL
 ORDER BY turn.project_id, turn.sequence, turn.turn_id
+LIMIT ?
+"""
+
+_OPERATION_PENDING_BRANCH_SQL = """
+SELECT operation.project_id, operation.turn_id, operation.operation_id
+FROM project_operations AS operation
+     INDEXED BY idx_project_operations_recovery
+JOIN project_turns AS turn
+  ON turn.project_id = operation.project_id
+ AND turn.turn_id = operation.turn_id
+WHERE operation.status = ?
+  AND operation.guard_revision = 1
+  AND operation.status IN (
+      'approved', 'effect_started', 'receipt_recorded', 'unknown'
+  )
+  AND turn.status = 'reconciling'
+  AND turn.recovery_block_key IS NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM project_worker_leases AS lease
+      WHERE lease.project_id = turn.project_id
+        AND lease.turn_id = turn.turn_id
+  )
+  AND (
+      SELECT COUNT(*)
+      FROM project_operations AS unresolved
+           INDEXED BY idx_project_operations_recovery
+      WHERE unresolved.project_id = turn.project_id
+        AND unresolved.turn_id = turn.turn_id
+        AND unresolved.guard_revision = 1
+        AND unresolved.status IN (
+            'approved', 'effect_started',
+            'receipt_recorded', 'unknown'
+        )
+  ) = 1
+  AND NOT EXISTS (
+      SELECT 1
+      FROM project_operations AS history
+           INDEXED BY idx_project_operations_turn_guard
+      WHERE history.project_id = turn.project_id
+        AND history.turn_id = turn.turn_id
+        AND NOT (
+            history.guard_revision = 1
+            AND (
+                history.status IN (
+                    'approved', 'effect_started',
+                    'receipt_recorded', 'unknown', 'reconciled'
+                )
+                OR (
+                    history.status = 'blocked'
+                    AND history.blocked_reason IN (
+                        'operation_capability_unsupported',
+                        'approval_denied',
+                        'approval_time_expired',
+                        'approval_stale_boundary'
+                    )
+                )
+            )
+        )
+  )
+ORDER BY operation.updated_at, operation.project_id,
+         operation.operation_id, operation.turn_id
+LIMIT ?
+"""
+
+_APPROVAL_DUE_MAINTENANCE_SQL = """
+SELECT approval_id
+FROM project_approvals
+     INDEXED BY idx_project_approvals_operation_due
+WHERE status = 'pending'
+  AND operation_id IS NOT NULL
+  AND expires_at <= ?
+ORDER BY expires_at, project_id, approval_id
+LIMIT ?
+"""
+
+_APPROVAL_STALE_MAINTENANCE_SQL = """
+SELECT approval_id
+FROM project_approvals
+     INDEXED BY idx_project_approvals_operation_scan
+WHERE status = 'pending'
+  AND operation_id IS NOT NULL
+  AND approval_id > ?
+ORDER BY approval_id
+LIMIT ?
+"""
+
+_APPROVAL_STALE_MAINTENANCE_WRAP_SQL = """
+SELECT approval_id
+FROM project_approvals
+     INDEXED BY idx_project_approvals_operation_scan
+WHERE status = 'pending'
+  AND operation_id IS NOT NULL
+  AND approval_id <= ?
+ORDER BY approval_id
 LIMIT ?
 """
 
@@ -770,6 +1154,8 @@ class ProjectOperationRecord:
     receipt_id: str | None
     readback_json: str | None
     blocked_reason: str | None
+    remote_idempotency_supported: bool
+    approval_fingerprint_json: str | None
 
 
 @dataclass(frozen=True)
@@ -947,6 +1333,9 @@ def project_operation_from_row(
         _decode_operation_json(row["payload_json"], require_object=True)
         receipt_json = row["receipt_json"]
         readback_json = row["readback_json"]
+        approval_fingerprint_json = row[
+            "approval_fingerprint_json"
+        ]
         if receipt_json is not None:
             _decode_operation_json(receipt_json, require_object=True)
         decoded_readback = None
@@ -954,11 +1343,20 @@ def project_operation_from_row(
             decoded_readback = _decode_operation_json(
                 readback_json, require_object=True
             )
+        decoded_fingerprint = None
+        if approval_fingerprint_json is not None:
+            decoded_fingerprint = _decode_operation_json(
+                approval_fingerprint_json, require_object=True
+            )
         status = row["status"]
         approval_id = row["approval_id"]
         readback_kind = row["readback_kind"]
         receipt_id = row["receipt_id"]
         blocked_reason = row["blocked_reason"]
+        remote_idempotency_supported = row[
+            "remote_idempotency_supported"
+        ]
+        canonical_action = row["canonical_action"]
         valid_targets = (
             type(targets) is list
             and bool(targets)
@@ -993,6 +1391,36 @@ def project_operation_from_row(
             and type(decoded_readback["evidence"]) is dict
             and bool(decoded_readback["evidence"])
         )
+        expected_approval_class = approval_class_for_action(
+            canonical_action
+        )
+        fingerprint_present = (
+            type(decoded_fingerprint) is dict
+            and set(decoded_fingerprint)
+            == {
+                "approval_class",
+                "approval_id",
+                "authorization_actor_id",
+                "expires_at",
+                "requires_owner",
+            }
+            and _stored_text(decoded_fingerprint["approval_class"])
+            and _stored_text(decoded_fingerprint["approval_id"])
+            and _stored_text(
+                decoded_fingerprint["authorization_actor_id"]
+            )
+            and _stored_int(decoded_fingerprint["expires_at"])
+            and decoded_fingerprint["requires_owner"] is True
+        )
+        fingerprint_absent = approval_fingerprint_json is None
+        capability_missing = (
+            remote_idempotency_supported == 0
+            or readback_kind is None
+        )
+        capability_blocked = (
+            status == "blocked"
+            and blocked_reason == "operation_capability_unsupported"
+        )
         valid = (
             guard_revision == 1
             and _stored_text(row["operation_id"])
@@ -1007,13 +1435,50 @@ def project_operation_from_row(
             and status in _OPERATION_STATUSES
             and _stored_int(row["created_at"])
             and _stored_int(row["updated_at"])
-            and _stored_text(row["canonical_action"])
+            and _stored_text(canonical_action)
             and _stored_text(readback_kind, optional=True)
             and _stored_text(row["attempt_id"])
             and _stored_int(row["lease_generation"], minimum=1)
             and _stored_int(row["fencing_token"], minimum=1)
             and _stored_text(receipt_id, optional=True)
             and _stored_text(blocked_reason, optional=True)
+            and type(remote_idempotency_supported) is int
+            and remote_idempotency_supported in {0, 1}
+            and (
+                (
+                    capability_missing
+                    and capability_blocked
+                    and approval_id is None
+                )
+                or (
+                    not capability_missing
+                    and not capability_blocked
+                )
+            )
+            and (
+                (
+                    expected_approval_class is None
+                    and fingerprint_absent
+                    and approval_id is None
+                )
+                or (
+                    type(expected_approval_class) is str
+                    and fingerprint_present
+                    and decoded_fingerprint["approval_class"]
+                    == expected_approval_class
+                    and (
+                        (
+                            approval_id is not None
+                            and decoded_fingerprint["approval_id"]
+                            == approval_id
+                        )
+                        or (
+                            approval_id is None
+                            and capability_blocked
+                        )
+                    )
+                )
+            )
             and (
                 status != "awaiting_approval"
                 or approval_id is not None
@@ -1024,7 +1489,19 @@ def project_operation_from_row(
             )
             and (
                 (
-                    status in {"receipt_recorded", "reconciled"}
+                    (
+                        status
+                        in {
+                            "receipt_recorded",
+                            "unknown",
+                            "reconciled",
+                        }
+                        or (
+                            status == "blocked"
+                            and blocked_reason
+                            == "operation_readback_ambiguous"
+                        )
+                    )
                     and receipt_present
                 )
                 or (
@@ -1087,7 +1564,7 @@ def project_operation_from_row(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         guard_revision=guard_revision,
-        canonical_action=row["canonical_action"],
+        canonical_action=canonical_action,
         batch_items_json=row["batch_items_json"],
         readback_kind=readback_kind,
         attempt_id=row["attempt_id"],
@@ -1096,6 +1573,10 @@ def project_operation_from_row(
         receipt_id=receipt_id,
         readback_json=readback_json,
         blocked_reason=blocked_reason,
+        remote_idempotency_supported=bool(
+            remote_idempotency_supported
+        ),
+        approval_fingerprint_json=approval_fingerprint_json,
     )
 
 
@@ -1319,6 +1800,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
     """Add Task-6 operation authority without reinterpreting placeholder rows."""
     with write_transaction(conn):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO project_operation_maintenance (
+                singleton, approval_scan_after, next_lane
+            ) VALUES (1, '', 0)
+            """
+        )
         for name, ddl in (
             (
                 "guard_revision",
@@ -1339,8 +1827,48 @@ def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
             ("receipt_id", "receipt_id TEXT"),
             ("readback_json", "readback_json TEXT"),
             ("blocked_reason", "blocked_reason TEXT"),
+            (
+                "remote_idempotency_supported",
+                "remote_idempotency_supported INTEGER",
+            ),
+            (
+                "approval_fingerprint_json",
+                "approval_fingerprint_json TEXT",
+            ),
         ):
             add_column_if_missing(conn, "project_operations", name, ddl)
+        non_inverse_operation_link = conn.execute(
+            """
+            SELECT operation.project_id, operation.operation_id
+            FROM project_operations AS operation
+            LEFT JOIN project_approvals AS approval
+              ON approval.project_id = operation.project_id
+             AND approval.approval_id = operation.approval_id
+            WHERE operation.approval_id IS NOT NULL
+              AND (
+                  approval.approval_id IS NULL
+                  OR approval.operation_id IS NULL
+                  OR approval.operation_id != operation.operation_id
+              )
+            LIMIT 1
+            """
+        ).fetchone()
+        non_inverse_approval_link = conn.execute(
+            """
+            SELECT approval.project_id, approval.approval_id
+            FROM project_approvals AS approval
+            LEFT JOIN project_operations AS operation
+              ON operation.project_id = approval.project_id
+             AND operation.operation_id = approval.operation_id
+            WHERE approval.operation_id IS NOT NULL
+              AND (
+                  operation.operation_id IS NULL
+                  OR operation.approval_id IS NULL
+                  OR operation.approval_id != approval.approval_id
+              )
+            LIMIT 1
+            """
+        ).fetchone()
         duplicate_operation_link = conn.execute(
             """
             SELECT project_id, operation_id
@@ -1368,6 +1896,50 @@ def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
             raise OperationMigrationError(
                 "duplicate approval operation links"
             )
+        if (
+            non_inverse_operation_link is not None
+            or non_inverse_approval_link is not None
+        ):
+            raise OperationMigrationError(
+                "operation approval links are not inverse"
+            )
+        recovery_index = conn.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'index'
+              AND name = 'idx_project_operations_recovery'
+            """
+        ).fetchone()
+        if recovery_index is not None:
+            normalized = " ".join(
+                recovery_index["sql"].lower().split()
+            )
+            if not (
+                "status, updated_at, project_id, operation_id, turn_id"
+                in normalized
+                and "'approved'" in normalized
+            ):
+                conn.execute(
+                    "DROP INDEX idx_project_operations_recovery"
+                )
+        for trigger_name in (
+            "trg_project_operations_task6_insert",
+            "trg_project_operations_task6_update",
+        ):
+            trigger = conn.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'trigger' AND name = ?
+                """,
+                (trigger_name,),
+            ).fetchone()
+            if trigger is not None and (
+                "remote_idempotency_supported"
+                not in trigger["sql"]
+                or "approval_fingerprint_json"
+                not in trigger["sql"]
+            ):
+                conn.execute(f"DROP TRIGGER {trigger_name}")
 
 
 def _validate_existing_lineage(conn: sqlite3.Connection) -> None:
@@ -1912,6 +2484,210 @@ _PRE_EFFECT_BLOCK_REASONS = frozenset(
     }
 )
 
+_OPERATION_PENDING_STATUSES = frozenset(
+    {"approved", "effect_started", "receipt_recorded", "unknown"}
+)
+
+
+def _operation_pending_for_turn(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    turn_id: str,
+) -> ProjectOperationRecord | None:
+    """Return the sole unresolved operation for one exact derived lane."""
+    turn = _runtime_turn_for_project(
+        conn, project_id=project_id, turn_id=turn_id
+    )
+    if not (
+        turn is not None
+        and turn.status == "reconciling"
+        and turn.recovery_block_key is None
+        and _current_worker_lease_for_turn(
+            conn, project_id=project_id, turn_id=turn_id
+        )
+        is None
+    ):
+        return None
+    rows = conn.execute(
+        """
+        SELECT operation_id
+        FROM project_operations
+        WHERE project_id = ? AND turn_id = ?
+        ORDER BY operation_id
+        """,
+        (project_id, turn_id),
+    ).fetchall()
+    unresolved: list[ProjectOperationRecord] = []
+    for row in rows:
+        try:
+            operation = _project_operation_for_id(
+                conn,
+                project_id=project_id,
+                operation_id=row["operation_id"],
+            )
+        except (LegacyOperationUnmanagedError, RuntimeError):
+            return None
+        if operation is None:
+            return None
+        if operation.status in _OPERATION_PENDING_STATUSES:
+            unresolved.append(operation)
+        elif operation.status == "reconciled":
+            continue
+        elif (
+            operation.status == "blocked"
+            and operation.blocked_reason in _PRE_EFFECT_BLOCK_REASONS
+        ):
+            continue
+        else:
+            return None
+    return unresolved[0] if len(unresolved) == 1 else None
+
+
+def _turn_allows_new_unresolved_operation(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    turn_id: str,
+) -> bool:
+    """Allow history, but reject a second or unsafe unresolved authority."""
+    rows = conn.execute(
+        """
+        SELECT operation_id
+        FROM project_operations
+        WHERE project_id = ? AND turn_id = ?
+        ORDER BY operation_id
+        """,
+        (project_id, turn_id),
+    ).fetchall()
+    for row in rows:
+        try:
+            operation = _project_operation_for_id(
+                conn,
+                project_id=project_id,
+                operation_id=row["operation_id"],
+            )
+        except (LegacyOperationUnmanagedError, RuntimeError):
+            return False
+        if operation is None:
+            return False
+        if operation.status == "reconciled":
+            continue
+        if (
+            operation.status == "blocked"
+            and operation.blocked_reason in _PRE_EFFECT_BLOCK_REASONS
+        ):
+            continue
+        return False
+    return True
+
+
+def _operation_pending_candidates(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+) -> tuple[ProjectOperationRecord, ...]:
+    """Merge four status-indexed branches into one bounded global order."""
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("invalid operation recovery limit")
+    selected: dict[
+        tuple[str, str], ProjectOperationRecord
+    ] = {}
+    for status in (
+        "approved",
+        "effect_started",
+        "receipt_recorded",
+        "unknown",
+    ):
+        rows = conn.execute(
+            _OPERATION_PENDING_BRANCH_SQL, (status, limit)
+        ).fetchall()
+        for row in rows:
+            operation = _operation_pending_for_turn(
+                conn,
+                project_id=row["project_id"],
+                turn_id=row["turn_id"],
+            )
+            if not (
+                operation is not None
+                and operation.operation_id == row["operation_id"]
+                and operation.status == status
+            ):
+                continue
+            selected.setdefault(
+                (operation.project_id, operation.operation_id),
+                operation,
+            )
+    return tuple(
+        sorted(
+            selected.values(),
+            key=lambda operation: (
+                operation.updated_at,
+                operation.project_id,
+                operation.operation_id,
+                operation.turn_id,
+            ),
+        )[:limit]
+    )
+
+
+def _select_operation_approval_maintenance(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    limit: int,
+) -> tuple[str, ...]:
+    """Choose one durable alternating lane inside caller write scope."""
+    state = conn.execute(
+        """
+        SELECT approval_scan_after, next_lane
+        FROM project_operation_maintenance
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    if state is None or not (
+        type(state["approval_scan_after"]) is str
+        and type(state["next_lane"]) is int
+        and state["next_lane"] in {0, 1}
+    ):
+        raise RuntimeError("invalid operation maintenance state")
+    scan_after = state["approval_scan_after"]
+    lane = state["next_lane"]
+    if lane == 0:
+        rows = conn.execute(
+            _APPROVAL_DUE_MAINTENANCE_SQL, (now, limit)
+        ).fetchall()
+        next_scan_after = scan_after
+    else:
+        rows = list(
+            conn.execute(
+                _APPROVAL_STALE_MAINTENANCE_SQL,
+                (scan_after, limit),
+            ).fetchall()
+        )
+        if len(rows) < limit:
+            rows.extend(
+                conn.execute(
+                    _APPROVAL_STALE_MAINTENANCE_WRAP_SQL,
+                    (scan_after, limit - len(rows)),
+                ).fetchall()
+            )
+        next_scan_after = (
+            rows[-1]["approval_id"] if rows else ""
+        )
+    updated = conn.execute(
+        """
+        UPDATE project_operation_maintenance
+        SET approval_scan_after = ?, next_lane = ?, singleton = 1
+        WHERE singleton = 1
+          AND approval_scan_after = ? AND next_lane = ?
+        """,
+        (next_scan_after, 1 - lane, scan_after, lane),
+    )
+    if updated.rowcount != 1:
+        raise RuntimeError("operation maintenance state changed")
+    return tuple(row["approval_id"] for row in rows)
+
 
 def _project_operation_disposition_for_turn(
     conn: sqlite3.Connection,
@@ -1987,6 +2763,8 @@ def _insert_project_operation(
     lease_generation: int,
     fencing_token: int,
     blocked_reason: str | None,
+    remote_idempotency_supported: bool,
+    approval_fingerprint_json: str | None,
     now: int,
 ) -> bool:
     cursor = conn.execute(
@@ -1996,10 +2774,11 @@ def _insert_project_operation(
             command_revision, targets_json, payload_json, status, receipt_json,
             created_at, updated_at, guard_revision, canonical_action,
             batch_items_json, readback_kind, attempt_id, lease_generation,
-            fencing_token, receipt_id, readback_json, blocked_reason
+            fencing_token, receipt_id, readback_json, blocked_reason,
+            remote_idempotency_supported, approval_fingerprint_json
         ) VALUES (
             ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?,
-            NULL, NULL, ?
+            NULL, NULL, ?, ?, ?
         )
         ON CONFLICT DO NOTHING
         """,
@@ -2021,6 +2800,8 @@ def _insert_project_operation(
             lease_generation,
             fencing_token,
             blocked_reason,
+            int(remote_idempotency_supported),
+            approval_fingerprint_json,
         ),
     )
     return cursor.rowcount == 1
@@ -2561,6 +3342,24 @@ def _record_project_operation_receipt(
     return cursor.rowcount == 1
 
 
+def _project_operation_receipt_owner(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    receipt_id: str,
+) -> str | None:
+    row = conn.execute(
+        """
+        SELECT operation_id
+        FROM project_operations
+        WHERE project_id = ? AND receipt_id = ?
+          AND guard_revision = 1
+        """,
+        (project_id, receipt_id),
+    ).fetchone()
+    return row["operation_id"] if row is not None else None
+
+
 def _park_project_operation_unknown(
     conn: sqlite3.Connection,
     *,
@@ -2576,8 +3375,8 @@ def _park_project_operation_unknown(
     cursor = conn.execute(
         """
         UPDATE project_operations
-        SET status = 'unknown', receipt_id = NULL, receipt_json = NULL,
-            readback_json = NULL, blocked_reason = NULL, updated_at = ?
+        SET status = 'unknown', readback_json = NULL,
+            blocked_reason = NULL, updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND operation_id = ?
           AND status = ?
           AND attempt_id = ? AND lease_generation = ? AND fencing_token = ?

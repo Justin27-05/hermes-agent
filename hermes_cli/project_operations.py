@@ -20,6 +20,7 @@ from hermes_cli.project_runtime import (
     JSONValue,
     ProjectRuntime,
     ProjectRuntimeError,
+    RuntimeErrorCode,
     SQLITE_INT_MAX,
     TurnClaim,
     _decode_canonical_object,
@@ -138,8 +139,13 @@ class OperationIntent:
     batch_items: tuple[str, ...]
     payload: Mapping[str, JSONValue]
     readback_kind: str | None
+    remote_idempotency_supported: bool
 
     def __post_init__(self) -> None:
+        if type(self.remote_idempotency_supported) is not bool:
+            raise TypeError(
+                "remote_idempotency_supported must be an exact bool"
+            )
         object.__setattr__(
             self, "payload", _immutable_json_mapping(self.payload)
         )
@@ -372,9 +378,40 @@ class ProjectOperationGuard:
             and type(approval.expires_at) is int
             and approval.expires_at >= 0
             and type(approval.authorization) is ActorContext
+            and approval.authorization.is_owner is True
         ):
             raise ValueError("invalid operation approval")
         return policy.decision, approval
+
+    @staticmethod
+    def _approval_fingerprint_storage(
+        approval: object,
+    ) -> str:
+        if not (
+            type(approval) is OperationApprovalSpec
+            and type(approval.approval_id) is str
+            and approval.approval_id
+            and type(approval.approval_class) is str
+            and approval.approval_class
+            and type(approval.expires_at) is int
+            and approval.expires_at >= 0
+            and type(approval.authorization) is ActorContext
+            and type(approval.authorization.actor_id) is str
+            and approval.authorization.actor_id
+            and type(approval.authorization.is_owner) is bool
+        ):
+            raise ValueError("invalid approval fingerprint")
+        return canonical_json_object(
+            {
+                "approval_class": approval.approval_class,
+                "approval_id": approval.approval_id,
+                "authorization_actor_id": (
+                    approval.authorization.actor_id
+                ),
+                "expires_at": approval.expires_at,
+                "requires_owner": approval.authorization.is_owner,
+            }
+        )
 
     def _existing_operation(
         self,
@@ -384,13 +421,10 @@ class ProjectOperationGuard:
         targets_json: str,
         batch_items_json: str,
         payload_json: str,
-        approval_spec: OperationApprovalSpec | None,
+        approval_id: str | None,
+        approval_fingerprint_json: str | None,
+        remote_idempotency_supported: bool,
     ) -> runtime_db.ProjectOperationRecord | None:
-        approval_id = (
-            approval_spec.approval_id
-            if approval_spec is not None
-            else None
-        )
         try:
             by_id = runtime_db._project_operation_for_id(
                 self._conn,
@@ -422,7 +456,12 @@ class ProjectOperationGuard:
             conflict = True
         existing = by_id or by_key
         approval_matches = True
-        if existing is not None and approval_spec is not None:
+        if (
+            existing is not None
+            and approval_fingerprint_json is not None
+            and existing.approval_id is not None
+        ):
+            fingerprint = json.loads(approval_fingerprint_json)
             approval_row = self._conn.execute(
                 """
                 SELECT approval_class, authorization_actor_id, expires_at
@@ -432,18 +471,18 @@ class ProjectOperationGuard:
                 """,
                 (
                     intent.project_id,
-                    approval_spec.approval_id,
+                    existing.approval_id,
                     intent.operation_id,
                 ),
             ).fetchone()
             approval_matches = (
                 approval_row is not None
                 and approval_row["approval_class"]
-                == approval_spec.approval_class
+                == fingerprint["approval_class"]
                 and approval_row["authorization_actor_id"]
-                == approval_spec.authorization.actor_id
+                == fingerprint["authorization_actor_id"]
                 and approval_row["expires_at"]
-                == approval_spec.expires_at
+                == fingerprint["expires_at"]
             )
         if existing is None and not conflict:
             return None
@@ -461,6 +500,10 @@ class ProjectOperationGuard:
             or existing.payload_json != payload_json
             or existing.approval_id != approval_id
             or existing.readback_kind != intent.readback_kind
+            or existing.remote_idempotency_supported
+            is not remote_idempotency_supported
+            or existing.approval_fingerprint_json
+            != approval_fingerprint_json
             or existing.attempt_id != claim.attempt_id
             or existing.lease_generation != claim.lease_generation
             or existing.fencing_token != claim.fencing_token
@@ -515,9 +558,6 @@ class ProjectOperationGuard:
                 batch_items_json,
                 payload_json,
             ) = self._intent_storage(intent)
-            decision, approval_spec = self._validate_policy(
-                policy, approval, intent
-            )
         except ProjectOperationError:
             raise
         except Exception as exc:
@@ -527,11 +567,28 @@ class ProjectOperationGuard:
                     intent if type(intent) is OperationIntent else None
                 ),
             ) from exc
-        capability_supported = intent.readback_kind is not None
-        approval_id = (
-            approval_spec.approval_id
-            if decision is Decision.REQUIRE_APPROVAL
-            and capability_supported
+        capability_supported = (
+            intent.remote_idempotency_supported
+            and intent.readback_kind is not None
+        )
+        replay_fingerprint: str | None = None
+        if (
+            type(policy) is PolicyDecision
+            and policy.decision is Decision.REQUIRE_APPROVAL
+        ):
+            try:
+                replay_fingerprint = (
+                    self._approval_fingerprint_storage(approval)
+                )
+            except ValueError:
+                replay_fingerprint = None
+        replay_approval_id = (
+            approval.approval_id
+            if (
+                capability_supported
+                and replay_fingerprint is not None
+                and type(approval) is OperationApprovalSpec
+            )
             else None
         )
         existing = self._existing_operation(
@@ -540,14 +597,36 @@ class ProjectOperationGuard:
             targets_json=targets_json,
             batch_items_json=batch_items_json,
             payload_json=payload_json,
-            approval_spec=(
-                approval_spec
-                if approval_id is not None
-                else None
+            approval_id=replay_approval_id,
+            approval_fingerprint_json=replay_fingerprint,
+            remote_idempotency_supported=(
+                intent.remote_idempotency_supported
             ),
         )
         if existing is not None:
             return self._public_operation(existing)
+        try:
+            decision, approval_spec = self._validate_policy(
+                policy, approval, intent
+            )
+            approval_fingerprint_json = (
+                self._approval_fingerprint_storage(approval_spec)
+                if decision is Decision.REQUIRE_APPROVAL
+                else None
+            )
+        except ProjectOperationError:
+            raise
+        except Exception as exc:
+            raise self._error(
+                OperationErrorCode.INVALID_OPERATION_ARGUMENT,
+                intent=intent,
+            ) from exc
+        approval_id = (
+            approval_spec.approval_id
+            if decision is Decision.REQUIRE_APPROVAL
+            and capability_supported
+            else None
+        )
 
         now = self._runtime._now()
         with runtime_db.write_transaction(self._conn):
@@ -563,6 +642,18 @@ class ProjectOperationGuard:
                 raise self._error(
                     OperationErrorCode.INVALID_OPERATION_ARGUMENT,
                     intent=intent,
+                )
+            if (
+                capability_supported
+                and not runtime_db
+                ._turn_allows_new_unresolved_operation(
+                    self._conn,
+                    project_id=intent.project_id,
+                    turn_id=intent.turn_id,
+                )
+            ):
+                raise self._operation_state_conflict(
+                    claim, intent.operation_id, state.version
                 )
             initial_status = (
                 "blocked"
@@ -590,6 +681,12 @@ class ProjectOperationGuard:
                     if not capability_supported
                     else None
                 ),
+                remote_idempotency_supported=(
+                    intent.remote_idempotency_supported
+                ),
+                approval_fingerprint_json=(
+                    approval_fingerprint_json
+                ),
                 now=now,
             )
             if not inserted:
@@ -599,10 +696,12 @@ class ProjectOperationGuard:
                     targets_json=targets_json,
                     batch_items_json=batch_items_json,
                     payload_json=payload_json,
-                    approval_spec=(
-                        approval_spec
-                        if approval_id is not None
-                        else None
+                    approval_id=approval_id,
+                    approval_fingerprint_json=(
+                        approval_fingerprint_json
+                    ),
+                    remote_idempotency_supported=(
+                        intent.remote_idempotency_supported
                     ),
                 )
                 if raced is None:
@@ -815,6 +914,18 @@ class ProjectOperationGuard:
             and approval.approval_class
             == approval_class_for_action(
                 operation.canonical_action
+            )
+            and operation.approval_fingerprint_json
+            == canonical_json_object(
+                {
+                    "approval_class": approval.approval_class,
+                    "approval_id": approval.approval_id,
+                    "authorization_actor_id": (
+                        approval.authorization_actor_id
+                    ),
+                    "expires_at": approval.expires_at,
+                    "requires_owner": True,
+                }
             )
         ):
             raise self._approval_conflict(
@@ -1178,24 +1289,18 @@ class ProjectOperationGuard:
                 OperationErrorCode.INVALID_OPERATION_ARGUMENT
             )
         now = self._runtime._now()
-        rows = self._conn.execute(
-            """
-            SELECT approval_id
-            FROM project_approvals
-            WHERE status = 'pending'
-              AND operation_id IS NOT NULL
-              AND expires_at <= ?
-            ORDER BY expires_at, project_id, approval_id
-            LIMIT ?
-            """,
-            (now, limit),
-        ).fetchall()
+        with runtime_db.write_transaction(self._conn):
+            approval_ids = (
+                runtime_db._select_operation_approval_maintenance(
+                    self._conn, now=now, limit=limit
+                )
+            )
         expired: list[ProjectOperation] = []
-        for row in rows:
+        for approval_id in approval_ids:
             try:
                 expired.append(
                     self._resolve_operation_approval(
-                        row["approval_id"],
+                        approval_id,
                         resolver=None,
                         outcome=None,
                         maintenance=True,
@@ -1487,6 +1592,110 @@ class ProjectOperationGuard:
                 canonical_session_id=state.conversation_tip_id,
             )
 
+    def _recover_pending_operations(
+        self,
+        readback: OperationReadbackPort,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+        limit: int,
+    ) -> tuple[
+        tuple[ProjectOperation, TurnClaim | None], ...
+    ]:
+        """Run one bounded Task-6 pass over the derived recovery lane."""
+        if not (
+            callable(getattr(readback, "read_operation", None))
+            and type(worker_id) is str
+            and worker_id
+            and type(lease_seconds) is int
+            and lease_seconds > 0
+            and type(limit) is int
+            and 1 <= limit <= 100
+            and not self._conn.in_transaction
+        ):
+            raise ProjectOperationError(
+                OperationErrorCode.INVALID_OPERATION_ARGUMENT
+            )
+        selected = runtime_db._operation_pending_candidates(
+            self._conn, limit=limit
+        )
+        recovered: list[
+            tuple[ProjectOperation, TurnClaim | None]
+        ] = []
+        for candidate in selected:
+            current = runtime_db._operation_pending_for_turn(
+                self._conn,
+                project_id=candidate.project_id,
+                turn_id=candidate.turn_id,
+            )
+            if current != candidate:
+                continue
+            if candidate.status == "approved":
+                try:
+                    fresh = self._rehydrate_approved_operation(
+                        candidate.project_id,
+                        candidate.operation_id,
+                        worker_id=worker_id,
+                        lease_seconds=lease_seconds,
+                    )
+                except ProjectOperationError as exc:
+                    if (
+                        exc.code
+                        is OperationErrorCode.OPERATION_STATE_CONFLICT
+                    ):
+                        continue
+                    raise
+                if fresh is None:
+                    continue
+                recovered.append(
+                    (
+                        self._stored_public_operation(
+                            candidate.project_id,
+                            candidate.operation_id,
+                        ),
+                        fresh,
+                    )
+                )
+                continue
+            recovery = runtime_db._recovery_candidate_for_attempt(
+                self._conn,
+                project_id=candidate.project_id,
+                turn_id=candidate.turn_id,
+                attempt_id=candidate.attempt_id,
+                lease_generation=candidate.lease_generation,
+                fencing_token=candidate.fencing_token,
+            )
+            if recovery is None:
+                continue
+            claim = TurnClaim(
+                turn_id=recovery.turn_id,
+                project_id=recovery.project_id,
+                sequence=recovery.sequence,
+                worker_id=recovery.worker_id,
+                attempt_id=recovery.attempt_id,
+                lease_generation=recovery.lease_generation,
+                fencing_token=recovery.fencing_token,
+                lease_expires_at=recovery.lease_expires_at,
+                canonical_session_id=recovery.canonical_session_id,
+            )
+            try:
+                operation = self.reconcile(
+                    claim, candidate.operation_id, readback
+                )
+            except ProjectOperationError as exc:
+                if (
+                    exc.code
+                    is OperationErrorCode.OPERATION_STATE_CONFLICT
+                ):
+                    continue
+                raise
+            except ProjectRuntimeError as exc:
+                if exc.code is RuntimeErrorCode.STALE_TURN_CLAIM:
+                    continue
+                raise
+            recovered.append((operation, None))
+        return tuple(recovered)
+
     @staticmethod
     def _validate_operation_id(operation_id: object) -> None:
         if type(operation_id) is not str or not operation_id:
@@ -1511,6 +1720,30 @@ class ProjectOperationGuard:
             turn_id=claim.turn_id,
             operation_id=operation_id,
             current_version=current_version,
+        )
+
+    @staticmethod
+    def _operation_receipt_conflict(
+        claim: TurnClaim,
+        operation_id: str,
+        current_version: int,
+    ) -> ProjectOperationError:
+        return ProjectOperationError(
+            OperationErrorCode.OPERATION_RECEIPT_CONFLICT,
+            project_id=claim.project_id,
+            turn_id=claim.turn_id,
+            operation_id=operation_id,
+            current_version=current_version,
+        )
+
+    @staticmethod
+    def _is_exact_receipt_unique_conflict(
+        error: sqlite3.IntegrityError,
+    ) -> bool:
+        return str(error) == (
+            "UNIQUE constraint failed: "
+            "project_operations.project_id, "
+            "project_operations.receipt_id"
         )
 
     def _operation_for_claim(
@@ -1644,15 +1877,21 @@ class ProjectOperationGuard:
         claim: TurnClaim,
         *,
         now: int,
-    ) -> tuple[runtime_db.RuntimeState, bool]:
+    ) -> tuple[
+        runtime_db.RuntimeState,
+        bool,
+        runtime_db.RuntimeTurnRecord | None,
+        runtime_db.RuntimeControlRecord | None,
+        runtime_db.WorkerLeaseRecord | None,
+    ]:
         claim = self._runtime._require_turn_claim(claim)
         try:
-            state, _, _, _ = (
+            state, turn, control, lease = (
                 self._runtime._require_live_operation_claim(
                     claim, now=now
                 )
             )
-            return state, False
+            return state, False, turn, control, lease
         except ProjectRuntimeError as stale:
             candidate = (
                 runtime_db._recovery_candidate_for_attempt(
@@ -1688,7 +1927,7 @@ class ProjectOperationGuard:
                 == claim.canonical_session_id
             ):
                 raise stale
-            return state, True
+            return state, True, None, None, None
 
     @classmethod
     def _classify_readback(
@@ -1703,14 +1942,30 @@ class ProjectOperationGuard:
         str | None,
         str,
     ]:
-        blocked = (
-            "blocked",
-            None,
-            None,
-            None,
-            "operation_readback_ambiguous",
-            "operation.blocked",
-        )
+        if parked_receipt is None:
+            parked_id = parked_json = None
+        else:
+            parked_id, parked_json = cls._receipt_storage(
+                parked_receipt
+            )
+
+        def blocked() -> tuple[
+            Literal["approved", "reconciled", "blocked"],
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+            str,
+        ]:
+            return (
+                "blocked",
+                parked_id,
+                parked_json,
+                None,
+                "operation_readback_ambiguous",
+                "operation.blocked",
+            )
+
         try:
             if not (
                 type(result) is OperationReadbackResult
@@ -1718,14 +1973,14 @@ class ProjectOperationGuard:
                 and result.outcome
                 in {"applied", "not_applied", "unknown"}
             ):
-                return blocked
+                return blocked()
             if result.outcome == "unknown":
-                return blocked
+                return blocked()
             if not (
                 isinstance(result.evidence, Mapping)
                 and bool(result.evidence)
             ):
-                return blocked
+                return blocked()
             evidence = {
                 key: cls._thaw_json(value)
                 for key, value in result.evidence.items()
@@ -1735,7 +1990,7 @@ class ProjectOperationGuard:
                     parked_receipt is not None
                     or result.receipt is not None
                 ):
-                    return blocked
+                    return blocked()
                 return (
                     "approved",
                     None,
@@ -1757,18 +2012,16 @@ class ProjectOperationGuard:
             else:
                 result_id = result_json = None
             if parked_receipt is not None:
-                parked_id, parked_json = cls._receipt_storage(
-                    parked_receipt
-                )
-                if result_receipt is not None and (
-                    result_id != parked_id
+                if (
+                    result_receipt is None
+                    or result_id != parked_id
                     or result_json != parked_json
                 ):
-                    return blocked
+                    return blocked()
                 receipt_id, receipt_json = parked_id, parked_json
             else:
                 if result_receipt is None:
-                    return blocked
+                    return blocked()
                 receipt_id, receipt_json = result_id, result_json
             return (
                 "reconciled",
@@ -1784,7 +2037,7 @@ class ProjectOperationGuard:
                 "operation.reconciled",
             )
         except Exception:
-            return blocked
+            return blocked()
 
     def mark_started(
         self,
@@ -1794,13 +2047,25 @@ class ProjectOperationGuard:
         self._validate_operation_id(operation_id)
         now = self._runtime._now()
         with runtime_db.write_transaction(self._conn):
+            operation = self._operation_for_claim(
+                claim, operation_id
+            )
+            if (
+                operation.status == "approved"
+                and operation.readback_json is not None
+            ):
+                state = runtime_db.runtime_state_for_project(
+                    self._conn, claim.project_id
+                )
+                if state is None:
+                    raise RuntimeError("operation project disappeared")
+                raise self._operation_state_conflict(
+                    claim, operation_id, state.version
+                )
             state, _, _, _ = (
                 self._runtime._require_live_operation_claim(
                     claim, now=now
                 )
-            )
-            operation = self._operation_for_claim(
-                claim, operation_id
             )
             if operation.status == "effect_started":
                 return self._public_operation(operation)
@@ -1862,29 +2127,42 @@ class ProjectOperationGuard:
                     and operation.receipt_json == receipt_json
                 ):
                     return self._public_operation(operation)
-                raise ProjectOperationError(
-                    OperationErrorCode.OPERATION_RECEIPT_CONFLICT,
-                    project_id=claim.project_id,
-                    turn_id=claim.turn_id,
-                    operation_id=operation_id,
-                    current_version=state.version,
+                raise self._operation_receipt_conflict(
+                    claim, operation_id, state.version
                 )
             if operation.status != "effect_started":
                 raise self._operation_state_conflict(
                     claim, operation_id, state.version
                 )
-            if not runtime_db._record_project_operation_receipt(
+            owner = runtime_db._project_operation_receipt_owner(
                 self._conn,
                 project_id=claim.project_id,
-                turn_id=claim.turn_id,
-                operation_id=operation_id,
-                attempt_id=claim.attempt_id,
-                lease_generation=claim.lease_generation,
-                fencing_token=claim.fencing_token,
                 receipt_id=receipt_id,
-                receipt_json=receipt_json,
-                now=now,
-            ):
+            )
+            if owner is not None and owner != operation_id:
+                raise self._operation_receipt_conflict(
+                    claim, operation_id, state.version
+                )
+            try:
+                recorded = runtime_db._record_project_operation_receipt(
+                    self._conn,
+                    project_id=claim.project_id,
+                    turn_id=claim.turn_id,
+                    operation_id=operation_id,
+                    attempt_id=claim.attempt_id,
+                    lease_generation=claim.lease_generation,
+                    fencing_token=claim.fencing_token,
+                    receipt_id=receipt_id,
+                    receipt_json=receipt_json,
+                    now=now,
+                )
+            except sqlite3.IntegrityError as exc:
+                if not self._is_exact_receipt_unique_conflict(exc):
+                    raise
+                raise self._operation_receipt_conflict(
+                    claim, operation_id, state.version
+                ) from exc
+            if not recorded:
                 raise self._operation_state_conflict(
                     claim, operation_id, state.version
                 )
@@ -1912,7 +2190,13 @@ class ProjectOperationGuard:
         now = self._runtime._now()
         parked_receipt: OperationReceipt | None = None
         with runtime_db.write_transaction(self._conn):
-            state, recovery_candidate = (
+            (
+                state,
+                recovery_candidate,
+                _,
+                _,
+                _,
+            ) = (
                 self._reconciliation_authority(
                     claim, now=now
                 )
@@ -1936,7 +2220,7 @@ class ProjectOperationGuard:
                 raise self._operation_state_conflict(
                     claim, operation_id, state.version
                 )
-            if operation.status == "receipt_recorded":
+            if operation.receipt_id is not None:
                 parked_receipt = self._receipt_from_record(operation)
             if operation.status != "unknown":
                 if not runtime_db._park_project_operation_unknown(
@@ -1974,7 +2258,13 @@ class ProjectOperationGuard:
 
         phase_c_now = self._runtime._now()
         with runtime_db.write_transaction(self._conn):
-            state, phase_c_candidate = (
+            (
+                state,
+                phase_c_candidate,
+                phase_c_turn,
+                phase_c_control,
+                phase_c_lease,
+            ) = (
                 self._reconciliation_authority(
                     claim, now=phase_c_now
                 )
@@ -2004,23 +2294,100 @@ class ProjectOperationGuard:
                 blocked_reason,
                 event_kind,
             ) = self._classify_readback(result, parked_receipt)
-            if not runtime_db._finalize_project_operation_readback(
-                self._conn,
-                project_id=claim.project_id,
-                turn_id=claim.turn_id,
-                operation_id=operation_id,
-                attempt_id=claim.attempt_id,
-                lease_generation=claim.lease_generation,
-                fencing_token=claim.fencing_token,
-                target_status=target_status,
-                receipt_id=final_receipt_id,
-                receipt_json=final_receipt_json,
-                readback_json=readback_json,
-                blocked_reason=blocked_reason,
-                now=phase_c_now,
-            ):
+            if final_receipt_id is not None:
+                owner = runtime_db._project_operation_receipt_owner(
+                    self._conn,
+                    project_id=claim.project_id,
+                    receipt_id=final_receipt_id,
+                )
+                if owner is not None and owner != operation_id:
+                    target_status = "blocked"
+                    final_receipt_id = (
+                        current.receipt_id
+                        if current.receipt_id is not None
+                        else None
+                    )
+                    final_receipt_json = (
+                        current.receipt_json
+                        if current.receipt_id is not None
+                        else None
+                    )
+                    readback_json = None
+                    blocked_reason = "operation_readback_ambiguous"
+                    event_kind = "operation.blocked"
+            try:
+                finalized = (
+                    runtime_db._finalize_project_operation_readback(
+                        self._conn,
+                        project_id=claim.project_id,
+                        turn_id=claim.turn_id,
+                        operation_id=operation_id,
+                        attempt_id=claim.attempt_id,
+                        lease_generation=claim.lease_generation,
+                        fencing_token=claim.fencing_token,
+                        target_status=target_status,
+                        receipt_id=final_receipt_id,
+                        receipt_json=final_receipt_json,
+                        readback_json=readback_json,
+                        blocked_reason=blocked_reason,
+                        now=phase_c_now,
+                    )
+                )
+            except sqlite3.IntegrityError as exc:
+                if not self._is_exact_receipt_unique_conflict(exc):
+                    raise
+                target_status = "blocked"
+                final_receipt_id = current.receipt_id
+                final_receipt_json = current.receipt_json
+                readback_json = None
+                blocked_reason = "operation_readback_ambiguous"
+                event_kind = "operation.blocked"
+                finalized = (
+                    runtime_db._finalize_project_operation_readback(
+                        self._conn,
+                        project_id=claim.project_id,
+                        turn_id=claim.turn_id,
+                        operation_id=operation_id,
+                        attempt_id=claim.attempt_id,
+                        lease_generation=claim.lease_generation,
+                        fencing_token=claim.fencing_token,
+                        target_status=target_status,
+                        receipt_id=final_receipt_id,
+                        receipt_json=final_receipt_json,
+                        readback_json=readback_json,
+                        blocked_reason=blocked_reason,
+                        now=phase_c_now,
+                    )
+                )
+            if not finalized:
                 raise self._operation_state_conflict(
                     claim, operation_id, state.version
+                )
+            if (
+                target_status == "approved"
+                and not phase_c_candidate
+            ):
+                if (
+                    phase_c_turn is None
+                    or phase_c_control is None
+                    or phase_c_lease is None
+                ):
+                    raise RuntimeError(
+                        "live reconciliation records disappeared"
+                    )
+                runtime_db._park_live_runtime_turn_for_operation_block(
+                    self._conn,
+                    project_id=claim.project_id,
+                    turn_id=claim.turn_id,
+                    sequence=phase_c_turn.sequence,
+                    attempt_id=claim.attempt_id,
+                    worker_id=claim.worker_id,
+                    lease_generation=claim.lease_generation,
+                    fencing_token=claim.fencing_token,
+                    lease_expires_at=phase_c_lease.expires_at,
+                    canonical_session_id=claim.canonical_session_id,
+                    control_version=phase_c_control.control_version,
+                    now=phase_c_now,
                 )
             updated = self._runtime._advance_state(
                 state, phase_c_now
@@ -2064,6 +2431,8 @@ class ProjectOperationGuard:
                     claim, operation_id, state.version
                 )
             reason = "operation_readback_ambiguous"
+            receipt_id = operation.receipt_id
+            receipt_json = operation.receipt_json
             if not runtime_db._finalize_project_operation_readback(
                 self._conn,
                 project_id=claim.project_id,
@@ -2073,8 +2442,8 @@ class ProjectOperationGuard:
                 lease_generation=claim.lease_generation,
                 fencing_token=claim.fencing_token,
                 target_status="blocked",
-                receipt_id=None,
-                receipt_json=None,
+                receipt_id=receipt_id,
+                receipt_json=receipt_json,
                 readback_json=None,
                 blocked_reason=reason,
                 now=now,

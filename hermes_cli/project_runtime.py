@@ -913,6 +913,24 @@ class ProjectRuntime:
                 "unresolved",
                 "post_effect_blocked",
             }:
+                if (
+                    operation_disposition == "unresolved"
+                    and runtime_db._operation_pending_for_turn(
+                        self._conn,
+                        project_id=candidate.project_id,
+                        turn_id=candidate.turn_id,
+                    )
+                    is not None
+                ):
+                    recovered.append(
+                        self._turn_from_record(
+                            self._turn(
+                                candidate.project_id,
+                                candidate.turn_id,
+                            )
+                        )
+                    )
+                    continue
                 recovered.append(
                     self._block_recovery(candidate, now=now)
                 )
@@ -1117,6 +1135,21 @@ class ProjectRuntime:
                 operation_disposition == "pre_effect_blocked"
                 and outcome != "failed"
             ):
+                if (
+                    operation_disposition == "unresolved"
+                    and runtime_db._operation_pending_for_turn(
+                        self._conn,
+                        project_id=candidate.project_id,
+                        turn_id=candidate.turn_id,
+                    )
+                    is not None
+                ):
+                    return self._turn_from_record(
+                        self._turn(
+                            candidate.project_id,
+                            candidate.turn_id,
+                        )
+                    )
                 return self._block_current_recovery(
                     current_candidate, now=now
                 )
@@ -1200,6 +1233,17 @@ class ProjectRuntime:
         *,
         now: int,
     ) -> ProjectTurn:
+        if (
+            runtime_db._operation_pending_for_turn(
+                self._conn,
+                project_id=candidate.project_id,
+                turn_id=candidate.turn_id,
+            )
+            is not None
+        ):
+            return self._turn_from_record(
+                self._turn(candidate.project_id, candidate.turn_id)
+            )
         block_key = runtime_db._recovery_block_key(
             project_id=candidate.project_id,
             turn_id=candidate.turn_id,

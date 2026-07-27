@@ -714,11 +714,14 @@ def _valid_task5_turn_metadata(
         ):
             return False
     if terminal_result_id is None:
-        return True
+        return (
+            status not in {"succeeded", "failed"}
+            or execution_state is None
+        )
     return (
         status in {"succeeded", "failed"}
         and attempt_id is not None
-        and execution_state != "not_started"
+        and execution_state in {None, "started"}
     )
 
 
@@ -1579,8 +1582,16 @@ def _claim_oldest_queued_runtime_turn(
                     OR (
                         turn.status IN ('succeeded', 'failed')
                         AND turn.attempt_id IS NOT NULL
-                        AND turn.execution_state IS NOT 'not_started'
+                        AND (
+                            turn.execution_state IS NULL
+                            OR turn.execution_state = 'started'
+                        )
                     )
+                )
+                AND (
+                    turn.status NOT IN ('succeeded', 'failed')
+                    OR turn.terminal_result_id IS NOT NULL
+                    OR turn.execution_state IS NULL
                 )
                 AND turn.recovery_block_key IS NULL
                 AND typeof(turn.created_at) = 'integer'

@@ -933,6 +933,62 @@ def test_task5_turn_mapper_rejects_impossible_metadata_combinations(
         prdb.runtime_turn_from_row(row)
 
 
+@pytest.mark.parametrize("terminal_status", ["succeeded", "failed"])
+@pytest.mark.parametrize("execution_state", ["started", "not_started"])
+def test_terminal_execution_marker_without_result_fails_mapper(
+    terminal_status, execution_state
+):
+    row = {
+        "turn_id": "terminal-turn",
+        "project_id": "project",
+        "sequence": 1,
+        "idempotency_key": "terminal-key",
+        "payload_json": "{}",
+        "origin_binding_id": "binding",
+        "status": terminal_status,
+        "attempt_id": "attempt",
+        "lease_generation": 1,
+        "fencing_token": 1,
+        "execution_state": execution_state,
+        "terminal_result_id": None,
+        "recovery_block_key": None,
+        "created_at": 1,
+        "updated_at": 1,
+    }
+
+    with pytest.raises(RuntimeError):
+        prdb.runtime_turn_from_row(row)
+
+
+@pytest.mark.parametrize("terminal_status", ["succeeded", "failed"])
+def test_legacy_terminal_without_task5_evidence_remains_mappable(
+    terminal_status,
+):
+    row = {
+        "turn_id": "legacy-terminal",
+        "project_id": "project",
+        "sequence": 1,
+        "idempotency_key": "legacy-key",
+        "payload_json": "{}",
+        "origin_binding_id": "binding",
+        "status": terminal_status,
+        "attempt_id": "legacy-attempt",
+        "lease_generation": 1,
+        "fencing_token": 1,
+        "execution_state": None,
+        "terminal_result_id": None,
+        "recovery_block_key": None,
+        "created_at": 1,
+        "updated_at": 1,
+    }
+
+    mapped = prdb.runtime_turn_from_row(row)
+
+    assert mapped.status == terminal_status
+    assert mapped.execution_state is None
+    assert mapped.terminal_result_id is None
+
+
 def test_pair_validator_rejects_impossible_task5_metadata(tmp_path):
     _, conn, runtime, project_id, actor = _make_runtime(
         tmp_path / "pair-metadata.db"
@@ -949,6 +1005,43 @@ def test_pair_validator_rejects_impossible_task5_metadata(tmp_path):
                 conn,
                 turn=replace(
                     persisted, terminal_result_id="nonterminal-result"
+                ),
+            )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("terminal_status", ["succeeded", "failed"])
+@pytest.mark.parametrize("execution_state", ["started", "not_started"])
+def test_terminal_execution_marker_without_result_fails_pair_validation(
+    tmp_path, terminal_status, execution_state
+):
+    module, conn, runtime, project_id, actor = _make_runtime(
+        tmp_path / f"pair-missing-{terminal_status}-{execution_state}.db"
+    )
+    try:
+        turn, claim = _enqueue_and_claim(runtime, project_id, actor)
+        runtime.mark_turn_started(claim)
+        runtime.commit_turn(
+            claim,
+            module.CanonicalTurnResult(
+                terminal_status, f"result-{terminal_status}"
+            ),
+        )
+        persisted = prdb._runtime_turn_for_project(
+            conn, project_id=project_id, turn_id=turn.turn_id
+        )
+        assert persisted is not None
+
+        with pytest.raises(
+            RuntimeError, match="inconsistent Task-5 metadata"
+        ):
+            prdb._validate_runtime_turn_pair(
+                conn,
+                turn=replace(
+                    persisted,
+                    execution_state=execution_state,
+                    terminal_result_id=None,
                 ),
             )
     finally:
@@ -1002,6 +1095,52 @@ def test_claim_scan_rejects_historical_orphan_terminal_result(tmp_path):
         with pytest.raises(RuntimeError):
             runtime.claim_next_turn(
                 project_id, "worker", lease_seconds=30
+            )
+
+        assert _claim_snapshot(conn, project_id, target.turn_id) == before
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("terminal_status", ["succeeded", "failed"])
+@pytest.mark.parametrize("execution_state", ["started", "not_started"])
+def test_fifo_claim_rejects_terminal_execution_marker_without_result(
+    tmp_path, terminal_status, execution_state
+):
+    module, conn, runtime, project_id, actor = _make_runtime(
+        tmp_path / f"history-missing-{terminal_status}-{execution_state}.db"
+    )
+    try:
+        turn, claim = _enqueue_and_claim(runtime, project_id, actor)
+        runtime.mark_turn_started(claim)
+        runtime.commit_turn(
+            claim,
+            module.CanonicalTurnResult(
+                terminal_status, f"result-{terminal_status}"
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE project_turns
+            SET execution_state = ?, terminal_result_id = NULL
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (execution_state, project_id, turn.turn_id),
+        )
+        conn.commit()
+        state = prdb.runtime_state_for_project(conn, project_id)
+        target = runtime.enqueue_turn(
+            project_id,
+            {"message": "must remain queued"},
+            actor,
+            idempotency_key=f"after-{terminal_status}-{execution_state}",
+            expected_version=state.version,
+        )
+        before = _claim_snapshot(conn, project_id, target.turn_id)
+
+        with pytest.raises(RuntimeError):
+            runtime.claim_next_turn(
+                project_id, "later-worker", lease_seconds=30
             )
 
         assert _claim_snapshot(conn, project_id, target.turn_id) == before

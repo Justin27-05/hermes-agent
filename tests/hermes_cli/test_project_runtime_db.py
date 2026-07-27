@@ -876,6 +876,8 @@ def test_task4_store_refuses_an_illegal_turn_control_edge(runtime_conn):
                 turn_id="turn_illegal_edge",
                 expected_turn_status="queued",
                 next_turn_status="claimed",
+                expected_control_state="running",
+                expected_attempt_id=None,
                 expected_control_version=0,
                 next_control_state="running",
                 now=2,
@@ -885,6 +887,102 @@ def test_task4_store_refuses_an_illegal_turn_control_edge(runtime_conn):
         "SELECT status FROM project_turns WHERE turn_id = 'turn_illegal_edge'"
     ).fetchone()
     assert row[0] == "queued"
+
+
+@pytest.mark.parametrize(
+    ("mapper", "row"),
+    [
+        pytest.param(
+            prdb.runtime_turn_from_row,
+            {
+                "turn_id": "turn",
+                "project_id": "project",
+                "sequence": 1,
+                "idempotency_key": "key",
+                "payload_json": "{}",
+                "origin_binding_id": "binding",
+                "status": "illegal",
+                "attempt_id": None,
+                "lease_generation": 0,
+                "fencing_token": 0,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+            id="turn-enum",
+        ),
+        pytest.param(
+            prdb.runtime_turn_from_row,
+            {
+                "turn_id": "turn",
+                "project_id": "project",
+                "sequence": True,
+                "idempotency_key": "key",
+                "payload_json": "{}",
+                "origin_binding_id": "binding",
+                "status": "queued",
+                "attempt_id": None,
+                "lease_generation": "0",
+                "fencing_token": 0,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+            id="turn-bool-and-string-numerics",
+        ),
+        pytest.param(
+            prdb.runtime_control_from_row,
+            {
+                "turn_id": "turn",
+                "project_id": "project",
+                "control_state": "illegal",
+                "control_version": 0,
+                "idempotency_key": None,
+                "command_fingerprint": None,
+                "attempt_id": None,
+                "claim_worker_id": None,
+                "claim_lease_expires_at": None,
+                "claim_canonical_session_id": None,
+                "updated_at": 1,
+            },
+            id="control-enum",
+        ),
+        pytest.param(
+            prdb.runtime_control_from_row,
+            {
+                "turn_id": "turn",
+                "project_id": "project",
+                "control_state": "running",
+                "control_version": True,
+                "idempotency_key": None,
+                "command_fingerprint": None,
+                "attempt_id": "attempt",
+                "claim_worker_id": "worker",
+                "claim_lease_expires_at": "30",
+                "claim_canonical_session_id": "session",
+                "updated_at": 1,
+            },
+            id="control-bool-and-string-numerics",
+        ),
+        pytest.param(
+            prdb.worker_lease_from_row,
+            {
+                "lease_id": "attempt",
+                "project_id": "project",
+                "turn_id": "turn",
+                "worker_id": "worker",
+                "lease_generation": True,
+                "fencing_token": 1,
+                "expires_at": "30",
+                "updated_at": 1,
+            },
+            id="lease-bool-and-string-numerics",
+        ),
+    ],
+)
+def test_task4_row_mappers_fail_closed_on_illegal_enums_and_numerics(
+    mapper, row
+):
+    with pytest.raises(RuntimeError):
+        mapper(row)
 
 
 def test_event_sequence_is_unique_within_each_project(runtime_conn):
@@ -1095,16 +1193,18 @@ def _insert_raw_approval(
         INSERT INTO project_approvals (
             approval_id, project_id, actor_id, authorization_actor_id,
             canonical_action, approval_class, command_revision,
-            expected_runtime_version, expected_lifecycle, expected_phase,
+            expected_runtime_version, effective_runtime_version,
+            expected_lifecycle, expected_phase,
             targets_json, batch_boundary_json, status, expires_at,
             resolved_at, resolved_by_actor_id, created_at
         ) VALUES (
             ?, 'p_approval', 'owner-1', 'owner-1', 'publish', 'publish', 7,
-            ?, ?, ?, ?, '{}', ?, 100, ?, ?, 1
+            ?, ?, ?, ?, ?, '{}', ?, 100, ?, ?, 1
         )
         """,
         (
             approval_id,
+            expected_runtime_version,
             expected_runtime_version,
             expected_lifecycle,
             expected_phase,
@@ -1124,10 +1224,12 @@ def test_fresh_approval_schema_requires_runtime_snapshot_columns(runtime_conn):
 
     assert {
         "expected_runtime_version",
+        "effective_runtime_version",
         "expected_lifecycle",
         "expected_phase",
     } <= columns.keys()
     assert columns["expected_runtime_version"]["notnull"] == 1
+    assert columns["effective_runtime_version"]["notnull"] == 1
     assert columns["expected_lifecycle"]["notnull"] == 1
     assert columns["expected_phase"]["notnull"] == 1
 
@@ -1167,8 +1269,8 @@ def test_create_approval_persists_the_exact_live_runtime_snapshot(runtime_conn):
 
     row = runtime_conn.execute(
         """
-        SELECT expected_runtime_version, expected_lifecycle, expected_phase,
-               batch_boundary_json
+        SELECT expected_runtime_version, effective_runtime_version,
+               expected_lifecycle, expected_phase, batch_boundary_json
         FROM project_approvals
         WHERE approval_id = ?
         """,
@@ -1177,7 +1279,7 @@ def test_create_approval_persists_the_exact_live_runtime_snapshot(runtime_conn):
     assert created.expected_runtime_version == 0
     assert created.expected_lifecycle == "active"
     assert created.expected_phase == "implementation"
-    assert tuple(row)[:3] == (0, "active", "implementation")
+    assert tuple(row)[:4] == (0, 0, "active", "implementation")
     assert json.loads(row["batch_boundary_json"]) == {
         "authorization_actor_id": "owner-1",
         "canonical_action": "publish",
@@ -2243,12 +2345,15 @@ def test_task1_legacy_approval_rows_survive_additive_migration(tmp_path):
         """
         SELECT canonical_action, authorization_actor_id,
                resolved_by_actor_id, consumed_at,
-               expected_runtime_version, expected_lifecycle, expected_phase
+               expected_runtime_version, effective_runtime_version,
+               expected_lifecycle, expected_phase
         FROM project_approvals WHERE approval_id = 'legacy-approval'
         """
     ).fetchone()
     assert after == before
-    assert tuple(migrated) == (None, None, None, None, None, None, None)
+    assert tuple(migrated) == (
+        None, None, None, None, None, None, None, None,
+    )
     conn.close()
 
 
@@ -2368,7 +2473,8 @@ def test_two_connections_can_race_task1_approval_migration(tmp_path):
     expected = {
         "canonical_action", "authorization_actor_id",
         "resolved_by_actor_id", "consumed_at",
-        "expected_runtime_version", "expected_lifecycle", "expected_phase",
+        "expected_runtime_version", "effective_runtime_version",
+        "expected_lifecycle", "expected_phase",
     }
     assert all(expected <= columns for columns in results)
     conn = sqlite3.connect(db_path)

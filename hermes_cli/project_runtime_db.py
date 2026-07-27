@@ -115,6 +115,9 @@ CREATE TABLE IF NOT EXISTS project_run_controls (
     idempotency_key  TEXT,
     command_fingerprint TEXT,
     attempt_id       TEXT,
+    claim_worker_id  TEXT,
+    claim_lease_expires_at INTEGER,
+    claim_canonical_session_id TEXT,
     updated_at       INTEGER NOT NULL,
     UNIQUE (project_id, turn_id),
     UNIQUE (project_id, idempotency_key),
@@ -170,6 +173,11 @@ CREATE TABLE IF NOT EXISTS project_approvals (
                         CHECK (
                             typeof(expected_runtime_version) = 'integer'
                             AND expected_runtime_version >= 0
+                        ),
+    effective_runtime_version INTEGER NOT NULL
+                        CHECK (
+                            typeof(effective_runtime_version) = 'integer'
+                            AND effective_runtime_version >= 0
                         ),
     expected_lifecycle  TEXT NOT NULL
                         CHECK (
@@ -353,6 +361,9 @@ class RuntimeControlRecord:
     idempotency_key: str | None
     command_fingerprint: str | None
     attempt_id: str | None
+    claim_worker_id: str | None
+    claim_lease_expires_at: int | None
+    claim_canonical_session_id: str | None
     updated_at: int
 
 
@@ -422,6 +433,39 @@ def runtime_state_from_row(row: sqlite3.Row) -> RuntimeState:
         conversation_root_id=row["conversation_root_id"],
         conversation_tip_id=row["conversation_tip_id"],
         updated_at=row["updated_at"],
+    )
+
+
+_TURN_STATUSES = frozenset(
+    {
+        "queued",
+        "claimed",
+        "awaiting_approval",
+        "stop_requested",
+        "stopped",
+        "reconciling",
+        "succeeded",
+        "failed",
+        "cancelled",
+    }
+)
+_CONTROL_STATES = frozenset(
+    {"running", "stop_requested", "stopped", "resume_requested", "terminal"}
+)
+_TERMINAL_TURN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+
+
+def _stored_text(value: object, *, optional: bool = False) -> bool:
+    return (optional and value is None) or (
+        type(value) is str and bool(value)
+    )
+
+
+def _stored_int(
+    value: object, *, minimum: int = 0, optional: bool = False
+) -> bool:
+    return (optional and value is None) or (
+        type(value) is int and value >= minimum
     )
 
 
@@ -587,6 +631,7 @@ def _ensure_approval_columns(conn: sqlite3.Connection) -> None:
         ("resolved_by_actor_id", "resolved_by_actor_id TEXT"),
         ("consumed_at", "consumed_at INTEGER"),
         ("expected_runtime_version", "expected_runtime_version INTEGER"),
+        ("effective_runtime_version", "effective_runtime_version INTEGER"),
         ("expected_lifecycle", "expected_lifecycle TEXT"),
         ("expected_phase", "expected_phase TEXT"),
     ):
@@ -596,16 +641,29 @@ def _ensure_approval_columns(conn: sqlite3.Connection) -> None:
             name,
             ddl,
         )
+    with write_transaction(conn):
+        conn.execute(
+            """
+            UPDATE project_approvals
+            SET effective_runtime_version = expected_runtime_version
+            WHERE effective_runtime_version IS NULL
+              AND expected_runtime_version IS NOT NULL
+            """
+        )
 
 
 def _ensure_run_control_columns(conn: sqlite3.Connection) -> None:
     """Add Task-4's immutable control-command fingerprint additively."""
-    add_column_if_missing(
-        conn,
-        "project_run_controls",
-        "command_fingerprint",
-        "command_fingerprint TEXT",
-    )
+    for name, ddl in (
+        ("command_fingerprint", "command_fingerprint TEXT"),
+        ("claim_worker_id", "claim_worker_id TEXT"),
+        ("claim_lease_expires_at", "claim_lease_expires_at INTEGER"),
+        (
+            "claim_canonical_session_id",
+            "claim_canonical_session_id TEXT",
+        ),
+    ):
+        add_column_if_missing(conn, "project_run_controls", name, ddl)
 
 
 @contextlib.contextmanager
@@ -650,6 +708,36 @@ def runtime_state_for_project(
 
 def runtime_turn_from_row(row: sqlite3.Row) -> RuntimeTurnRecord:
     """Map a turn row without interpreting its caller payload."""
+    if not (
+        _stored_text(row["turn_id"])
+        and _stored_text(row["project_id"])
+        and _stored_int(row["sequence"], minimum=1)
+        and _stored_text(row["idempotency_key"])
+        and _stored_text(row["payload_json"])
+        and _stored_text(row["origin_binding_id"], optional=True)
+        and type(row["status"]) is str
+        and row["status"] in _TURN_STATUSES
+        and _stored_text(row["attempt_id"], optional=True)
+        and _stored_int(row["lease_generation"])
+        and _stored_int(row["fencing_token"])
+        and _stored_int(row["created_at"])
+        and _stored_int(row["updated_at"])
+    ):
+        raise RuntimeError("malformed persisted runtime turn")
+    if (
+        row["attempt_id"] is None
+        and (
+            row["lease_generation"] != 0
+            or row["fencing_token"] != 0
+        )
+    ) or (
+        row["attempt_id"] is not None
+        and (
+            row["lease_generation"] <= 0
+            or row["fencing_token"] <= 0
+        )
+    ):
+        raise RuntimeError("persisted turn has an invalid attempt identity")
     return RuntimeTurnRecord(
         turn_id=row["turn_id"],
         project_id=row["project_id"],
@@ -668,6 +756,31 @@ def runtime_turn_from_row(row: sqlite3.Row) -> RuntimeTurnRecord:
 
 def runtime_control_from_row(row: sqlite3.Row) -> RuntimeControlRecord:
     """Map the durable control lane for one exact project turn."""
+    audit_values = (
+        row["claim_worker_id"],
+        row["claim_lease_expires_at"],
+        row["claim_canonical_session_id"],
+    )
+    audit_is_empty = all(value is None for value in audit_values)
+    audit_is_complete = (
+        _stored_text(row["claim_worker_id"])
+        and _stored_int(row["claim_lease_expires_at"])
+        and _stored_text(row["claim_canonical_session_id"])
+    )
+    if not (
+        _stored_text(row["turn_id"])
+        and _stored_text(row["project_id"])
+        and type(row["control_state"]) is str
+        and row["control_state"] in _CONTROL_STATES
+        and _stored_int(row["control_version"])
+        and _stored_text(row["idempotency_key"], optional=True)
+        and _stored_text(row["command_fingerprint"], optional=True)
+        and _stored_text(row["attempt_id"], optional=True)
+        and (audit_is_empty or audit_is_complete)
+        and not (row["attempt_id"] is None and audit_is_complete)
+        and _stored_int(row["updated_at"])
+    ):
+        raise RuntimeError("malformed persisted runtime control")
     return RuntimeControlRecord(
         turn_id=row["turn_id"],
         project_id=row["project_id"],
@@ -676,12 +789,26 @@ def runtime_control_from_row(row: sqlite3.Row) -> RuntimeControlRecord:
         idempotency_key=row["idempotency_key"],
         command_fingerprint=row["command_fingerprint"],
         attempt_id=row["attempt_id"],
+        claim_worker_id=row["claim_worker_id"],
+        claim_lease_expires_at=row["claim_lease_expires_at"],
+        claim_canonical_session_id=row["claim_canonical_session_id"],
         updated_at=row["updated_at"],
     )
 
 
 def worker_lease_from_row(row: sqlite3.Row) -> WorkerLeaseRecord:
     """Map a current worker identity; expiry interpretation remains Task 5."""
+    if not (
+        _stored_text(row["lease_id"])
+        and _stored_text(row["project_id"])
+        and _stored_text(row["turn_id"])
+        and _stored_text(row["worker_id"])
+        and _stored_int(row["lease_generation"], minimum=1)
+        and _stored_int(row["fencing_token"], minimum=1)
+        and _stored_int(row["expires_at"])
+        and _stored_int(row["updated_at"])
+    ):
+        raise RuntimeError("malformed persisted worker lease")
     return WorkerLeaseRecord(
         lease_id=row["lease_id"],
         project_id=row["project_id"],
@@ -694,7 +821,7 @@ def worker_lease_from_row(row: sqlite3.Row) -> WorkerLeaseRecord:
     )
 
 
-def runtime_turn_for_project(
+def _runtime_turn_for_project(
     conn: sqlite3.Connection, *, project_id: str, turn_id: str
 ) -> RuntimeTurnRecord | None:
     row = conn.execute(
@@ -707,7 +834,7 @@ def runtime_turn_for_project(
     return runtime_turn_from_row(row) if row is not None else None
 
 
-def runtime_control_for_turn(
+def _runtime_control_for_turn(
     conn: sqlite3.Connection, *, project_id: str, turn_id: str
 ) -> RuntimeControlRecord | None:
     row = conn.execute(
@@ -720,7 +847,7 @@ def runtime_control_for_turn(
     return runtime_control_from_row(row) if row is not None else None
 
 
-def queued_turns_for_project(
+def _queued_turns_for_project(
     conn: sqlite3.Connection, *, project_id: str
 ) -> tuple[RuntimeTurnRecord, ...]:
     rows = conn.execute(
@@ -734,7 +861,7 @@ def queued_turns_for_project(
     return tuple(runtime_turn_from_row(row) for row in rows)
 
 
-def current_worker_lease_for_turn(
+def _current_worker_lease_for_turn(
     conn: sqlite3.Connection, *, project_id: str, turn_id: str
 ) -> WorkerLeaseRecord | None:
     row = conn.execute(
@@ -839,9 +966,95 @@ def _insert_queued_runtime_turn(
         """,
         (turn_id, project_id, now),
     )
-    result = runtime_turn_for_project(conn, project_id=project_id, turn_id=turn_id)
+    result = _runtime_turn_for_project(conn, project_id=project_id, turn_id=turn_id)
     assert result is not None
     return result
+
+
+def _validate_runtime_turn_pair(
+    conn: sqlite3.Connection,
+    *,
+    turn: RuntimeTurnRecord,
+) -> RuntimeControlRecord:
+    """Fail closed unless one persisted turn has its exact control/lease pair."""
+    control = _runtime_control_for_turn(
+        conn, project_id=turn.project_id, turn_id=turn.turn_id
+    )
+    if control is None or not (
+        control.project_id == turn.project_id
+        and control.turn_id == turn.turn_id
+    ):
+        raise RuntimeError("runtime turn has no matching control row")
+    lease = _current_worker_lease_for_turn(
+        conn, project_id=turn.project_id, turn_id=turn.turn_id
+    )
+    audit_complete = (
+        control.claim_worker_id is not None
+        and control.claim_lease_expires_at is not None
+        and control.claim_canonical_session_id is not None
+    )
+    lease_matches = (
+        lease is not None
+        and audit_complete
+        and lease.lease_id == turn.attempt_id
+        and lease.worker_id == control.claim_worker_id
+        and lease.lease_generation == turn.lease_generation
+        and lease.fencing_token == turn.fencing_token
+        and lease.expires_at == control.claim_lease_expires_at
+    )
+    attempt_matches = (
+        turn.attempt_id is not None
+        and control.attempt_id == turn.attempt_id
+        and audit_complete
+    )
+    if turn.status == "queued":
+        if turn.attempt_id is None:
+            valid = (
+                control.control_state == "running"
+                and control.attempt_id is None
+                and not audit_complete
+                and lease is None
+            )
+        else:
+            valid = (
+                control.control_state == "resume_requested"
+                and attempt_matches
+                and lease is None
+            )
+    elif turn.status in {"claimed", "awaiting_approval"}:
+        valid = (
+            control.control_state == "running"
+            and attempt_matches
+            and lease_matches
+        )
+    elif turn.status == "stop_requested":
+        valid = (
+            control.control_state == "stop_requested"
+            and attempt_matches
+            and lease_matches
+        )
+    elif turn.status == "stopped":
+        valid = (
+            control.control_state == "stopped"
+            and attempt_matches
+            and lease is None
+        )
+    elif turn.status == "reconciling":
+        valid = (
+            control.control_state in {"running", "stop_requested"}
+            and attempt_matches
+            and (lease is None or lease_matches)
+        )
+    else:
+        assert turn.status in _TERMINAL_TURN_STATUSES
+        valid = (
+            control.control_state == "terminal"
+            and control.attempt_id == turn.attempt_id
+            and lease is None
+        )
+    if not valid:
+        raise RuntimeError("runtime turn/control/lease pair is inconsistent")
+    return control
 
 
 def _claim_oldest_queued_runtime_turn(
@@ -850,36 +1063,43 @@ def _claim_oldest_queued_runtime_turn(
     project_id: str,
     worker_id: str,
     attempt_id: str,
+    canonical_session_id: str,
     now: int,
     lease_seconds: int,
 ) -> RuntimeTurnRecord | None:
     """Claim only the exact FIFO head; Task 5 owns expiry and takeover."""
-    if conn.execute(
-        """
-        SELECT 1 FROM project_turns
-        WHERE project_id = ?
-          AND status IN ('claimed', 'awaiting_approval', 'stop_requested', 'stopped', 'reconciling')
-        LIMIT 1
-        """,
-        (project_id,),
-    ).fetchone() is not None:
-        return None
-    row = conn.execute(
+    rows = conn.execute(
         """
         SELECT * FROM project_turns
-        WHERE project_id = ? AND status = 'queued'
-        ORDER BY sequence, turn_id LIMIT 1
+        WHERE project_id = ?
+        ORDER BY sequence, turn_id
         """,
         (project_id,),
-    ).fetchone()
-    if row is None:
+    ).fetchall()
+    turns: list[RuntimeTurnRecord] = []
+    controls: dict[str, RuntimeControlRecord] = {}
+    for row in rows:
+        stored_turn = runtime_turn_from_row(row)
+        turns.append(stored_turn)
+        controls[stored_turn.turn_id] = _validate_runtime_turn_pair(
+            conn, turn=stored_turn
+        )
+    turn = next(
+        (
+            stored_turn
+            for stored_turn in turns
+            if stored_turn.status not in _TERMINAL_TURN_STATUSES
+        ),
+        None,
+    )
+    if turn is None:
         return None
-    turn = runtime_turn_from_row(row)
-    control = runtime_control_for_turn(conn, project_id=project_id, turn_id=turn.turn_id)
-    if control is None or control.control_state not in {"running", "resume_requested"}:
-        raise RuntimeError("queued runtime turn has an invalid control row")
+    if turn.status != "queued":
+        return None
+    control = controls[turn.turn_id]
     generation = turn.lease_generation + 1
     fence = turn.fencing_token + 1
+    lease_expires_at = now + lease_seconds
     if conn.execute(
         """
         UPDATE project_turns
@@ -887,18 +1107,52 @@ def _claim_oldest_queued_runtime_turn(
             fencing_token = ?, updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND status = 'queued'
           AND lease_generation = ? AND fencing_token = ?
+          AND (
+                (attempt_id IS NULL AND ? IS NULL)
+                OR attempt_id = ?
+          )
         """,
-        (attempt_id, generation, fence, now, project_id, turn.turn_id, turn.lease_generation, turn.fencing_token),
+        (
+            attempt_id,
+            generation,
+            fence,
+            now,
+            project_id,
+            turn.turn_id,
+            turn.lease_generation,
+            turn.fencing_token,
+            turn.attempt_id,
+            turn.attempt_id,
+        ),
     ).rowcount != 1:
         return None
     if conn.execute(
         """
         UPDATE project_run_controls
         SET control_state = 'running', control_version = control_version + 1,
-            attempt_id = ?, updated_at = ?
+            attempt_id = ?, claim_worker_id = ?,
+            claim_lease_expires_at = ?,
+            claim_canonical_session_id = ?, updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND control_version = ?
+          AND control_state = ?
+          AND (
+                (attempt_id IS NULL AND ? IS NULL)
+                OR attempt_id = ?
+          )
         """,
-        (attempt_id, now, project_id, turn.turn_id, control.control_version),
+        (
+            attempt_id,
+            worker_id,
+            lease_expires_at,
+            canonical_session_id,
+            now,
+            project_id,
+            turn.turn_id,
+            control.control_version,
+            control.control_state,
+            control.attempt_id,
+            control.attempt_id,
+        ),
     ).rowcount != 1:
         raise RuntimeError("runtime control changed during guarded turn claim")
     conn.execute(
@@ -908,18 +1162,27 @@ def _claim_oldest_queued_runtime_turn(
             fencing_token, expires_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (attempt_id, project_id, turn.turn_id, worker_id, generation, fence, now + lease_seconds, now),
+        (
+            attempt_id,
+            project_id,
+            turn.turn_id,
+            worker_id,
+            generation,
+            fence,
+            lease_expires_at,
+            now,
+        ),
     )
-    result = runtime_turn_for_project(conn, project_id=project_id, turn_id=turn.turn_id)
+    result = _runtime_turn_for_project(conn, project_id=project_id, turn_id=turn.turn_id)
     assert result is not None
     return result
 
 
 _TASK4_TRANSITIONS = {
-    ("queued", "cancelled", "terminal"),
-    ("claimed", "stop_requested", "stop_requested"),
-    ("stop_requested", "stopped", "stopped"),
-    ("stopped", "queued", "resume_requested"),
+    ("queued", "running", "cancelled", "terminal"),
+    ("claimed", "running", "stop_requested", "stop_requested"),
+    ("stop_requested", "stop_requested", "stopped", "stopped"),
+    ("stopped", "stopped", "queued", "resume_requested"),
 }
 
 
@@ -930,6 +1193,8 @@ def _transition_runtime_turn_and_control(
     turn_id: str,
     expected_turn_status: str,
     next_turn_status: str,
+    expected_control_state: str,
+    expected_attempt_id: str | None,
     expected_control_version: int,
     next_control_state: str,
     now: int,
@@ -937,14 +1202,31 @@ def _transition_runtime_turn_and_control(
     command_fingerprint: str | None = None,
 ) -> RuntimeControlRecord | None:
     """Atomically move a legal turn/control pair under caller-owned SQL scope."""
-    if (expected_turn_status, next_turn_status, next_control_state) not in _TASK4_TRANSITIONS:
+    if (
+        expected_turn_status,
+        expected_control_state,
+        next_turn_status,
+        next_control_state,
+    ) not in _TASK4_TRANSITIONS:
         raise ValueError("unsupported Task-4 turn/control transition")
     if conn.execute(
         """
         UPDATE project_turns SET status = ?, updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND status = ?
+          AND (
+                (attempt_id IS NULL AND ? IS NULL)
+                OR attempt_id = ?
+          )
         """,
-        (next_turn_status, now, project_id, turn_id, expected_turn_status),
+        (
+            next_turn_status,
+            now,
+            project_id,
+            turn_id,
+            expected_turn_status,
+            expected_attempt_id,
+            expected_attempt_id,
+        ),
     ).rowcount != 1:
         return None
     if conn.execute(
@@ -954,11 +1236,27 @@ def _transition_runtime_turn_and_control(
             idempotency_key = COALESCE(?, idempotency_key),
             command_fingerprint = COALESCE(?, command_fingerprint), updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND control_version = ?
+          AND control_state = ?
+          AND (
+                (attempt_id IS NULL AND ? IS NULL)
+                OR attempt_id = ?
+          )
         """,
-        (next_control_state, idempotency_key, command_fingerprint, now, project_id, turn_id, expected_control_version),
+        (
+            next_control_state,
+            idempotency_key,
+            command_fingerprint,
+            now,
+            project_id,
+            turn_id,
+            expected_control_version,
+            expected_control_state,
+            expected_attempt_id,
+            expected_attempt_id,
+        ),
     ).rowcount != 1:
         raise RuntimeError("runtime control changed after durable turn transition")
-    return runtime_control_for_turn(conn, project_id=project_id, turn_id=turn_id)
+    return _runtime_control_for_turn(conn, project_id=project_id, turn_id=turn_id)
 
 
 def _delete_current_worker_lease(
@@ -970,15 +1268,24 @@ def _delete_current_worker_lease(
     worker_id: str,
     lease_generation: int,
     fencing_token: int,
+    lease_expires_at: int,
 ) -> bool:
     """Close exactly the current worker identity; never delete a stale lease."""
     return conn.execute(
         """
         DELETE FROM project_worker_leases
         WHERE project_id = ? AND turn_id = ? AND lease_id = ? AND worker_id = ?
-          AND lease_generation = ? AND fencing_token = ?
+          AND lease_generation = ? AND fencing_token = ? AND expires_at = ?
         """,
-        (project_id, turn_id, attempt_id, worker_id, lease_generation, fencing_token),
+        (
+            project_id,
+            turn_id,
+            attempt_id,
+            worker_id,
+            lease_generation,
+            fencing_token,
+            lease_expires_at,
+        ),
     ).rowcount == 1
 
 
@@ -988,6 +1295,9 @@ def _link_approval_to_claimed_turn(
     approval_id: str,
     project_id: str,
     turn_id: str,
+    expected_attempt_id: str,
+    expected_lease_generation: int,
+    expected_fencing_token: int,
     now: int,
 ) -> bool:
     """Bind one newly-created approval to one claimed FIFO head atomically."""
@@ -1003,8 +1313,18 @@ def _link_approval_to_claimed_turn(
         """
         UPDATE project_turns SET status = 'awaiting_approval', updated_at = ?
         WHERE project_id = ? AND turn_id = ? AND status = 'claimed'
+          AND attempt_id = ?
+          AND lease_generation = ?
+          AND fencing_token = ?
         """,
-        (now, project_id, turn_id),
+        (
+            now,
+            project_id,
+            turn_id,
+            expected_attempt_id,
+            expected_lease_generation,
+            expected_fencing_token,
+        ),
     ).rowcount != 1:
         raise RuntimeError("claimed turn changed while linking approval")
     return True
@@ -1503,13 +1823,12 @@ def _canonical_boundary_json(
     )
 
 
-def _approval_storage_values(
-    request: ApprovalRequest, now: int
+def _approval_identity_storage_values(
+    request: ApprovalRequest,
 ) -> tuple[tuple[str, ...], str, str]:
+    """Validate and encode immutable request identity without reading the clock."""
     if not isinstance(request, ApprovalRequest):
         raise ValueError("request must be an ApprovalRequest")
-    if type(now) is not int:
-        raise ValueError("now must be an integer timestamp")
     if not all(
         type(value) is str and bool(value)
         for value in (
@@ -1560,8 +1879,8 @@ def _approval_storage_values(
         )
     ):
         raise ValueError("new approvals cannot contain resolved or consumed state")
-    if type(request.expires_at) is not int or request.expires_at <= now:
-        raise ValueError("approval expiry must be in the future")
+    if type(request.expires_at) is not int or request.expires_at < 0:
+        raise ValueError("approval expiry must be a non-negative integer")
     canonical_targets = canonicalize_targets(request.targets)
     if canonical_targets is None or not canonical_targets:
         raise ValueError("targets must be non-empty canonical paths")
@@ -1579,6 +1898,17 @@ def _approval_storage_values(
             expected_phase=request.expected_phase,
         ),
     )
+
+
+def _approval_storage_values(
+    request: ApprovalRequest, now: int
+) -> tuple[tuple[str, ...], str, str]:
+    values = _approval_identity_storage_values(request)
+    if type(now) is not int:
+        raise ValueError("now must be an integer timestamp")
+    if request.expires_at <= now:
+        raise ValueError("approval expiry must be in the future")
+    return values
 
 
 def _approval_from_row(row: sqlite3.Row) -> ApprovalRequest:
@@ -1629,13 +1959,24 @@ def _row_matches_immutable_request(
     )
 
 
-def create_approval_request(
-    conn: sqlite3.Connection, request: ApprovalRequest, *, now: int
+def _create_approval_request(
+    conn: sqlite3.Connection,
+    request: ApprovalRequest,
+    *,
+    now: int,
+    effective_runtime_version: int,
 ) -> ApprovalRequest:
-    """Insert-or-read one immutable approval ID; reject every payload collision."""
+    """Persist one request with distinct immutable and live authority versions."""
     canonical_targets, targets_json, boundary_json = _approval_storage_values(
         request, now
     )
+    if (
+        type(effective_runtime_version) is not int
+        or effective_runtime_version < 0
+    ):
+        raise ValueError(
+            "effective_runtime_version must be a non-negative integer"
+        )
     with write_transaction(conn):
         state = _runtime_state_for_project(conn, request.project_id)
         if not (
@@ -1653,11 +1994,12 @@ def create_approval_request(
                 INSERT INTO project_approvals (
                     approval_id, project_id, actor_id, authorization_actor_id,
                     canonical_action, approval_class, command_revision,
-                    expected_runtime_version, expected_lifecycle, expected_phase,
+                    expected_runtime_version, effective_runtime_version,
+                    expected_lifecycle, expected_phase,
                     targets_json, batch_boundary_json, status, expires_at,
                     resolved_at, resolved_by_actor_id, consumed_at, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?,
                     NULL, NULL, NULL, ?
                 )
                 ON CONFLICT DO NOTHING
@@ -1671,6 +2013,7 @@ def create_approval_request(
                     request.approval_class,
                     request.command_revision,
                     request.expected_runtime_version,
+                    effective_runtime_version,
                     request.expected_lifecycle,
                     request.expected_phase,
                     targets_json,
@@ -1690,7 +2033,7 @@ def create_approval_request(
             request,
             targets_json=targets_json,
             boundary_json=boundary_json,
-        ):
+        ) or row["effective_runtime_version"] != effective_runtime_version:
             raise ApprovalConflictError(
                 "approval id or immutable batch boundary already exists"
             )
@@ -1698,6 +2041,20 @@ def create_approval_request(
     if result.targets != canonical_targets:
         raise ApprovalConflictError("stored approval targets are not canonical")
     return result
+
+
+def create_approval_request(
+    conn: sqlite3.Connection, request: ApprovalRequest, *, now: int
+) -> ApprovalRequest:
+    """Insert-or-read a generic approval whose live version is unchanged."""
+    if not isinstance(request, ApprovalRequest):
+        raise ValueError("request must be an ApprovalRequest")
+    return _create_approval_request(
+        conn,
+        request,
+        now=now,
+        effective_runtime_version=request.expected_runtime_version,
+    )
 
 
 def _expire_approvals(conn: sqlite3.Connection, now: int) -> None:
@@ -1756,7 +2113,7 @@ def resolve_approval(
                   SELECT 1
                   FROM project_runtime_state AS state
                   WHERE state.project_id = approval.project_id
-                    AND state.version = approval.expected_runtime_version
+                    AND state.version = approval.effective_runtime_version
                     AND state.lifecycle = approval.expected_lifecycle
                     AND state.current_phase = approval.expected_phase
               )
@@ -1925,18 +2282,15 @@ def consume_approval_authorization(
                   SELECT 1
                   FROM project_runtime_state AS state
                   WHERE state.project_id = approval.project_id
-                    AND state.version = ?
-                    AND state.lifecycle = ?
-                    AND state.current_phase = ?
+                    AND state.version = approval.effective_runtime_version
+                    AND state.lifecycle = approval.expected_lifecycle
+                    AND state.current_phase = approval.expected_phase
               )
             """,
             (
                 now,
                 *parameters,
                 now,
-                expected_runtime_version,
-                expected_lifecycle,
-                expected_phase,
             ),
         )
     return cursor.rowcount == 1

@@ -74,6 +74,7 @@ class RuntimeErrorCode(str, Enum):
     APPROVAL_CONFLICT = "approval_conflict"
     STALE_TURN_CLAIM = "stale_turn_claim"
     TURN_EXECUTION_NOT_STARTED = "turn_execution_not_started"
+    TURN_OPERATIONS_UNRESOLVED = "turn_operations_unresolved"
     TERMINAL_RESULT_CONFLICT = "terminal_result_conflict"
 
 
@@ -547,6 +548,32 @@ class ProjectRuntime:
             raise self._stale_turn_claim(claim)
         return state, turn, control, lease
 
+    def _require_live_operation_claim(
+        self,
+        claim: TurnClaim,
+        *,
+        now: int,
+    ) -> tuple[
+        runtime_db.RuntimeState,
+        runtime_db.RuntimeTurnRecord,
+        runtime_db.RuntimeControlRecord,
+        runtime_db.WorkerLeaseRecord,
+    ]:
+        """Share the full Task-5 fence predicate with operation mutations."""
+        claim = self._require_turn_claim(claim)
+        if not _is_nonnegative_int(now):
+            raise ProjectRuntimeError(RuntimeErrorCode.INVALID_ARGUMENT)
+        state, turn, control, lease = self._live_claim_records(
+            claim, now=now
+        )
+        if not (
+            turn.status == "claimed"
+            and control.control_state == "running"
+            and turn.execution_state in {"not_started", "started"}
+        ):
+            raise self._stale_turn_claim(claim)
+        return state, turn, control, lease
+
     @staticmethod
     def _claim_at_horizon(
         claim: TurnClaim,
@@ -661,6 +688,7 @@ class ProjectRuntime:
         ):
             raise ProjectRuntimeError(RuntimeErrorCode.INVALID_ARGUMENT)
         now = self._now()
+        parked_operation_block = False
         with runtime_db.write_transaction(self._conn):
             state = runtime_db.runtime_state_for_project(
                 self._conn, claim.project_id
@@ -721,39 +749,115 @@ class ProjectRuntime:
                 )
             if turn.execution_state != "started":
                 raise self._stale_turn_claim(claim)
-            committed = runtime_db._commit_runtime_turn(
-                self._conn,
+            operation_disposition = (
+                runtime_db._project_operation_disposition_for_turn(
+                    self._conn,
+                    project_id=claim.project_id,
+                    turn_id=claim.turn_id,
+                )
+            )
+            if operation_disposition == "post_effect_blocked":
+                candidate = (
+                    runtime_db
+                    ._park_live_runtime_turn_for_operation_block(
+                        self._conn,
+                        project_id=claim.project_id,
+                        turn_id=claim.turn_id,
+                        sequence=claim.sequence,
+                        attempt_id=claim.attempt_id,
+                        worker_id=claim.worker_id,
+                        lease_generation=claim.lease_generation,
+                        fencing_token=claim.fencing_token,
+                        lease_expires_at=lease.expires_at,
+                        canonical_session_id=(
+                            claim.canonical_session_id
+                        ),
+                        control_version=control.control_version,
+                        now=now,
+                    )
+                )
+                updated_state = self._advance_state(state, now)
+                self._event(
+                    claim.project_id,
+                    "turn.reconciling",
+                    claim.turn_id,
+                    {
+                        "attempt_id": claim.attempt_id,
+                        "fencing_token": claim.fencing_token,
+                        "lease_generation": (
+                            claim.lease_generation
+                        ),
+                        "source_status": "claimed",
+                        "turn_id": claim.turn_id,
+                        "version": updated_state.version,
+                    },
+                    now,
+                )
+                self._block_current_recovery(
+                    candidate, now=now
+                )
+                parked_operation_block = True
+            else:
+                terminal_allowed = operation_disposition in {
+                    "clear",
+                    "reconciled",
+                } or (
+                    operation_disposition
+                    == "pre_effect_blocked"
+                    and result.status == "failed"
+                )
+                if not terminal_allowed:
+                    raise ProjectRuntimeError(
+                        RuntimeErrorCode.TURN_OPERATIONS_UNRESOLVED,
+                        project_id=claim.project_id,
+                        turn_id=claim.turn_id,
+                    )
+                committed = runtime_db._commit_runtime_turn(
+                    self._conn,
+                    project_id=claim.project_id,
+                    turn_id=claim.turn_id,
+                    sequence=claim.sequence,
+                    terminal_status=result.status,
+                    terminal_result_id=result.result_id,
+                    attempt_id=claim.attempt_id,
+                    worker_id=claim.worker_id,
+                    lease_generation=claim.lease_generation,
+                    fencing_token=claim.fencing_token,
+                    canonical_session_id=(
+                        claim.canonical_session_id
+                    ),
+                    expires_at=lease.expires_at,
+                    expected_control_version=(
+                        control.control_version
+                    ),
+                    now=now,
+                )
+                if committed is None:
+                    raise self._stale_turn_claim(claim)
+                updated_state = self._advance_state(state, now)
+                self._event(
+                    claim.project_id,
+                    f"turn.{result.status}",
+                    claim.turn_id,
+                    {
+                        "attempt_id": claim.attempt_id,
+                        "fencing_token": claim.fencing_token,
+                        "lease_generation": (
+                            claim.lease_generation
+                        ),
+                        "turn_id": claim.turn_id,
+                        "version": updated_state.version,
+                    },
+                    now,
+                )
+                return self._turn_from_record(committed)
+        if parked_operation_block:
+            raise ProjectRuntimeError(
+                RuntimeErrorCode.TURN_OPERATIONS_UNRESOLVED,
                 project_id=claim.project_id,
                 turn_id=claim.turn_id,
-                sequence=claim.sequence,
-                terminal_status=result.status,
-                terminal_result_id=result.result_id,
-                attempt_id=claim.attempt_id,
-                worker_id=claim.worker_id,
-                lease_generation=claim.lease_generation,
-                fencing_token=claim.fencing_token,
-                canonical_session_id=claim.canonical_session_id,
-                expires_at=lease.expires_at,
-                expected_control_version=control.control_version,
-                now=now,
             )
-            if committed is None:
-                raise self._stale_turn_claim(claim)
-            updated_state = self._advance_state(state, now)
-            self._event(
-                claim.project_id,
-                f"turn.{result.status}",
-                claim.turn_id,
-                {
-                    "attempt_id": claim.attempt_id,
-                    "fencing_token": claim.fencing_token,
-                    "lease_generation": claim.lease_generation,
-                    "turn_id": claim.turn_id,
-                    "version": updated_state.version,
-                },
-                now,
-            )
-            return self._turn_from_record(committed)
+        raise RuntimeError("operation commit reached invalid state")
 
     def reconcile_inflight_turns(
         self,
@@ -798,6 +902,38 @@ class ProjectRuntime:
                 recovered.append(item)
                 continue
             candidate = item
+            operation_disposition = (
+                runtime_db._project_operation_disposition_for_turn(
+                    self._conn,
+                    project_id=candidate.project_id,
+                    turn_id=candidate.turn_id,
+                )
+            )
+            if operation_disposition in {
+                "unresolved",
+                "post_effect_blocked",
+            }:
+                recovered.append(
+                    self._block_recovery(candidate, now=now)
+                )
+                continue
+            if operation_disposition == "pre_effect_blocked":
+                recovered.append(
+                    self._finalize_recovery(
+                        candidate,
+                        outcome="failed",
+                        result_id=(
+                            "operation-pre-effect-blocked:"
+                            f"{candidate.project_id}:"
+                            f"{candidate.turn_id}:"
+                            f"{candidate.attempt_id}:"
+                            f"{candidate.lease_generation}:"
+                            f"{candidate.fencing_token}"
+                        ),
+                        now=now,
+                    )
+                )
+                continue
             result_id = None
             if candidate.execution_state == "not_started":
                 if candidate.source_status == "stop_requested":
@@ -966,6 +1102,23 @@ class ProjectRuntime:
             ):
                 return self._turn_from_record(
                     self._turn(candidate.project_id, candidate.turn_id)
+                )
+            operation_disposition = (
+                runtime_db._project_operation_disposition_for_turn(
+                    self._conn,
+                    project_id=candidate.project_id,
+                    turn_id=candidate.turn_id,
+                )
+            )
+            if operation_disposition in {
+                "unresolved",
+                "post_effect_blocked",
+            } or (
+                operation_disposition == "pre_effect_blocked"
+                and outcome != "failed"
+            ):
+                return self._block_current_recovery(
+                    current_candidate, now=now
                 )
             if outcome == "queued":
                 state = runtime_db.runtime_state_for_project(
@@ -1392,14 +1545,29 @@ class ProjectRuntime:
                 next_turn, next_control, event_kind = "stop_requested", "stop_requested", "run.stop_requested"
             else:
                 self._require_active(state)
-                if self._conn.execute(
-                    """
-                    SELECT 1 FROM project_operations
-                    WHERE project_id = ? AND turn_id = ?
-                      AND status IN ('unknown', 'recovery_blocked') LIMIT 1
-                    """, (project_id, turn_id),
-                ).fetchone() is not None:
-                    raise ProjectRuntimeError(RuntimeErrorCode.TURN_RECOVERY_BLOCKED, project_id=project_id, turn_id=turn_id)
+                operation_disposition = (
+                    runtime_db
+                    ._project_operation_disposition_for_turn(
+                        self._conn,
+                        project_id=project_id,
+                        turn_id=turn_id,
+                    )
+                )
+                if operation_disposition == "unresolved":
+                    raise ProjectRuntimeError(
+                        RuntimeErrorCode.TURN_OPERATIONS_UNRESOLVED,
+                        project_id=project_id,
+                        turn_id=turn_id,
+                    )
+                if operation_disposition in {
+                    "pre_effect_blocked",
+                    "post_effect_blocked",
+                }:
+                    raise ProjectRuntimeError(
+                        RuntimeErrorCode.TURN_RECOVERY_BLOCKED,
+                        project_id=project_id,
+                        turn_id=turn_id,
+                    )
                 if turn.status != "stopped" or control.control_state != "stopped":
                     raise ProjectRuntimeError(RuntimeErrorCode.TURN_NOT_STOPPED, project_id=project_id, turn_id=turn_id)
                 next_turn, next_control, event_kind = "queued", "resume_requested", "run.resume_requested"

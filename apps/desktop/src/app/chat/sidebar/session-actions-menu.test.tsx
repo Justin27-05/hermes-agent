@@ -1,10 +1,19 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { SessionActionsMenu } from './session-actions-menu'
+import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
+import type { SessionInfo } from '@/types/hermes'
+
+import { renameSessionPreferringRpc, SessionActionsMenu } from './session-actions-menu'
 
 afterEach(cleanup)
+
+const mocks = vi.hoisted(() => ({
+  activeGateway: vi.fn(),
+  renameSession: vi.fn(),
+  resolveCurrentManagedProjectSurface: vi.fn()
+}))
 
 // This file exists specifically to catch the regression flagged in #67500:
 // SessionActionsMenu used to be composed as
@@ -23,7 +32,7 @@ vi.mock('@/components/pane-shell/tree/store', () => ({
   closeTreeTabsToRight: vi.fn(),
   treeTabCloseTargets: vi.fn(() => null)
 }))
-vi.mock('@/hermes', () => ({ renameSession: vi.fn() }))
+vi.mock('@/hermes', () => ({ renameSession: mocks.renameSession, setApiRequestProfile: vi.fn() }))
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
@@ -55,13 +64,20 @@ vi.mock('@/i18n', () => ({
 vi.mock('@/lib/haptics', () => ({ triggerHaptic: vi.fn() }))
 vi.mock('@/lib/profile-color', () => ({ PROFILE_SWATCHES: [] }))
 vi.mock('@/lib/session-export', () => ({ exportSession: vi.fn() }))
-vi.mock('@/store/gateway', () => ({ activeGateway: vi.fn(() => null) }))
+vi.mock('@/store/gateway', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/store/gateway')>()
+  return { ...actual, activeGateway: mocks.activeGateway }
+})
 vi.mock('@/store/notifications', () => ({ notify: vi.fn(), notifyError: vi.fn() }))
+vi.mock('@/store/project-surface-authority-store', () => ({
+  $projectSurfaceAuthorityContext: atom({}),
+  resolveCurrentManagedProjectSurface: mocks.resolveCurrentManagedProjectSurface
+}))
 vi.mock('@/store/session', () => ({
   $activeSessionId: atom<null | string>(null),
   $selectedStoredSessionId: atom<null | string>(null),
   $sessions: atom<unknown[]>([]),
-  sessionMatchesStoredId: vi.fn(() => false),
+  sessionMatchesStoredId: vi.fn((session: { id: string }, id: string) => session.id === id),
   sessionPinId: vi.fn((s: { id: string }) => s.id),
   setSessions: vi.fn()
 }))
@@ -78,9 +94,17 @@ vi.mock('@/store/windows', () => ({
   openSessionInNewWindow: vi.fn()
 }))
 
-function renderMenu() {
+function renderMenu(options: { withMutations?: boolean } = {}) {
   return render(
-    <SessionActionsMenu sessionId="s1" title="My session" tooltip="Actions for My session">
+    <SessionActionsMenu
+      onArchive={options.withMutations ? vi.fn() : undefined}
+      onBranch={options.withMutations ? vi.fn() : undefined}
+      onDelete={options.withMutations ? vi.fn() : undefined}
+      sessionId="s1"
+      storedSession={{ id: 's1', profile: 'default', project_id: null } as SessionInfo}
+      title="My session"
+      tooltip="Actions for My session"
+    >
       <button aria-label="Actions for My session" type="button">
         ⋮
       </button>
@@ -88,7 +112,23 @@ function renderMenu() {
   )
 }
 
+function openMenu() {
+  const trigger = screen.getByRole('button', { name: 'Actions for My session' })
+
+  fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+  fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+  fireEvent.click(trigger)
+}
+
 describe('SessionActionsMenu', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
+    mocks.activeGateway.mockReturnValue(null)
+    mocks.resolveCurrentManagedProjectSurface.mockReturnValue({ status: 'conclusively-legacy' })
+  })
+
   it('shows the tooltip label wired to the real trigger button', () => {
     renderMenu()
 
@@ -100,14 +140,10 @@ describe('SessionActionsMenu', () => {
   it('still opens the dropdown on click with the trigger wrapped in a Tip (#67500)', async () => {
     renderMenu()
 
-    const trigger = screen.getByRole('button', { name: 'Actions for My session' })
-
     // Radix's dropdown trigger opens on pointerdown (not on the synthetic
     // 'click' fireEvent alone would dispatch), so fire the full mouse
     // sequence a real click produces.
-    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
-    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
-    fireEvent.click(trigger)
+    openMenu()
 
     // If Tip (now composed around DropdownMenuTrigger, not the other way
     // round) ever stopped forwarding the asChild-injected props again, this
@@ -116,5 +152,83 @@ describe('SessionActionsMenu', () => {
     expect(await screen.findByRole('menu')).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /rename/i })).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /archive/i })).toBeTruthy()
+  })
+
+  it.each([{ status: 'managed' }, { projectId: 'project-1', status: 'unavailable' }, { status: 'ambiguous' }])(
+    'hides every non-canonical session mutation when project authority is $status',
+    async resolution => {
+      mocks.resolveCurrentManagedProjectSurface.mockReturnValue(resolution)
+      renderMenu({ withMutations: true })
+      openMenu()
+
+      expect(await screen.findByRole('menu')).toBeTruthy()
+      expect(screen.queryByRole('menuitem', { name: /^rename$/i })).toBeNull()
+      expect(screen.queryByRole('menuitem', { name: /branch from here/i })).toBeNull()
+      expect(screen.queryByRole('menuitem', { name: /^archive$/i })).toBeNull()
+      expect(screen.queryByRole('menuitem', { name: /^delete$/i })).toBeNull()
+    }
+  )
+
+  it('keeps rename, branch, archive and delete for a conclusively legacy session', async () => {
+    renderMenu({ withMutations: true })
+    openMenu()
+
+    expect(await screen.findByRole('menuitem', { name: /^rename$/i })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /branch from here/i })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /^archive$/i })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /^delete$/i })).toBeTruthy()
+  })
+
+  it('blocks a direct rename before either RPC or REST when project authority is unavailable', async () => {
+    const stored = { id: 's1', profile: 'default', project_id: null } as SessionInfo
+    const request = vi.fn()
+
+    $selectedStoredSessionId.set(stored.id)
+    $activeSessionId.set('s1-R')
+    mocks.activeGateway.mockReturnValue({ request })
+    mocks.resolveCurrentManagedProjectSurface.mockReturnValue({
+      projectId: 'project-1',
+      status: 'unavailable'
+    })
+
+    await expect(renameSessionPreferringRpc(stored.id, 'Forbidden', stored.profile, stored)).rejects.toThrow(
+      'project session authority is unavailable'
+    )
+    expect(mocks.resolveCurrentManagedProjectSurface).toHaveBeenCalledWith('s1-R', stored.id, stored)
+    expect(request).not.toHaveBeenCalled()
+    expect(mocks.renameSession).not.toHaveBeenCalled()
+  })
+
+  it('rechecks the exact row authority before REST fallback after an awaited RPC failure', async () => {
+    const stored = {
+      id: 'same-C',
+      profile: 'default',
+      project_id: null
+    } as SessionInfo
+    const request = vi.fn(async () => {
+      mocks.resolveCurrentManagedProjectSurface.mockReturnValue({
+        snapshot: { project_id: 'project-managed' },
+        status: 'managed'
+      })
+      throw new Error('socket failed')
+    })
+
+    $selectedStoredSessionId.set(stored.id)
+    $activeSessionId.set('same-R')
+    mocks.activeGateway.mockReturnValue({ request })
+    mocks.renameSession.mockResolvedValue({ title: 'Forbidden fallback' })
+
+    const renameExact = renameSessionPreferringRpc as unknown as (
+      storedSessionId: string,
+      title: string,
+      profile: string,
+      storedSession: SessionInfo
+    ) => Promise<{ title?: string }>
+
+    await expect(renameExact(stored.id, 'Forbidden fallback', stored.profile!, stored)).rejects.toThrow(
+      'project session authority is unavailable'
+    )
+    expect(mocks.resolveCurrentManagedProjectSurface).toHaveBeenCalledWith('same-R', 'same-C', stored)
+    expect(mocks.renameSession).not.toHaveBeenCalled()
   })
 })

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { useI18n } from '@/i18n'
 import { monitorSpeechDuringPlayback } from '@/lib/voice-barge-in'
 import {
@@ -23,9 +24,10 @@ interface PendingVoiceResponse {
 
 interface VoiceConversationOptions {
   busy: boolean
+  captureSubmitOptions: () => SubmitTextOptions
   enabled: boolean
   onFatalError?: () => void
-  onSubmit: (text: string) => Promise<void> | void
+  onSubmit: (text: string, options: SubmitTextOptions) => Promise<void> | void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
@@ -33,6 +35,7 @@ interface VoiceConversationOptions {
 
 export function useVoiceConversation({
   busy,
+  captureSubmitOptions,
   enabled,
   onFatalError,
   onSubmit,
@@ -54,6 +57,7 @@ export function useVoiceConversation({
   const speechSessionRef = useRef<null | SpeechStreamSession>(null)
   const stopBargeMonitorRef = useRef<(() => void) | null>(null)
   const bargeCapturePendingRef = useRef(false)
+  const bargeSubmitOptionsRef = useRef<null | SubmitTextOptions>(null)
   const enabledRef = useRef(enabled)
   const mutedRef = useRef(muted)
   const busyRef = useRef(busy)
@@ -91,6 +95,7 @@ export function useVoiceConversation({
     stopBargeMonitorRef.current?.()
     stopBargeMonitorRef.current = null
     bargeCapturePendingRef.current = false
+    bargeSubmitOptionsRef.current = null
     speechSessionRef.current = null
     responseIdRef.current = null
     spokenSourceLengthRef.current = 0
@@ -105,6 +110,7 @@ export function useVoiceConversation({
       turnClosingRef.current = true
       clearTurnTimeout()
       setStatus('transcribing')
+      const submitOptions = captureSubmitOptions()
 
       try {
         const result = await handle.stop()
@@ -134,7 +140,7 @@ export function useVoiceConversation({
 
           awaitingSpokenResponseRef.current = true
           dropSpeechSession()
-          await onSubmit(transcript)
+          await onSubmit(transcript, submitOptions)
           setStatus('thinking')
         } catch (error) {
           notifyError(error, voiceCopy.transcriptionFailed)
@@ -149,7 +155,7 @@ export function useVoiceConversation({
         turnClosingRef.current = false
       }
     },
-    [handle, onSubmit, onTranscribeAudio, voiceCopy.transcriptionFailed]
+    [captureSubmitOptions, handle, onSubmit, onTranscribeAudio, voiceCopy.transcriptionFailed]
   )
 
   const startListening = useCallback(async () => {
@@ -242,6 +248,13 @@ export function useVoiceConversation({
       }
 
       setStatus('transcribing')
+      const submitOptions = bargeSubmitOptionsRef.current
+
+      if (!submitOptions) {
+        resumeListening()
+
+        return
+      }
 
       try {
         const transcript = (await onTranscribeAudio(audio)).trim()
@@ -255,7 +268,7 @@ export function useVoiceConversation({
         awaitingSpokenResponseRef.current = true
         dropSpeechSession()
         consumePendingResponse()
-        await onSubmit(transcript)
+        await onSubmit(transcript, submitOptions)
         setStatus('thinking')
       } catch (error) {
         notifyError(error, voiceCopy.transcriptionFailed)
@@ -271,6 +284,7 @@ export function useVoiceConversation({
       monitorSpeechDuringPlayback({
         onSpeech: () => {
           bargeCapturePendingRef.current = true
+          bargeSubmitOptionsRef.current = captureSubmitOptions()
           onBarge()
           markVoicePlaybackInterrupted()
           stopVoicePlayback()
@@ -281,7 +295,7 @@ export function useVoiceConversation({
           void submitCapturedUtterance(audio)
         }
       }),
-    [submitCapturedUtterance]
+    [captureSubmitOptions, submitCapturedUtterance]
   )
 
   /** Push any new reply text into the live session; finish when complete. */

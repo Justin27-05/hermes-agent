@@ -5,6 +5,9 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
+import type { ExactLegacySessionAuthority, FrozenFreshDraftAuthority } from '@/store/legacy-session-authority'
+import type { ProjectSubmitAuthorityCapture } from '@/store/project-composer-queue'
+import type { SessionInfo } from '@/types/hermes'
 
 export type GatewayRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
 
@@ -394,6 +397,10 @@ export interface SubmitTextOptions {
    *  without it. */
   composerScope?: string | null
   fromQueue?: boolean
+  /** Full requester/profile + project binding authority captured before an
+   * asynchronous voice transcription starts. When present, submit must match
+   * this exact live authority and may never fall back to a legacy session RPC. */
+  projectAuthority?: ProjectSubmitAuthorityCapture
   /** Runtime session id to submit into. Queue drains pass this so a
    *  backgrounded/source session cannot be replaced by the current foreground
    *  session between enqueue and drain. */
@@ -401,4 +408,7 @@ export interface SubmitTextOptions {
   /** Stable stored session id for optimistic/cache updates and stale-runtime
    *  recovery. Distinct from the runtime session id minted by the gateway. */
   storedSessionId?: string | null
+  storedSession?: SessionInfo
+  legacyAuthority?: ExactLegacySessionAuthority
+  legacyDraftAuthority?: FrozenFreshDraftAuthority
 }

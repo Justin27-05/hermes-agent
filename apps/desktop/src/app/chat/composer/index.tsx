@@ -15,6 +15,7 @@ import { $compactionActive } from '@/store/compaction'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
 import { parkQueuedPrompts, removeQueuedPrompt, unparkQueuedPrompts } from '@/store/composer-queue'
+import { $projectSurfaceAuthorityContext } from '@/store/project-surface-authority-store'
 import { toggleReview } from '@/store/review'
 import { $gatewayState } from '@/store/session'
 import { $threadScrolledUp } from '@/store/thread-scroll'
@@ -25,7 +26,7 @@ import { AttachmentList } from './attachments'
 import { COMPOSER_FADE_BACKGROUND, type QueueEditState, slashArgStage } from './composer-utils'
 import { ContextMenu } from './context-menu'
 import { COMPOSER_AREAS, runComposerMiddleware } from './contrib'
-import { ComposerControls } from './controls'
+import { type ComposerBusyAction, ComposerControls } from './controls'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
 import { markActiveComposer } from './focus'
 import { HelpHint } from './help-hint'
@@ -44,6 +45,7 @@ import { useComposerUrlDialog } from './hooks/use-composer-url-dialog'
 import { useComposerVoice } from './hooks/use-composer-voice'
 import { useSlashCompletions } from './hooks/use-slash-completions'
 import { useSessionStatusPresence } from './hooks/use-status-presence'
+import { isManagedProjectComposerTarget } from './managed-project-target'
 import { QueuePanel } from './queue-panel'
 import {
   composerPlainText,
@@ -56,6 +58,8 @@ import {
 import { useComposerScope } from './scope'
 import { ComposerStatusStack } from './status-stack'
 import { CodingStatusRow } from './status-stack/coding-row'
+import { ManagedLegacyQueueRecovery } from './status-stack/managed-legacy-queue-recovery'
+import { submitAfterComposerMiddleware } from './submit-boundary'
 import { extractClipboardImageBlobs } from './text-utils'
 import { ComposerTriggerPopover } from './trigger-popover'
 import type { ChatBarProps } from './types'
@@ -71,6 +75,8 @@ export function ChatBar({
   maxRecordingSeconds = 120,
   queueSessionKey,
   sessionId,
+  storedSession,
+  storedSessionId,
   state,
   onCancel,
   onAddUrl,
@@ -90,15 +96,19 @@ export function ChatBar({
   // exact pass-through, so surfaces without contributions are byte-identical.
   const onSubmit = useCallback<ChatBarProps['onSubmit']>(
     async (value, options) => {
-      const draft = await runComposerMiddleware({ text: value, attachments: options?.attachments })
-
-      if (!draft) {
-        return false
-      }
-
-      return onSubmitProp(draft.text, { ...options, attachments: draft.attachments })
+      return submitAfterComposerMiddleware({
+        middleware: runComposerMiddleware,
+        options,
+        submit: onSubmitProp,
+        target: {
+          runtimeSessionId: sessionId,
+          storedSession,
+          storedSessionId
+        },
+        value
+      })
     },
-    [onSubmitProp]
+    [onSubmitProp, sessionId, storedSession, storedSessionId]
   )
 
   // Which live composer this instance IS (main | tile) — its attachment set,
@@ -106,6 +116,9 @@ export function ChatBar({
   const scope = useComposerScope()
   const attachments = useStore(scope.attachments.$attachments)
   const compacting = useStore($compactionActive)
+  // Keep the central wrapper reactive for profile, catalog, runtime and stored
+  // session changes. The wrapper derives the exact target profile for C.
+  useStore($projectSurfaceAuthorityContext)
   const scrolledUp = useStore($threadScrolledUp)
   const autoSpeak = useStore($autoSpeakReplies)
   // The turn is parked on the user (clarify / approval / sudo / secret). Esc must
@@ -119,6 +132,8 @@ export function ChatBar({
   // session id — gateway events and process.list both speak that id. Only the
   // queue uses the stored-session fallback key (prompts can queue pre-resume).
   const statusSessionId = sessionId ?? null
+
+  const managedProjectTarget = isManagedProjectComposerTarget(sessionId, storedSessionId, storedSession)
 
   // Coarse edge: re-renders ChatBar only when the stack shows/hides, NOT on
   // every per-item status mutation or other sessions' churn (see the hook).
@@ -192,7 +207,11 @@ export function ChatBar({
     queueCurrentDraft,
     queueEdit,
     queueParked,
+    quarantinedManagedPrompts,
+    quarantinedVoicePrompts,
     queuedPrompts,
+    restoreManagedLegacyPrompt,
+    restoreManagedVoicePrompt,
     sendQueuedNow,
     stepQueuedEdit
   } = useComposerQueue({
@@ -203,14 +222,20 @@ export function ChatBar({
     draftRef,
     focusInput,
     loadIntoComposer,
+    managedProjectSession: managedProjectTarget,
     onCancel,
     onSubmit,
     queueEditRef,
     queueSessionKey,
-    sessionId
+    sessionId,
+    storedSessionId
   })
 
-  const statusStackVisible = queuedPrompts.length > 0 || statusPresent
+  const statusStackVisible =
+    queuedPrompts.length > 0 ||
+    quarantinedManagedPrompts.length > 0 ||
+    quarantinedVoicePrompts.length > 0 ||
+    statusPresent
 
   // Halt vs. reach-the-queue: every interrupt lands on onCancel, but only the
   // gestures that MEAN "stop working" (Stop button, Esc) go through this
@@ -232,15 +257,19 @@ export function ChatBar({
 
   // Steer only makes sense mid-turn, text-only (the gateway can't carry images
   // into a tool result) and never for a slash command (those execute inline).
-  const canSteer = busy && !compacting && !!onSteer && attachments.length === 0 && isSteerableText
+  const canSteer =
+    !managedProjectTarget && busy && !compacting && !!onSteer && attachments.length === 0 && isSteerableText
 
   // While busy: text redirects the live turn (Cursor-style stop-and-correct),
   // attachments queue for the next turn, an empty composer stops.
-  const busyAction: 'steer' | 'queue' | 'stop' = canSteer
-    ? 'steer'
-    : compacting || hasComposerPayload
-      ? 'queue'
-      : 'stop'
+  const busyAction: ComposerBusyAction =
+    managedProjectTarget && hasComposerPayload
+      ? 'send'
+      : canSteer
+        ? 'steer'
+        : compacting || hasComposerPayload
+          ? 'queue'
+          : 'stop'
 
   // The submit engine — the orchestration seam where draft + queue meet. Owns
   // the submit decision tree, the send-with-restore primitive, and steer.
@@ -259,6 +288,7 @@ export function ChatBar({
     focusInput,
     inputDisabled,
     loadIntoComposer,
+    managedProjectSession: managedProjectTarget,
     // The submit engine's only cancel call is the Stop-button branch (busy +
     // empty composer) — an explicit halt, so it parks the queue.
     onCancel: haltRun,
@@ -718,6 +748,8 @@ export function ChatBar({
     onSubmit,
     onTranscribeAudio,
     sessionId,
+    storedSession,
+    storedSessionId,
     target: scope.target
   })
 
@@ -917,29 +949,44 @@ export function ChatBar({
               accounts for it. Collapses to nothing when every status is empty. */}
           <ComposerStatusStack
             queue={
-              activeQueueSessionKey && queuedPrompts.length > 0 ? (
-                <QueuePanel
-                  busy={busy}
-                  editingId={queueEdit?.entryId ?? null}
-                  entries={queuedPrompts}
-                  onDelete={id => {
-                    if (removeQueuedPrompt(activeQueueSessionKey, id) && queueEdit?.entryId === id) {
-                      exitQueuedEdit('cancel')
-                    }
-                  }}
-                  onEdit={beginQueuedEdit}
-                  onResume={() => {
-                    unparkQueuedPrompts(activeQueueSessionKey)
+              quarantinedManagedPrompts.length > 0 ||
+              quarantinedVoicePrompts.length > 0 ||
+              (activeQueueSessionKey && queuedPrompts.length > 0) ? (
+                <>
+                  <ManagedLegacyQueueRecovery
+                    entries={quarantinedManagedPrompts}
+                    onRestore={restoreManagedLegacyPrompt}
+                  />
+                  <ManagedLegacyQueueRecovery
+                    entries={quarantinedVoicePrompts}
+                    kind="voice"
+                    onRestore={restoreManagedVoicePrompt}
+                  />
+                  {activeQueueSessionKey && queuedPrompts.length > 0 && (
+                    <QueuePanel
+                      busy={busy}
+                      editingId={queueEdit?.entryId ?? null}
+                      entries={queuedPrompts}
+                      onDelete={id => {
+                        if (removeQueuedPrompt(activeQueueSessionKey, id) && queueEdit?.entryId === id) {
+                          exitQueuedEdit('cancel')
+                        }
+                      }}
+                      onEdit={beginQueuedEdit}
+                      onResume={() => {
+                        unparkQueuedPrompts(activeQueueSessionKey)
 
-                    // Idle → kick the head immediately; busy → the settle drain
-                    // takes over now that the park is lifted.
-                    if (!busy) {
-                      void drainNextQueued()
-                    }
-                  }}
-                  onSendNow={id => void sendQueuedNow(id)}
-                  parked={queueParked}
-                />
+                        // Idle → kick the head immediately; busy → the settle drain
+                        // takes over now that the park is lifted.
+                        if (!busy) {
+                          void drainNextQueued()
+                        }
+                      }}
+                      onSendNow={id => void sendQueuedNow(id)}
+                      parked={queueParked}
+                    />
+                  )}
+                </>
               ) : null
             }
             sessionId={statusSessionId}

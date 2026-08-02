@@ -1,3 +1,4 @@
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { atom } from 'nanostores'
 
 import { liveSessionProjectId, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
@@ -10,8 +11,18 @@ import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { persistentAtom } from '@/lib/persisted'
 import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
-import { notify } from '@/store/notifications'
+import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, requestFreshSession } from '@/store/profile'
+import {
+  executeProjectMutation,
+  type ProjectCommandResult,
+  type ProjectMutationIntent,
+  type ProjectMutationName,
+  type ProjectMutationOutcome,
+  retryProjectMutation
+} from '@/store/project-command-runtime'
+import { $projectRuntimes, projectRuntimeAuthority, type ProjectRuntimeState } from '@/store/project-runtime'
+import { type ManagedProjectSurfaceResolution, resolveManagedProjectSurface } from '@/store/project-surface-authority'
 import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, workspaceCwdForNewSession } from '@/store/session'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
@@ -22,6 +33,42 @@ import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
 export const $projects = atom<ProjectInfo[]>([])
 export const $activeProjectId = atom<null | string>(null)
+
+export interface ProjectCatalogAuthority {
+  catalogGeneration: null | number
+  contextGeneration: number
+  profile: null | string
+}
+
+export const $projectCatalogAuthority = atom<ProjectCatalogAuthority>({
+  catalogGeneration: null,
+  contextGeneration: 0,
+  profile: null
+})
+
+let observedProjectCatalogProfile = $activeGatewayProfile.get() || 'default'
+let observedProjectCatalogGateway = $gateway.get()
+let projectCatalogRequestGeneration = 0
+
+export function projectCatalogScope(): null | string {
+  return $projectCatalogAuthority.get().profile
+}
+
+export interface ProjectDialogState {
+  mode: 'add-folder' | 'create' | 'rename'
+  name?: string
+  projectId?: string
+}
+
+export interface PendingProjectMutation {
+  phase: 'executing' | 'retry_required'
+}
+
+export const $pendingProjectMutations = atom<Readonly<Record<string, PendingProjectMutation>>>({})
+
+export function projectMutationPendingKey(name: ProjectMutationName, projectId: null | string): string {
+  return name === 'project.create' ? 'project/create' : `project/${projectId ?? 'global'}/${name}`
+}
 
 // The authoritative project -> repo -> lane tree (overview), served by
 // `projects.tree`. Lanes carry counts + structure; per-project session rows are
@@ -301,39 +348,287 @@ async function gatewayRequestOn<T>(
 }
 
 interface ActiveProjectsContext {
+  contextGeneration: number
   gateway: HermesGateway
   profile: string
 }
 
 async function activeProjectsContext(): Promise<ActiveProjectsContext> {
   const profile = $activeGatewayProfile.get() || 'default'
+  const contextGeneration = $projectCatalogAuthority.get().contextGeneration
   let gateway = activeGateway()
 
   if (!gateway || gateway.connectionState !== 'open') {
     gateway = await ensureActiveGatewayOpen()
   }
 
-  if (!gateway || gateway !== activeGateway() || profile !== ($activeGatewayProfile.get() || 'default')) {
+  if (
+    !gateway ||
+    gateway !== activeGateway() ||
+    profile !== ($activeGatewayProfile.get() || 'default') ||
+    contextGeneration !== $projectCatalogAuthority.get().contextGeneration
+  ) {
     throw new Error('Active Hermes profile changed while connecting')
   }
 
-  return { gateway, profile }
+  return { contextGeneration, gateway, profile }
 }
 
-function applyPayload(payload: ProjectsPayload): void {
-  $projects.set(payload.projects ?? [])
+interface ProjectMutationContext {
+  gateway: HermesGateway | null
+  profile: string
+}
+
+type MutationSuccessHandler = (result: ProjectCommandResult, retried: boolean) => void
+
+interface ProjectMutationOwner {
+  context: ProjectMutationContext
+  intentId: string | null
+  key: string
+  onSuccess: MutationSuccessHandler | undefined
+  phase: PendingProjectMutation['phase']
+  token: symbol
+}
+
+const pendingProjectMutationOwners = new Map<string, ProjectMutationOwner>()
+
+function activeProfileId(): string {
+  return $activeGatewayProfile.get() || 'default'
+}
+
+function captureProjectMutationContext(): ProjectMutationContext {
+  return { gateway: activeGateway() ?? null, profile: activeProfileId() }
+}
+
+function isProjectMutationContextCurrent(context: ProjectMutationContext): boolean {
+  return (
+    context.profile === activeProfileId() && (context.gateway === null || context.gateway === (activeGateway() ?? null))
+  )
+}
+
+function isProjectCatalogContextCurrent(context: ActiveProjectsContext): boolean {
+  return (
+    context.contextGeneration === $projectCatalogAuthority.get().contextGeneration &&
+    isProjectMutationContextCurrent(context)
+  )
+}
+
+function publishPendingProjectMutations(): void {
+  $pendingProjectMutations.set(
+    Object.fromEntries([...pendingProjectMutationOwners].map(([key, owner]) => [key, { phase: owner.phase }]))
+  )
+}
+
+function releaseProjectMutation(owner: ProjectMutationOwner): void {
+  if (pendingProjectMutationOwners.get(owner.key)?.token !== owner.token) {
+    return
+  }
+
+  pendingProjectMutationOwners.delete(owner.key)
+  publishPendingProjectMutations()
+}
+
+function clearPendingProjectMutations(): void {
+  if (!pendingProjectMutationOwners.size) {
+    return
+  }
+
+  pendingProjectMutationOwners.clear()
+  publishPendingProjectMutations()
+}
+
+function claimProjectMutation(
+  intent: ProjectMutationIntent,
+  onSuccess?: MutationSuccessHandler,
+  context = captureProjectMutationContext()
+): ProjectMutationOwner | null {
+  const key = projectMutationPendingKey(intent.name, intent.project_id)
+  const existing = pendingProjectMutationOwners.get(key)
+
+  if (existing && existing.context.profile !== activeProfileId()) {
+    releaseProjectMutation(existing)
+  } else if (existing) {
+    return null
+  }
+
+  const owner: ProjectMutationOwner = {
+    context,
+    intentId: null,
+    key,
+    onSuccess,
+    phase: 'executing',
+    token: Symbol(key)
+  }
+
+  pendingProjectMutationOwners.set(key, owner)
+  publishPendingProjectMutations()
+
+  return owner
+}
+
+let pendingMutationProfile = activeProfileId()
+
+function synchronizeProjectCatalogContext(): void {
+  const profile = activeProfileId()
+  const gateway = $gateway.get()
+
+  if (profile === observedProjectCatalogProfile && gateway === observedProjectCatalogGateway) {
+    return
+  }
+
+  observedProjectCatalogProfile = profile
+  observedProjectCatalogGateway = gateway
+
+  const authority = $projectCatalogAuthority.get()
+
+  $projectCatalogAuthority.set({
+    ...authority,
+    contextGeneration: authority.contextGeneration + 1
+  })
+}
+
+$activeGatewayProfile.subscribe(() => {
+  synchronizeProjectCatalogContext()
+
+  const profile = activeProfileId()
+
+  if (profile !== pendingMutationProfile) {
+    pendingMutationProfile = profile
+    clearPendingProjectMutations()
+  }
+})
+
+$gateway.subscribe(synchronizeProjectCatalogContext)
+
+function normalizeProjectInfo(project: ProjectInfo): ProjectInfo {
+  return { ...project }
+}
+
+export function resolveProjectManagementAuthority(
+  projectId: string,
+  projects: readonly ProjectInfo[] = $projects.get(),
+  runtimes: Readonly<Record<string, ProjectRuntimeState>> = $projectRuntimes.get()
+): ManagedProjectSurfaceResolution {
+  return resolveManagedProjectSurface({
+    activeProfile: activeProfileId(),
+    activeProjectId: projectId,
+    catalogAuthority: $projectCatalogAuthority.get(),
+    projects,
+    runtimeAuthority: projectRuntimeAuthority(),
+    runtimes: { ...runtimes },
+    sessions: []
+  })
+}
+
+/** True means the project is protected from legacy mutation. This includes a
+ * managed runtime as well as boot/profile/catalog gaps where legacy ownership
+ * has not yet been proved. */
+export function isEffectivelyManagedProject(
+  projectId: string,
+  projects: readonly ProjectInfo[] = $projects.get(),
+  runtimes: Readonly<Record<string, ProjectRuntimeState>> = $projectRuntimes.get()
+): boolean {
+  return resolveProjectManagementAuthority(projectId, projects, runtimes).status !== 'conclusively-legacy'
+}
+
+function requireConclusiveLegacyProject(projectId: string): void {
+  const resolution = resolveProjectManagementAuthority(projectId)
+
+  if (resolution.status !== 'conclusively-legacy') {
+    throw new Error(
+      resolution.status === 'managed'
+        ? 'managed project mutations are canonical-only'
+        : 'project authority is unavailable'
+    )
+  }
+}
+
+function applyPayload(payload: ProjectsPayload, profile: string, contextGeneration: number): boolean {
+  const authority = $projectCatalogAuthority.get()
+
+  if (contextGeneration !== authority.contextGeneration || profile !== activeProfileId()) {
+    return false
+  }
+
+  $projectCatalogAuthority.set({
+    catalogGeneration: contextGeneration,
+    contextGeneration: authority.contextGeneration,
+    profile
+  })
+  $projects.set((payload.projects ?? []).map(normalizeProjectInfo))
   $activeProjectId.set(payload.active_id ?? null)
+
+  return true
 }
 
 // Pull the full project list + active pointer. Best-effort: a failure (gateway
 // not up yet) leaves the cached atoms intact so the sidebar doesn't flicker.
 export async function refreshProjects(): Promise<void> {
+  const requestGeneration = ++projectCatalogRequestGeneration
+  let context: ActiveProjectsContext | null = null
+
   try {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.list'))
-    markProjectsRpcSuccess()
+    context = await activeProjectsContext()
+    const payload = await gatewayRequestOn<ProjectsPayload>(context.gateway, 'projects.list')
+
+    if (requestGeneration !== projectCatalogRequestGeneration || !isProjectCatalogContextCurrent(context)) {
+      return
+    }
+
+    if (applyPayload(payload, context.profile, context.contextGeneration)) {
+      markProjectsRpcSuccess()
+    }
   } catch (err) {
-    markProjectsRpcFailure(err)
+    if (
+      requestGeneration === projectCatalogRequestGeneration &&
+      (context === null || isProjectCatalogContextCurrent(context))
+    ) {
+      markProjectsRpcFailure(err)
+    }
+
     // Backend may not be ready; keep the last known list.
+  }
+}
+
+async function refreshProjectsForContext(
+  context: ProjectMutationContext,
+  projectId: string
+): Promise<ProjectInfo | null> {
+  if (!context.gateway || !isProjectMutationContextCurrent(context)) {
+    return null
+  }
+
+  const contextGeneration = $projectCatalogAuthority.get().contextGeneration
+  const requestGeneration = ++projectCatalogRequestGeneration
+
+  try {
+    const payload = await gatewayRequestOn<ProjectsPayload>(context.gateway, 'projects.list')
+
+    if (
+      requestGeneration !== projectCatalogRequestGeneration ||
+      contextGeneration !== $projectCatalogAuthority.get().contextGeneration ||
+      !isProjectMutationContextCurrent(context)
+    ) {
+      return null
+    }
+
+    if (!applyPayload(payload, context.profile, contextGeneration)) {
+      return null
+    }
+
+    markProjectsRpcSuccess()
+
+    return $projects.get().find(project => project.id === projectId) ?? null
+  } catch (error) {
+    if (
+      requestGeneration === projectCatalogRequestGeneration &&
+      contextGeneration === $projectCatalogAuthority.get().contextGeneration &&
+      isProjectMutationContextCurrent(context)
+    ) {
+      markProjectsRpcFailure(error)
+    }
+
+    return null
   }
 }
 
@@ -345,10 +640,11 @@ interface ProjectTreePayload {
 
 let projectTreeRefreshGeneration = 0
 
-async function refreshProjectTreeOn(gateway: HermesGateway): Promise<void> {
+async function refreshProjectTreeOn(gateway: HermesGateway, profile = activeProfileId()): Promise<void> {
   const generation = ++projectTreeRefreshGeneration
+  const context = { gateway, profile }
 
-  if (activeGateway() === gateway) {
+  if (isProjectMutationContextCurrent(context)) {
     $projectTreeLoading.set(true)
   }
 
@@ -357,7 +653,7 @@ async function refreshProjectTreeOn(gateway: HermesGateway): Promise<void> {
       preview_limit: 3
     })
 
-    if (generation !== projectTreeRefreshGeneration || activeGateway() !== gateway) {
+    if (generation !== projectTreeRefreshGeneration || !isProjectMutationContextCurrent(context)) {
       return
     }
 
@@ -380,11 +676,11 @@ async function refreshProjectTreeOn(gateway: HermesGateway): Promise<void> {
 
     markProjectsRpcSuccess()
   } catch (err) {
-    if (activeGateway() === gateway) {
+    if (isProjectMutationContextCurrent(context)) {
       markProjectsRpcFailure(err)
     }
   } finally {
-    if (generation === projectTreeRefreshGeneration && activeGateway() === gateway) {
+    if (generation === projectTreeRefreshGeneration && isProjectMutationContextCurrent(context)) {
       $projectTreeLoading.set(false)
     }
   }
@@ -395,8 +691,8 @@ async function refreshProjectTreeOn(gateway: HermesGateway): Promise<void> {
 // cached tree intact so the sidebar doesn't flicker.
 export async function refreshProjectTree(): Promise<void> {
   try {
-    const { gateway } = await activeProjectsContext()
-    await refreshProjectTreeOn(gateway)
+    const context = await activeProjectsContext()
+    await refreshProjectTreeOn(context.gateway, context.profile)
   } catch {
     // Backend may not be ready; keep the last known tree.
   }
@@ -529,7 +825,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     }
 
     state.completedSignature = signature
-    await refreshProjectTreeOn(context.gateway)
+    await refreshProjectTreeOn(context.gateway, context.profile)
   } catch {
     state.completedSignature = undefined
   } finally {
@@ -555,6 +851,10 @@ export interface CreateProjectInput {
   use?: boolean
   // Free-text project idea; written to IDEA.md at the primary folder on create.
   idea?: string
+}
+
+export interface CreateProjectOptions {
+  dialog?: ProjectDialogState
 }
 
 // Generate a project idea via the stateless llm.oneshot RPC (inherits the live
@@ -649,15 +949,40 @@ function projectInfoToTreeNode(project: ProjectInfo): SidebarProjectTree {
   }
 }
 
-export async function createProject(input: CreateProjectInput): Promise<ProjectInfo | null> {
-  if ($projectsRpcAvailable.get() === false) {
-    throw projectsStaleBackendError()
+async function legacyGatewayForContext(context: ProjectMutationContext): Promise<HermesGateway> {
+  if (context.gateway) {
+    if (!isProjectMutationContextCurrent(context)) {
+      throw new Error('Active Hermes profile changed during project creation')
+    }
+
+    return context.gateway
   }
 
+  if (!isProjectMutationContextCurrent(context)) {
+    throw new Error('Active Hermes profile changed during project creation')
+  }
+
+  const connected = await activeProjectsContext()
+
+  if (connected.profile !== context.profile) {
+    throw new Error('Active Hermes profile changed during project creation')
+  }
+
+  context.gateway = connected.gateway
+
+  return connected.gateway
+}
+
+async function createLegacyProject(
+  input: CreateProjectInput,
+  context: ProjectMutationContext
+): Promise<ProjectInfo | null> {
   let res: { project: ProjectInfo | null }
 
   try {
-    res = await gatewayRequest<{ project: ProjectInfo | null }>('projects.create', {
+    const gateway = await legacyGatewayForContext(context)
+
+    res = await gatewayRequestOn<{ project: ProjectInfo | null }>(gateway, 'projects.create', {
       name: input.name,
       folders: input.folders ?? [],
       primary_path: input.primaryPath,
@@ -670,47 +995,333 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
     })
   } catch (err) {
     if (isMissingRpcMethod(err)) {
-      $projectsRpcAvailable.set(false)
+      if (isProjectMutationContextCurrent(context)) {
+        $projectsRpcAvailable.set(false)
+      }
+
       throw projectsStaleBackendError()
     }
 
     throw err
   }
 
-  markProjectsRpcSuccess()
-
   // Not optimistic (the create awaits the RPC first, so there's nothing to roll
   // back): apply the server's row into the cached list + tree at once, so it
   // (and an entered scope) shows without waiting on the background refreshes
   // that reconcile counts/repos.
-  const created = res.project
+  const created = res.project === null ? null : normalizeProjectInfo(res.project)
+
+  if (!isProjectMutationContextCurrent(context)) {
+    return created
+  }
+
+  markProjectsRpcSuccess()
 
   if (created) {
-    if (input.idea) {
+    if (input.idea && isProjectMutationContextCurrent(context)) {
       void writeProjectIdea(created.primary_path ?? created.folders?.[0]?.path ?? input.primaryPath, input.idea)
     }
 
-    if (!$projects.get().some(proj => proj.id === created.id)) {
+    if (isProjectMutationContextCurrent(context) && !$projects.get().some(proj => proj.id === created.id)) {
       $projects.set([...$projects.get(), created])
     }
 
-    if (!$projectTree.get().some(node => node.id === created.id)) {
+    if (isProjectMutationContextCurrent(context) && !$projectTree.get().some(node => node.id === created.id)) {
       $projectTree.set([projectInfoToTreeNode(created), ...$projectTree.get()])
     }
 
-    if (input.use) {
+    if (input.use && isProjectMutationContextCurrent(context)) {
       $activeProjectId.set(created.id)
     }
 
-    setSidebarAgentsGrouped(true)
+    if (isProjectMutationContextCurrent(context)) {
+      setSidebarAgentsGrouped(true)
+    }
   }
 
-  reconcileProjects()
+  if (isProjectMutationContextCurrent(context)) {
+    runCanonicalProjectReconcile(context, created?.id ?? '')
+  }
 
   return created
 }
 
-export async function renameProject(id: string, name: string): Promise<void> {
+const canonicalCreatePayload = (input: CreateProjectInput): Record<string, unknown> => ({
+  name: input.name,
+  folders: input.folders ?? [],
+  ...(input.primaryPath !== undefined && { primary_path: input.primaryPath }),
+  ...(input.slug !== undefined && { slug: input.slug }),
+  ...(input.description !== undefined && { description: input.description }),
+  ...(input.icon !== undefined && { icon: input.icon }),
+  ...(input.color !== undefined && { color: input.color }),
+  ...(input.boardSlug !== undefined && { board_slug: input.boardSlug })
+})
+
+function isCanonicalMethodMissing(error: unknown): boolean {
+  return error instanceof JsonRpcGatewayError && error.code === -32601
+}
+
+class HandledProjectMutationError extends Error {
+  constructor() {
+    super('canonical project mutation feedback was shown')
+    this.name = 'HandledProjectMutationError'
+  }
+}
+
+export function isHandledProjectMutationError(error: unknown): boolean {
+  return error instanceof HandledProjectMutationError
+}
+
+function notifyMutationConflict(): void {
+  notify({
+    kind: 'warning',
+    message: translateNow('sidebar.projects.mutationConflict')
+  })
+}
+
+function notifyMutationRetry(owner: ProjectMutationOwner): void {
+  notify({
+    action: {
+      label: translateNow('common.retry'),
+      onClick: () => {
+        void retryVisibleProjectMutation(owner)
+      }
+    },
+    kind: 'warning',
+    message: translateNow('sidebar.projects.mutationRetry')
+  })
+}
+
+function settleProjectMutation(
+  outcome: ProjectMutationOutcome,
+  owner: ProjectMutationOwner,
+  retried: boolean
+): ProjectCommandResult {
+  if (outcome.status === 'succeeded') {
+    releaseProjectMutation(owner)
+
+    try {
+      owner.onSuccess?.(outcome.result, retried)
+    } catch (error) {
+      notifyError(error, translateNow('sidebar.projects.mutationFailed'))
+    }
+
+    return outcome.result
+  }
+
+  if (pendingProjectMutationOwners.get(owner.key)?.token !== owner.token) {
+    throw new HandledProjectMutationError()
+  }
+
+  if (outcome.status === 'conflict') {
+    releaseProjectMutation(owner)
+    notifyMutationConflict()
+  } else {
+    owner.intentId = outcome.intent_id
+    owner.phase = 'retry_required'
+    publishPendingProjectMutations()
+    notifyMutationRetry(owner)
+  }
+
+  throw new HandledProjectMutationError()
+}
+
+async function retryVisibleProjectMutation(owner: ProjectMutationOwner): Promise<void> {
+  if (
+    pendingProjectMutationOwners.get(owner.key)?.token !== owner.token ||
+    owner.intentId === null ||
+    owner.phase !== 'retry_required'
+  ) {
+    return
+  }
+
+  if (!isProjectMutationContextCurrent(owner.context)) {
+    releaseProjectMutation(owner)
+
+    return
+  }
+
+  const intentId = owner.intentId
+  owner.phase = 'executing'
+  publishPendingProjectMutations()
+
+  try {
+    settleProjectMutation(await retryProjectMutation(intentId), owner, true)
+  } catch (error) {
+    if (!isHandledProjectMutationError(error)) {
+      releaseProjectMutation(owner)
+      notifyError(error, translateNow('sidebar.projects.mutationFailed'))
+    }
+  }
+}
+
+export async function executeProjectMutationWithFeedback(
+  intent: ProjectMutationIntent,
+  onSuccess?: MutationSuccessHandler
+): Promise<ProjectCommandResult> {
+  const owner = claimProjectMutation(intent, onSuccess)
+
+  if (!owner) {
+    throw new HandledProjectMutationError()
+  }
+
+  let outcome: ProjectMutationOutcome
+
+  try {
+    outcome = await executeProjectMutation(intent)
+  } catch (error) {
+    releaseProjectMutation(owner)
+    notifyError(error, translateNow('sidebar.projects.mutationFailed'))
+    throw new HandledProjectMutationError()
+  }
+
+  return settleProjectMutation(outcome, owner, false)
+}
+
+async function setActiveProjectForContext(context: ProjectMutationContext, projectId: string): Promise<void> {
+  if (!context.gateway || !isProjectMutationContextCurrent(context)) {
+    return
+  }
+
+  const result = await gatewayRequestOn<{ active_id: null | string }>(context.gateway, 'projects.set_active', {
+    id: projectId
+  })
+
+  if (isProjectMutationContextCurrent(context)) {
+    $activeProjectId.set(result.active_id ?? null)
+  }
+}
+
+async function runCanonicalCreateFollowUps(
+  context: ProjectMutationContext,
+  input: CreateProjectInput,
+  projectId: string
+): Promise<void> {
+  const createdProject = refreshProjectsForContext(context, projectId)
+
+  if (context.gateway) {
+    void refreshProjectTreeOn(context.gateway, context.profile)
+  }
+
+  if (input.use) {
+    void setActiveProjectForContext(context, projectId).catch(error => {
+      if (isProjectMutationContextCurrent(context)) {
+        notifyError(error, translateNow('sidebar.projects.activationFailed'))
+      }
+    })
+  }
+
+  const created = await createdProject
+
+  if (!isProjectMutationContextCurrent(context)) {
+    return
+  }
+
+  if (input.idea) {
+    void writeProjectIdea(created?.primary_path ?? created?.folders?.[0]?.path ?? input.primaryPath, input.idea)
+  }
+
+  if (isProjectMutationContextCurrent(context)) {
+    setSidebarAgentsGrouped(true)
+  }
+}
+
+function runCanonicalProjectReconcile(context: ProjectMutationContext, projectId: string): void {
+  void Promise.all([
+    refreshProjectsForContext(context, projectId),
+    context.gateway ? refreshProjectTreeOn(context.gateway, context.profile) : Promise.resolve()
+  ])
+}
+
+export async function createProject(
+  input: CreateProjectInput,
+  options: CreateProjectOptions = {}
+): Promise<ProjectInfo | null> {
+  if ($projectsRpcAvailable.get() === false) {
+    throw projectsStaleBackendError()
+  }
+
+  const intent: ProjectMutationIntent = {
+    expected_version: 0,
+    name: 'project.create',
+    payload: canonicalCreatePayload(input),
+    project_id: null
+  }
+
+  const context = captureProjectMutationContext()
+
+  const owner = claimProjectMutation(
+    intent,
+    (receipt, retried) => {
+      if (retried && options.dialog) {
+        closeProjectDialog(options.dialog)
+      }
+
+      void runCanonicalCreateFollowUps(context, input, receipt.project_id)
+    },
+    context
+  )
+
+  if (!owner) {
+    throw new HandledProjectMutationError()
+  }
+
+  let outcome: ProjectMutationOutcome
+
+  try {
+    outcome = await executeProjectMutation(intent)
+  } catch (error) {
+    if (isCanonicalMethodMissing(error) && isProjectMutationContextCurrent(context)) {
+      try {
+        return await createLegacyProject(input, context)
+      } finally {
+        releaseProjectMutation(owner)
+      }
+    }
+
+    releaseProjectMutation(owner)
+    notifyError(error, translateNow('sidebar.projects.mutationFailed'))
+    throw new HandledProjectMutationError()
+  }
+
+  const receipt = settleProjectMutation(outcome, owner, false)
+
+  return $projects.get().find(project => project.id === receipt.project_id) ?? null
+}
+
+export async function renameProject(
+  id: string,
+  name: string,
+  options: { dialog?: ProjectDialogState } = {}
+): Promise<void> {
+  const authority = resolveProjectManagementAuthority(id)
+
+  if (authority.status === 'managed') {
+    const context = captureProjectMutationContext()
+
+    await executeProjectMutationWithFeedback(
+      {
+        expected_version: authority.snapshot.version,
+        name: 'project.rename',
+        payload: { name },
+        project_id: id
+      },
+      (result, retried) => {
+        runCanonicalProjectReconcile(context, result.project_id)
+
+        if (retried && options.dialog) {
+          closeProjectDialog(options.dialog)
+        }
+      }
+    )
+
+    return
+  }
+
+  if (authority.status !== 'conclusively-legacy') {
+    throw new Error('project authority is unavailable')
+  }
+
   await updateProject(id, { name })
 }
 
@@ -721,6 +1332,8 @@ export async function updateProject(
   id: string,
   patch: { name?: string; color?: null | string; icon?: null | string }
 ): Promise<void> {
+  requireConclusiveLegacyProject(id)
+
   const snap = snapshotProjects()
 
   $projectTree.set(
@@ -759,6 +1372,8 @@ export async function setProjectAppearance(
   project: Pick<SidebarProjectTree, 'color' | 'icon' | 'id' | 'isAuto' | 'label' | 'path'>,
   patch: { color?: null | string; icon?: null | string }
 ): Promise<boolean> {
+  requireConclusiveLegacyProject(project.id)
+
   if (!project.isAuto) {
     await updateProject(project.id, patch)
 
@@ -786,6 +1401,8 @@ export async function addProjectFolder(
   path: string,
   opts: { label?: string; isPrimary?: boolean } = {}
 ): Promise<void> {
+  requireConclusiveLegacyProject(id)
+
   const snap = snapshotProjects()
   const trimmed = path.trim()
 
@@ -840,7 +1457,11 @@ function openSessionBelongsToProject(projectId: string, projects: ProjectInfo[])
 // clicked (the entered-scope effect exits if you deleted the project you were
 // inside), reconciling from the server payload. A failed delete restores both.
 export async function deleteProject(id: string): Promise<void> {
+  requireConclusiveLegacyProject(id)
+
   const snap = snapshotProjects()
+  const catalogProfile = activeProfileId()
+  const catalogGeneration = $projectCatalogAuthority.get().contextGeneration
   // Capture membership BEFORE removal — the project's folders (which determine
   // ownership) are gone once it's dropped from the cache.
   const kickToIntro = openSessionBelongsToProject(id, snap.projects)
@@ -859,7 +1480,7 @@ export async function deleteProject(id: string): Promise<void> {
   }
 
   await persistOrRollback(snap, async () => {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', { id }))
+    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', { id }), catalogProfile, catalogGeneration)
   })
   void refreshProjectTree()
 }
@@ -873,12 +1494,6 @@ export async function setActiveProject(id: null | string): Promise<void> {
 // A single dialog mounted in the sidebar reads this atom, so a project node's
 // menu can open create / rename / add-folder flows without prop threading
 // (mirrors $profileCreateRequest).
-export interface ProjectDialogState {
-  mode: 'add-folder' | 'create' | 'rename'
-  projectId?: string
-  name?: string
-}
-
 export const $projectDialog = atom<null | ProjectDialogState>(null)
 
 export function openProjectCreate(): void {
@@ -899,10 +1514,18 @@ export function openProjectRename(project: { id: string; name: string }): void {
 }
 
 export function openProjectAddFolder(project: { id: string; name: string }): void {
+  if (isEffectivelyManagedProject(project.id)) {
+    return
+  }
+
   $projectDialog.set({ mode: 'add-folder', name: project.name, projectId: project.id })
 }
 
-export function closeProjectDialog(): void {
+export function closeProjectDialog(expected?: ProjectDialogState): void {
+  if (expected && $projectDialog.get() !== expected) {
+    return
+  }
+
   $projectDialog.set(null)
 }
 

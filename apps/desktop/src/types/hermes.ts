@@ -456,6 +456,9 @@ export interface SessionInfo {
   /** Parent conversation when this row is a /branch fork. */
   parent_session_id?: null | string
   preview: null | string
+  /** Immutable project binding stored with the session. Present on compact
+   *  session-list rows; null/absent for unbound and older sessions. */
+  project_id?: null | string
   source: null | string
   started_at: number
   title: null | string
@@ -506,6 +509,93 @@ export interface SessionMessage {
   tool_call_id?: null | string
   tool_calls?: unknown
   tool_name?: string
+}
+
+/** Sanitized, canonical ProjectRuntime wire projections. These deliberately do
+ * not expose filesystem paths, delivery claims, external identifiers, or raw
+ * provider payloads. */
+export type ProjectRuntimeJson =
+  | boolean
+  | null
+  | number
+  | string
+  | ProjectRuntimeJson[]
+  | { [key: string]: ProjectRuntimeJson }
+
+export interface ProjectQueueItem {
+  sequence: number
+  status: string
+  turn_id: string
+}
+
+export interface ProjectApproval {
+  approval_id: string
+  kind: string
+}
+
+export type ProjectRunControlState = 'running' | 'awaiting_approval' | 'stop_requested' | 'stopped' | 'resume_requested'
+
+export interface ProjectActiveRun {
+  control_state: ProjectRunControlState
+  control_version: number
+  turn_id: string
+}
+
+export interface ProjectDeliveryStatus {
+  error_code: null | string
+  state: 'not_configured' | 'caught_up' | 'pending' | 'in_flight' | 'blocked'
+}
+
+export interface ProjectRuntimeBlock {
+  code: string
+  kind: 'runtime' | 'operation' | 'delivery'
+}
+
+export interface ProjectArtifactOpenTarget {
+  href: string
+  kind: 'external_url'
+}
+
+export interface ProjectArtifactPresentation {
+  created_at: number
+  kind: 'file' | 'image' | 'link'
+  label: string
+  open_target: null | ProjectArtifactOpenTarget
+  sha256: null | string
+  size_bytes: null | number
+}
+
+export interface ProjectArtifact {
+  artifact_id: string
+  presentation: ProjectArtifactPresentation
+}
+
+export interface ProjectRuntimeSnapshot {
+  active_run: null | ProjectActiveRun
+  artifacts: ProjectArtifact[]
+  binding_id: string
+  block: null | ProjectRuntimeBlock
+  canonical_session_id: string
+  current_phase: string
+  delivery_status: ProjectDeliveryStatus
+  last_sequence: number
+  lifecycle: 'active' | 'awaiting_acceptance' | 'completed'
+  pending_approval: ProjectApproval | null
+  project_id: string
+  queue: ProjectQueueItem[]
+  transcript: SessionMessage[]
+  transcript_revision: number
+  version: number
+}
+
+export interface ProjectRuntimeEvent {
+  created_at: string
+  event_id: string
+  kind: string
+  payload: ProjectRuntimeJson
+  project_id: string
+  sequence: number
+  turn_id: null | string
 }
 
 export interface SessionMessagesResponse {
@@ -826,6 +916,9 @@ export interface ProjectInfo {
   color: null | string
   board_slug: null | string
   primary_path: null | string
+  /** Older gateways omit this marker. Absence is unknown and must never be
+   * treated as conclusive permission for a legacy mutation. */
+  managed?: boolean
   archived: boolean
   created_at: number
   folders: ProjectFolder[]

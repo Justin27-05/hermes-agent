@@ -538,6 +538,35 @@ describe('createBackendSessionForSend profile routing', () => {
       reasoning_effort: 'high'
     })
   })
+  it('revalidates frozen draftauthority directly before session.create after profile readiness awaits', async () => {
+    const profileReady = deferred<void>()
+    vi.mocked(ensureGatewayProfile).mockReturnValueOnce(profileReady.promise)
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    const validateDraftAuthority = vi.fn(() => true)
+    let handle: HarnessHandle | null = null
+
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    let createPromise!: Promise<null | string>
+    act(() => {
+      createPromise = handle!.createBackendSessionForSend(null, validateDraftAuthority)
+    })
+    await waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalled())
+
+    validateDraftAuthority.mockReturnValue(false)
+    profileReady.resolve()
+
+    let result: null | string = 'unexpected'
+    await act(async () => {
+      result = await createPromise
+    })
+
+    expect(result).toBeNull()
+    expect(validateDraftAuthority).toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalledWith('session.create', expect.anything())
+  })
 
   it('falls back to the entered project cwd when the current cwd is blank', async () => {
     const params = await createWith(() => {

@@ -282,6 +282,15 @@ export function ChatView({
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const surfaceSessions = useStore($sessions)
+
+  const storedSession = surfaceSessions.find(
+    session =>
+      Boolean(storedId) &&
+      sessionMatchesStoredId(session, storedId!) &&
+      (session.profile?.trim() || 'default') === activeGatewayProfile
+  )
+
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
   // from the view slice, not the global atoms (which track the primary only).
@@ -584,6 +593,8 @@ export function ChatView({
               queueSessionKey={queueSessionKey}
               sessionId={activeSessionId}
               state={chatBarState}
+              storedSession={storedSession ?? undefined}
+              storedSessionId={storedId}
             />
           </Suspense>
         )}

@@ -29,6 +29,7 @@ import {
 } from '@/components/pane-shell/tree/store'
 import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
+import type { SessionInfo } from '@/types/hermes'
 
 import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import {
@@ -429,7 +430,7 @@ export interface SessionTileDelegate {
   deleteSession(storedSessionId: string): Promise<void>
   /** Run a slash command against a tile's session (app-level effects — e.g.
    *  branch/handoff — act on the main surface, as they should). */
-  executeSlash(rawCommand: string, sessionId: string): Promise<void>
+  executeSlash(rawCommand: string, runtimeId: string, storedSession: SessionInfo): Promise<void>
   /** Interrupt a tile's running turn. */
   interruptSession(runtimeId: string): Promise<void>
   /** Bind a live runtime id for a stored session (resume without touching

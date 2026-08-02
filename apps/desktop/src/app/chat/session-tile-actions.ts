@@ -17,12 +17,20 @@ import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
+import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { triggerHaptic } from '@/lib/haptics'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
 import { notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
+import {
+  markManagedComposerNotice,
+  resolveCapturedProjectSubmitAuthority,
+  submitManagedProjectPrompt
+} from '@/store/project-composer-queue'
+import { resolveCurrentManagedProjectSurface } from '@/store/project-surface-authority-store'
+import { executeProjectMutationWithFeedback } from '@/store/projects'
 import { clearAllPrompts } from '@/store/prompts'
 import { $connection, $sessions, sessionMatchesStoredId } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
@@ -44,7 +52,7 @@ import {
   truncateSubmitParams
 } from '../session/hooks/use-prompt-actions/rewind'
 import { useSubmitPrompt } from '../session/hooks/use-prompt-actions/submit'
-import { type SubmitTextOptions } from '../session/hooks/use-prompt-actions/utils'
+import { type GatewayRequest, type SubmitTextOptions } from '../session/hooks/use-prompt-actions/utils'
 import { upsertOptimisticSession } from '../session/hooks/use-session-actions/utils'
 
 import type { ComposerScope } from './composer/scope'
@@ -91,18 +99,26 @@ export function listTileSessionRow(deps: {
 interface SessionTileActionsArgs {
   runtimeId: string
   scope: ComposerScope
+  storedSession?: SessionInfo
   storedSessionId: string
 }
 
-export function useSessionTileActions({ runtimeId, scope, storedSessionId }: SessionTileActionsArgs) {
+export function useSessionTileActions({ runtimeId, scope, storedSession, storedSessionId }: SessionTileActionsArgs) {
   const { t } = useI18n()
   const copy = t.desktop
+  const managedProjectCopy = t.statusStack.managedProject
   const { requestGateway } = useGatewayRequest()
 
   const runtimeIdRef = useRef(runtimeId)
   runtimeIdRef.current = runtimeId
   const storedIdRef = useRef(storedSessionId)
   storedIdRef.current = storedSessionId
+
+  const resolveProjectSurface = useCallback(
+    (runtimeSessionId: null | string | undefined) =>
+      resolveCurrentManagedProjectSurface(runtimeSessionId, storedIdRef.current, storedSession),
+    [storedSession]
+  )
 
   // Tile busy tracks the SESSION state, never the global $busy — and it must
   // read LIVE. A render-time snapshot goes stale (this hook's host doesn't
@@ -155,8 +171,9 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     async (
       sessionId: string,
       attachments: ComposerAttachment[],
-      options: { updateComposerAttachments?: boolean } = {}
+      options: { requestGateway?: GatewayRequest; updateComposerAttachments?: boolean } = {}
     ): Promise<ComposerAttachment[]> => {
+      const attachmentRequestGateway = options.requestGateway ?? requestGateway
       const remote = $connection.get()?.mode === 'remote'
       const synced: ComposerAttachment[] = []
 
@@ -168,7 +185,11 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         }
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
-          const next = await uploadComposerAttachment(attachment, { remote, requestGateway, sessionId })
+          const next = await uploadComposerAttachment(attachment, {
+            remote,
+            requestGateway: attachmentRequestGateway,
+            sessionId
+          })
 
           if (options.updateComposerAttachments ?? true) {
             scope.attachments.update(next)
@@ -219,25 +240,159 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
   const submitText = useCallback(
     async (rawText: string, options?: SubmitTextOptions) => {
-      const visibleText = rawText.trim()
+      const visibleText = sanitizeComposerInput(rawText).trim()
       const attachments = options?.attachments ?? scope.attachments.$attachments.get()
+      const targetSessionId = options?.sessionId ?? runtimeIdRef.current
+      let managedRuntime
+
+      if (options?.projectAuthority) {
+        const capturedResolution = resolveCapturedProjectSubmitAuthority(options.projectAuthority)
+        const surfaceResolution = resolveProjectSurface(targetSessionId)
+
+        const capturedManagedMatchesSurface =
+          capturedResolution.status === 'managed' &&
+          surfaceResolution.status === 'managed' &&
+          capturedResolution.snapshot.binding_id === surfaceResolution.snapshot.binding_id &&
+          capturedResolution.snapshot.project_id === surfaceResolution.snapshot.project_id &&
+          capturedResolution.snapshot.canonical_session_id === surfaceResolution.snapshot.canonical_session_id
+
+        const capturedLegacyMatchesSurface =
+          capturedResolution.status === 'legacy' && surfaceResolution.status === 'conclusively-legacy'
+
+        if (!capturedManagedMatchesSurface && !capturedLegacyMatchesSurface) {
+          notifyError(new Error(managedProjectCopy.voiceScopeChanged), managedProjectCopy.voiceScopeChanged)
+
+          return false
+        }
+
+        managedRuntime = capturedManagedMatchesSurface ? capturedResolution.snapshot : undefined
+      } else {
+        const managedResolution = resolveProjectSurface(targetSessionId)
+
+        if (managedResolution.status === 'ambiguous' || managedResolution.status === 'unavailable') {
+          const message =
+            managedResolution.status === 'ambiguous'
+              ? managedProjectCopy.ambiguousSession
+              : managedProjectCopy.runtimeUnavailable
+
+          notifyError(new Error(message), message)
+
+          return false
+        }
+
+        managedRuntime = managedResolution.status === 'managed' ? managedResolution.snapshot : undefined
+      }
 
       listTileSession(visibleText)
 
+      if (managedRuntime) {
+        return await submitManagedProjectPrompt({
+          attachmentsPresent: attachments.length > 0,
+          copy: managedProjectCopy,
+          fromQueue: Boolean(options?.fromQueue),
+          onOptimistic: optimistic =>
+            sessionTileDelegate()?.updateSession(targetSessionId, state => ({
+              ...state,
+              messages: state.messages.some(message => message.id === optimistic.local_id)
+                ? state.messages
+                : [
+                    ...state.messages,
+                    { id: optimistic.local_id, parts: [textPart(visibleText)], pending: true, role: 'user' }
+                  ]
+            })),
+          snapshot: managedRuntime,
+          text: visibleText
+        })
+      }
+
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
+        if (!storedSession) {
+          notifyError(new Error(managedProjectCopy.runtimeUnavailable), managedProjectCopy.runtimeUnavailable)
+
+          return false
+        }
+
         triggerHaptic('selection')
-        await sessionTileDelegate()?.executeSlash(visibleText, runtimeIdRef.current)
+        await sessionTileDelegate()?.executeSlash(visibleText, targetSessionId, storedSession)
 
         return true
       }
 
       return await submitPromptText(rawText, options)
     },
-    [listTileSession, scope.attachments.$attachments, submitPromptText]
+    [
+      listTileSession,
+      managedProjectCopy,
+      resolveProjectSurface,
+      scope.attachments.$attachments,
+      storedSession,
+      submitPromptText
+    ]
+  )
+
+  const blockManagedHistoryMutation = useCallback(
+    (sessionId: string): boolean => {
+      const resolution = resolveProjectSurface(sessionId)
+
+      if (resolution.status === 'conclusively-legacy') {
+        return false
+      }
+
+      if (resolution.status === 'managed') {
+        markManagedComposerNotice(resolution.snapshot, {
+          message: managedProjectCopy.historyUnsupported,
+          status: 'blocked',
+          text: ''
+        })
+      } else {
+        notifyError(new Error(managedProjectCopy.historyUnsupported), managedProjectCopy.historyUnsupported)
+      }
+
+      return true
+    },
+    [managedProjectCopy.historyUnsupported, resolveProjectSurface]
   )
 
   const cancelRun = useCallback(async () => {
     const sessionId = runtimeIdRef.current
+    const managedResolution = resolveProjectSurface(sessionId)
+
+    if (managedResolution.status === 'ambiguous' || managedResolution.status === 'unavailable') {
+      const message =
+        managedResolution.status === 'ambiguous'
+          ? managedProjectCopy.ambiguousSession
+          : managedProjectCopy.runtimeUnavailable
+
+      notifyError(new Error(message), message)
+
+      return
+    }
+
+    if (managedResolution.status === 'managed') {
+      const { active_run: activeRun } = managedResolution.snapshot
+
+      if (!activeRun || activeRun.control_state !== 'running') {
+        markManagedComposerNotice(managedResolution.snapshot, {
+          message: managedProjectCopy.stopUnavailable,
+          status: 'blocked',
+          text: ''
+        })
+
+        return
+      }
+
+      await executeProjectMutationWithFeedback({
+        expected_version: managedResolution.snapshot.version,
+        name: 'run.stop',
+        payload: {
+          expected_control_version: activeRun.control_version,
+          turn_id: activeRun.turn_id
+        },
+        project_id: managedResolution.snapshot.project_id
+      }).catch(() => undefined)
+
+      return
+    }
 
     update(state => ({
       ...state,
@@ -261,7 +416,15 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     } catch (err) {
       notifyError(err, copy.stopFailed)
     }
-  }, [copy.stopFailed, requestGateway, update])
+  }, [
+    copy.stopFailed,
+    managedProjectCopy.ambiguousSession,
+    managedProjectCopy.runtimeUnavailable,
+    managedProjectCopy.stopUnavailable,
+    requestGateway,
+    resolveProjectSurface,
+    update
+  ])
 
   const steerPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {
@@ -270,6 +433,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       if (!text || !sessionId) {
         return false
+      }
+
+      if (resolveProjectSurface(sessionId).status !== 'conclusively-legacy') {
+        return submitText(rawText, { sessionId })
       }
 
       const messageId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -343,7 +510,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       return false
     },
-    [requestGateway]
+    [requestGateway, resolveProjectSurface, submitText]
   )
 
   // Rewind primitive (interrupt-first for live turns, busy-retry) — shared with
@@ -356,6 +523,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
   const reloadFromMessage = useCallback(
     async (parentId: string | null) => {
+      if (blockManagedHistoryMutation(runtimeIdRef.current)) {
+        return
+      }
+
       const state = readState()
 
       if (!state || state.busy) {
@@ -385,12 +556,17 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         notifyError(err, copy.regenerateFailed)
       }
     },
-    [copy.regenerateFailed, readState, requestGateway, update]
+    [blockManagedHistoryMutation, copy.regenerateFailed, readState, requestGateway, update]
   )
 
   const restoreToMessage = useCallback(
     async (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => {
       const sessionId = runtimeIdRef.current
+
+      if (blockManagedHistoryMutation(sessionId)) {
+        return
+      }
+
       const messages = readMessages()
       const plan = planRestore(messages, messageId, target)
 
@@ -409,11 +585,15 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         throw err
       }
     },
-    [readMessages, readState, submitRewind, update]
+    [blockManagedHistoryMutation, readMessages, readState, submitRewind, update]
   )
 
   const editMessage = useCallback(
     async (edited: AppendMessage) => {
+      if (blockManagedHistoryMutation(runtimeIdRef.current)) {
+        return
+      }
+
       const messages = readMessages()
       const plan = planEdit(messages, edited)
 
@@ -438,7 +618,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         notifyError(err, copy.editFailed)
       }
     },
-    [copy.editFailed, readMessages, readState, submitRewind, update]
+    [blockManagedHistoryMutation, copy.editFailed, readMessages, readState, submitRewind, update]
   )
 
   // Branch-visibility sync (assistant-ui hides non-active branches).

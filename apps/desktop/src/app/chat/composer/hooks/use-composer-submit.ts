@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { type RefObject, useEffect, useRef } from 'react'
 
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
@@ -5,6 +6,8 @@ import { triggerHaptic } from '@/lib/haptics'
 import { clearSessionDraft, type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
+import { resolveManagedProjectSession } from '@/store/project-composer-queue'
+import { $projectRuntimes } from '@/store/project-runtime'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
@@ -27,6 +30,7 @@ interface UseComposerSubmitArgs {
   focusInput: () => void
   inputDisabled: boolean
   loadIntoComposer: (text: string, attachments: ComposerAttachment[]) => void
+  managedProjectSession?: boolean
   onCancel: ChatBarProps['onCancel']
   onSteer: ChatBarProps['onSteer']
   onSubmit: ChatBarProps['onSubmit']
@@ -62,6 +66,7 @@ export function useComposerSubmit({
   focusInput,
   inputDisabled,
   loadIntoComposer,
+  managedProjectSession: managedProjectSessionOverride,
   onCancel,
   onSteer,
   onSubmit,
@@ -73,6 +78,10 @@ export function useComposerSubmit({
   stashAt
 }: UseComposerSubmitArgs) {
   const scope = useComposerScope()
+  const projectRuntimes = useStore($projectRuntimes)
+
+  const managedProjectSession =
+    managedProjectSessionOverride ?? resolveManagedProjectSession(projectRuntimes, sessionId).status !== 'legacy'
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
@@ -107,11 +116,11 @@ export function useComposerSubmit({
   useEffect(
     () =>
       onComposerSubmitRequest(({ target, text }) => {
-        if (target === 'main' && !inputDisabled) {
+        if (target === scope.target && !inputDisabled) {
           dispatchSubmitRef.current(text)
         }
       }),
-    [inputDisabled]
+    [inputDisabled, scope.target]
   )
 
   const submitDraft = () => {
@@ -141,7 +150,14 @@ export function useComposerSubmit({
     const text = draftRef.current
     const payloadPresent = text.trim().length > 0 || attachments.length > 0
 
-    if (queueEdit) {
+    if (managedProjectSession && payloadPresent) {
+      const submittedAttachments = cloneAttachments(attachments)
+      triggerHaptic('submit')
+      resetBrowseState(sessionId)
+      clearDraft()
+      scope.attachments.clear()
+      dispatchSubmit(text, submittedAttachments)
+    } else if (queueEdit) {
       exitQueuedEdit('save')
     } else if (busy) {
       // Slash commands should execute immediately even while the agent is
@@ -208,6 +224,12 @@ export function useComposerSubmit({
 
   const queueDraft = () => {
     if (disabled || !busy) {
+      return
+    }
+
+    if (managedProjectSession) {
+      submitDraft()
+
       return
     }
 

@@ -348,7 +348,7 @@ export function useSessionActions({
   )
 
   const createBackendSessionForSend = useCallback(
-    async (preview: string | null = null): Promise<string | null> => {
+    async (preview: string | null = null, validateAuthority?: () => boolean): Promise<string | null> => {
       const startingStoredSessionId = selectedStoredSessionIdRef.current
       const startingRouteToken = getRouteToken()
 
@@ -368,8 +368,20 @@ export function useSessionActions({
               : $currentCwd.get().trim() || resolveNewSessionCwd()
 
         const params = await desktopSessionCreateParams(cwd)
+
+        if (validateAuthority && !validateAuthority()) {
+          return null
+        }
+
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id ?? null
+
+        // session.create can take seconds. Never publish its result into a
+        // fresh-draft surface whose frozen producer authority changed while the
+        // RPC awaited.
+        if (validateAuthority && !validateAuthority()) {
+          return null
+        }
 
         // Only a genuine move to a DIFFERENT chat mid-create should orphan the
         // session we just minted. The active runtime ref is deliberately not a
@@ -389,7 +401,10 @@ export function useSessionActions({
 
         if (drift) {
           console.warn('[submit-drift-abort]', drift, { phase: 'mid-create' })
-          await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+
+          if (!validateAuthority || validateAuthority()) {
+            await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+          }
 
           return null
         }
@@ -427,6 +442,10 @@ export function useSessionActions({
         // User may have armed YOLO on the new-chat draft before the runtime
         // session existed — apply it to the freshly created session.
         if (yoloArmed) {
+          if (validateAuthority && !validateAuthority()) {
+            return null
+          }
+
           await setSessionYolo(requestGateway, created.session_id, true).catch(() => undefined)
         }
 

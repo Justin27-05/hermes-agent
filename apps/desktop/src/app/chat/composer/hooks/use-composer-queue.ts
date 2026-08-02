@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
+import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
@@ -21,6 +21,14 @@ import {
   updateQueuedPrompt
 } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
+import {
+  $managedVoiceRecoveries,
+  captureProjectSubmitAuthority,
+  managedVoiceRecoveryKey,
+  resolveManagedProjectSession,
+  restoreManagedVoiceRecovery
+} from '@/store/project-composer-queue'
+import { $projectRuntimes } from '@/store/project-runtime'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { useComposerScope } from '../scope'
@@ -34,11 +42,13 @@ interface UseComposerQueueArgs {
   draftRef: RefObject<string>
   focusInput: () => void
   loadIntoComposer: (text: string, attachments: ComposerAttachment[]) => void
+  managedProjectSession?: boolean
   onCancel: ChatBarProps['onCancel']
   onSubmit: ChatBarProps['onSubmit']
   queueEditRef: RefObject<QueueEditState | null>
   queueSessionKey: ChatBarProps['queueSessionKey']
   sessionId: string | null | undefined
+  storedSessionId?: string | null
 }
 
 /**
@@ -58,11 +68,13 @@ export function useComposerQueue({
   draftRef,
   focusInput,
   loadIntoComposer,
+  managedProjectSession: managedProjectSessionOverride,
   onCancel,
   onSubmit,
   queueEditRef,
   queueSessionKey,
-  sessionId
+  sessionId,
+  storedSessionId
 }: UseComposerQueueArgs) {
   const { t } = useI18n()
   const scope = useComposerScope()
@@ -70,12 +82,23 @@ export function useComposerQueue({
   // Per-session slice (edge): re-renders only when THIS session's queue changes,
   // not on cross-session queue churn (the plain atom's map ref changes on every
   // write; the keyed array does not).
-  const queuedPrompts = useSessionSlice($queuedPromptsBySession, activeQueueSessionKey)
+  const storedQueuedPrompts = useSessionSlice($queuedPromptsBySession, activeQueueSessionKey)
 
   // Parked = the user explicitly halted this session (Stop/Esc) while prompts
   // were queued. The map is tiny (only halted sessions) so a plain subscribe
   // is fine; the auto-drain effect below reads it as a gate.
   const parkedSessions = useStore($parkedQueueSessions)
+  const projectRuntimes = useStore($projectRuntimes)
+
+  const managedProjectSession =
+    managedProjectSessionOverride ?? resolveManagedProjectSession(projectRuntimes, sessionId).status !== 'legacy'
+
+  const currentVoiceAuthority = captureProjectSubmitAuthority(storedSessionId ?? sessionId, projectRuntimes)
+
+  const voiceRecoveryKey =
+    currentVoiceAuthority.status === 'managed' ? managedVoiceRecoveryKey(currentVoiceAuthority) : null
+
+  const quarantinedVoicePrompts = useSessionSlice($managedVoiceRecoveries, voiceRecoveryKey)
   const queueParked = Boolean(activeQueueSessionKey && parkedSessions[activeQueueSessionKey])
 
   const [queueEdit, setQueueEdit] = useState<QueueEditState | null>(null)
@@ -89,11 +112,19 @@ export function useComposerQueue({
     [queueEditRef]
   )
 
-  const editingQueuedPrompt = queueEdit ? (queuedPrompts.find(entry => entry.id === queueEdit.entryId) ?? null) : null
-
   const prevQueueKeyRef = useRef(activeQueueSessionKey)
   const drainingQueueRef = useRef(false)
   const drainFailuresRef = useRef(new Map<string, number>())
+
+  const isManagedProjectSession = useCallback(() => managedProjectSession, [managedProjectSession])
+
+  const queuedPrompts = useMemo(
+    () => (managedProjectSession ? [] : storedQueuedPrompts),
+    [managedProjectSession, storedQueuedPrompts]
+  )
+
+  const quarantinedManagedPrompts = managedProjectSession ? storedQueuedPrompts : []
+  const editingQueuedPrompt = queueEdit ? (queuedPrompts.find(entry => entry.id === queueEdit.entryId) ?? null) : null
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
     if (!activeQueueSessionKey || queueEdit) {
@@ -176,7 +207,7 @@ export function useComposerQueue({
   const queueCurrentDraft = useCallback(() => {
     const text = draftRef.current
 
-    if (!activeQueueSessionKey || (!text.trim() && attachments.length === 0)) {
+    if (!activeQueueSessionKey || isManagedProjectSession() || (!text.trim() && attachments.length === 0)) {
       return false
     }
 
@@ -189,13 +220,13 @@ export function useComposerQueue({
     triggerHaptic('selection')
 
     return true
-  }, [activeQueueSessionKey, attachments, clearDraft, draftRef, scope.attachments])
+  }, [activeQueueSessionKey, attachments, clearDraft, draftRef, isManagedProjectSession, scope.attachments])
 
   // All queue drain paths share one lock + send-then-remove sequence.
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
   const runDrain = useCallback(
     async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
-      if (drainingQueueRef.current || !activeQueueSessionKey) {
+      if (drainingQueueRef.current || !activeQueueSessionKey || isManagedProjectSession()) {
         return false
       }
 
@@ -237,7 +268,7 @@ export function useComposerQueue({
         drainingQueueRef.current = false
       }
     },
-    [activeQueueSessionKey, onSubmit, sessionId]
+    [activeQueueSessionKey, isManagedProjectSession, onSubmit, sessionId]
   )
 
   const pickDrainHead = useCallback(
@@ -253,7 +284,7 @@ export function useComposerQueue({
 
   const sendQueuedNow = useCallback(
     (id: string) => {
-      if (!activeQueueSessionKey || id === queueEdit?.entryId) {
+      if (!activeQueueSessionKey || isManagedProjectSession() || id === queueEdit?.entryId) {
         return false
       }
 
@@ -277,7 +308,50 @@ export function useComposerQueue({
 
       return runDrain(entries => entries.find(e => e.id === id))
     },
-    [activeQueueSessionKey, busy, onCancel, queueEdit, runDrain]
+    [activeQueueSessionKey, busy, isManagedProjectSession, onCancel, queueEdit, runDrain]
+  )
+
+  const restoreManagedLegacyPrompt = useCallback(
+    (id: string): boolean => {
+      if (!managedProjectSession || !activeQueueSessionKey) {
+        return false
+      }
+
+      const entry = getQueuedPrompts(activeQueueSessionKey).find(candidate => candidate.id === id)
+
+      if (!entry) {
+        return false
+      }
+
+      loadIntoComposer(entry.text, entry.attachments)
+
+      if (!removeQueuedPrompt(activeQueueSessionKey, entry.id)) {
+        return false
+      }
+
+      triggerHaptic('selection')
+      focusInput()
+
+      return true
+    },
+    [activeQueueSessionKey, focusInput, loadIntoComposer, managedProjectSession]
+  )
+
+  const restoreManagedVoicePrompt = useCallback(
+    (id: string): boolean => {
+      const entry = restoreManagedVoiceRecovery(currentVoiceAuthority, id)
+
+      if (!entry) {
+        return false
+      }
+
+      loadIntoComposer(entry.text, entry.attachments)
+      triggerHaptic('selection')
+      focusInput()
+
+      return true
+    },
+    [currentVoiceAuthority, focusInput, loadIntoComposer]
   )
 
   // Edge-independent auto-drain: send the head whenever the session is idle and
@@ -285,7 +359,7 @@ export function useComposerQueue({
   // a stale-session 404) can't strand the entry permanently nor spin-loop. The
   // drain lock serializes sends; a remount/reconnect resets the failure counts.
   const autoDrainNext = useCallback(() => {
-    if (busy || queueParked || drainingQueueRef.current || !activeQueueSessionKey) {
+    if (busy || queueParked || drainingQueueRef.current || !activeQueueSessionKey || isManagedProjectSession()) {
       return
     }
 
@@ -316,7 +390,7 @@ export function useComposerQueue({
         }
       })
       .catch(onFail)
-  }, [activeQueueSessionKey, busy, pickDrainHead, queueParked, queuedPrompts, runDrain, t])
+  }, [activeQueueSessionKey, busy, isManagedProjectSession, pickDrainHead, queueParked, queuedPrompts, runDrain, t])
 
   // Re-key on a runtime session-id change. A stable stored id (queueSessionKey)
   // never churns, so a change there is a real session switch and must NOT
@@ -373,7 +447,11 @@ export function useComposerQueue({
     queueCurrentDraft,
     queueEdit,
     queueParked,
+    quarantinedManagedPrompts,
+    quarantinedVoicePrompts,
     queuedPrompts,
+    restoreManagedLegacyPrompt,
+    restoreManagedVoicePrompt,
     sendQueuedNow,
     stepQueuedEdit
   }

@@ -18,6 +18,7 @@ export type GatewayEventName =
   | 'sudo.request'
   | 'secret.request'
   | 'background.complete'
+  | 'project.event'
   | 'error'
   | 'skin.changed'
   | (string & {})
@@ -33,8 +34,14 @@ export interface GatewayEvent<P = unknown> {
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed' | 'error'
 export type GatewayRequestId = number | string
 
+export interface JsonRpcErrorFrame {
+  code?: number
+  data?: unknown
+  message?: string
+}
+
 export interface JsonRpcFrame {
-  error?: { message?: string }
+  error?: JsonRpcErrorFrame
   id?: GatewayRequestId | null
   method?: string
   params?: GatewayEvent
@@ -58,6 +65,21 @@ export interface GatewayClientOptions {
   requestTimeoutMs?: number
   socketFactory?: (url: string) => WebSocketLike
   notConnectedErrorMessage?: string
+}
+
+/** A safe client error retaining only the structured RPC evidence consumers
+ * must independently validate. Server-provided error text is never surfaced
+ * as the generic user-facing message. */
+export class JsonRpcGatewayError extends Error {
+  readonly code: number | undefined
+  readonly data: unknown
+
+  constructor(error: JsonRpcErrorFrame) {
+    super('Hermes RPC failed')
+    this.name = 'JsonRpcGatewayError'
+    this.code = typeof error.code === 'number' && Number.isSafeInteger(error.code) ? error.code : undefined
+    this.data = error.data
+  }
 }
 
 const ANY = '*'
@@ -364,7 +386,7 @@ export class JsonRpcGatewayClient {
       this.clearPending(frame.id)
 
       if (frame.error) {
-        call.reject(new Error(frame.error.message || 'Hermes RPC failed'))
+        call.reject(new JsonRpcGatewayError(frame.error))
       } else {
         call.resolve(frame.result)
       }

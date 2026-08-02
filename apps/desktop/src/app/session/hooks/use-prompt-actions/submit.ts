@@ -18,6 +18,11 @@ import {
   type ComposerAttachment,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
+import {
+  rebindExactLegacySessionAuthority,
+  validateExactLegacySessionAuthority,
+  validateFrozenLegacyDraftAuthority
+} from '@/store/legacy-session-authority'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $sessions, resolveComposerSessionKey, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
@@ -44,7 +49,7 @@ interface SubmitPromptDeps {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   copy: Translations['desktop']
-  createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
+  createBackendSessionForSend: (preview?: string | null, validateAuthority?: () => boolean) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
@@ -54,7 +59,7 @@ interface SubmitPromptDeps {
   syncAttachmentsForSubmit: (
     sessionId: string,
     attachments: ComposerAttachment[],
-    options?: { updateComposerAttachments?: boolean }
+    options?: { requestGateway?: GatewayRequest; updateComposerAttachments?: boolean }
   ) => Promise<ComposerAttachment[]>
   updateSessionState: (
     sessionId: string,
@@ -70,6 +75,13 @@ interface SubmitPromptDeps {
     setAwaitingResponse: (awaiting: boolean) => void
     setBusy: (busy: boolean) => void
     setMessages: (updater: (current: ChatMessage[]) => ChatMessage[]) => void
+  }
+}
+
+class LegacySubmitAuthorityDriftError extends Error {
+  constructor(readonly reason: string) {
+    super('legacy session authority changed')
+    this.name = 'LegacySubmitAuthorityDriftError'
   }
 }
 
@@ -188,8 +200,35 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const isBackgroundQueueDrain = Boolean(
         options?.fromQueue && options?.storedSessionId && options.storedSessionId !== selectedStoredSessionIdRef.current
       )
-
       let sessionId: null | string = options?.sessionId ?? (isBackgroundQueueDrain ? null : activeSessionIdRef.current)
+      let exactLegacyAuthority = options?.legacyAuthority
+
+      const legacyAuthorityDrift = (): string | null => {
+        if (
+          exactLegacyAuthority &&
+          !validateExactLegacySessionAuthority(exactLegacyAuthority, {
+            runtimeSessionId: sessionId
+          })
+        ) {
+          return 'legacy-authority'
+        }
+
+        return options?.legacyDraftAuthority && !validateFrozenLegacyDraftAuthority(options.legacyDraftAuthority)
+          ? 'legacy-draft-authority'
+          : null
+      }
+
+      const requestWithAuthority: GatewayRequest = (method, params, timeoutMs) => {
+        const drift = legacyAuthorityDrift()
+
+        if (drift) {
+          return Promise.reject(new LegacySubmitAuthorityDriftError(drift))
+        }
+
+        return timeoutMs === undefined
+          ? requestGateway(method, params)
+          : requestGateway(method, params, timeoutMs)
+      }
 
       // Pin the foreground session context for the whole async submit pipeline.
       // Without this, a fast session switch during session.resume / file.attach
@@ -226,23 +265,28 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // is the stored session this submit targets, so a move ONTO it (the
       // pipeline's own re-home) is never counted as drift.
       const sessionDriftReason = (): string | null =>
-        targetStartedInCurrentView
+        legacyAuthorityDrift() ??
+        (targetStartedInCurrentView
           ? sessionContextDrift({
-              startRouteToken: startingRouteToken,
-              nowRouteToken: getRouteToken(),
-              startSelectedStoredId: startingStoredSessionId,
-              nowSelectedStoredId: selectedStoredSessionIdRef.current,
-              submitTargetStoredId: startingStoredSessionId,
-              composerScope: options?.composerScope,
-              // The composer keys drafts/attachments on the durable lineage
-              // root (survives auto-compression tip rotation), while
-              // startingStoredSessionId is the live tip — resolve the target
-              // into the same lineage-root domain before comparing, or every
-              // submit into a session that has ever compressed would
-              // false-positive-abort.
-              submitTargetComposerScope: resolveComposerSessionKey(startingStoredSessionId, $sessions.get())
-            })
-          : null
+                startRouteToken: startingRouteToken,
+                nowRouteToken: getRouteToken(),
+                startSelectedStoredId: startingStoredSessionId,
+                nowSelectedStoredId: selectedStoredSessionIdRef.current,
+                submitTargetStoredId: startingStoredSessionId,
+                composerScope: options?.composerScope,
+                // The composer keys drafts/attachments on the durable lineage
+                // root (survives auto-compression tip rotation), while
+                // startingStoredSessionId is the live tip — resolve the target
+                // into the same lineage-root domain before comparing, or every
+                // submit into a session that has ever compressed would
+                // false-positive-abort.
+                submitTargetComposerScope: resolveComposerSessionKey(startingStoredSessionId, $sessions.get())
+              })
+          : null)
+
+      if (legacyAuthorityDrift()) {
+        return false
+      }
 
       const targetIsCurrentView = (): boolean => targetStartedInCurrentView && !sessionDriftReason()
 
@@ -419,7 +463,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // profile is live would fork the conversation into the wrong DB (#67603).
           const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
 
-          const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+          const resumed = await requestWithAuthority<{ session_id: string }>('session.resume', {
             session_id: targetStoredSessionId,
             source: 'desktop',
             ...(resumeProfile ? { profile: resumeProfile } : {})
@@ -466,7 +510,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       if (!sessionId) {
         try {
-          sessionId = await createBackendSessionForSend(visibleText)
+          sessionId = await createBackendSessionForSend(visibleText, () => !legacyAuthorityDrift())
         } catch (err) {
           dropOptimistic(null)
           releaseBusy()
@@ -500,6 +544,14 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return false
         }
 
+        const createAuthorityDrift = legacyAuthorityDrift()
+
+        if (createAuthorityDrift) {
+          console.warn('[submit-drift-abort]', createAuthorityDrift, { phase: 'post-create' })
+
+          return abortForSessionSwitch(sessionId)
+        }
+
         // A successful create re-homes selection + route to the chat it just
         // minted, so the pre-create baseline can't tell our own re-home from
         // a user switch (judging it drift aborted EVERY first send of a new
@@ -522,6 +574,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       try {
         const syncedAttachments = await syncAttachmentsForSubmit(sessionId, attachments, {
+          requestGateway: requestWithAuthority,
           updateComposerAttachments: usingComposerAttachments
         })
 
@@ -550,10 +603,15 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // while the desktop app still holds the old session ID. Detect this,
         // resume the stored session to re-register it, and retry once.
         let submitErr: unknown = null
+        const initialSubmitSessionId = sessionId
 
         try {
           await withSessionBusyRetry(() =>
-            requestGateway('prompt.submit', submitParams(sessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+            requestWithAuthority(
+              'prompt.submit',
+              submitParams(initialSubmitSessionId),
+              PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+            )
           )
         } catch (firstErr) {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
@@ -566,7 +624,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // out and losing the session binding.
             const resumeProfile = await resolveSessionProfile(recoverStoredSessionId)
 
-            const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+            const resumed = await requestWithAuthority<{ session_id: string }>('session.resume', {
               session_id: recoverStoredSessionId,
               source: 'desktop',
               ...(resumeProfile ? { profile: resumeProfile } : {})
@@ -583,12 +641,28 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             const recoveredId = resumed?.session_id
 
             if (recoveredId) {
+              if (exactLegacyAuthority) {
+                const reboundAuthority = rebindExactLegacySessionAuthority(exactLegacyAuthority, recoveredId)
+
+                if (!reboundAuthority) {
+                  console.warn('[submit-drift-abort]', 'legacy-authority-rebind', {
+                    phase: 'post-resume-retry'
+                  })
+
+                  return abortForSessionSwitch(sessionId)
+                }
+
+                exactLegacyAuthority = reboundAuthority
+              }
+
+              sessionId = recoveredId
+
               if (targetIsCurrentView()) {
                 activeSessionIdRef.current = recoveredId
               }
 
               await withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(recoveredId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                requestWithAuthority('prompt.submit', submitParams(recoveredId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
               )
             } else {
               submitErr = firstErr
@@ -602,16 +676,34 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           throw submitErr
         }
 
+        const postSubmitDrift = sessionDriftReason()
+
+        if (postSubmitDrift) {
+          console.warn('[submit-drift-abort]', postSubmitDrift, { phase: 'post-submit' })
+          // Never publish a settle into a replacement producer. Releasing the
+          // process-local lock is safe; attachment/busy/awaiting state belongs
+          // to whichever authority is current now and must remain untouched.
+          releaseSubmitLock()
+
+          return false
+        }
+
         if (usingComposerAttachments) {
           scope.clearAttachments()
         }
 
         // Submit landed — the turn now runs (busy stays true), but the submit
-        // window is closed, so release the lock for the next (sequential) send.
+        // window is closed, so release the lock for the next sequential send.
         releaseSubmitLock()
 
         return true
       } catch (err) {
+        if (err instanceof LegacySubmitAuthorityDriftError) {
+          console.warn('[submit-drift-abort]', err.reason, { phase: 'request-boundary' })
+
+          return abortForSessionSwitch(sessionId)
+        }
+
         releaseBusy()
 
         // A queued drain that raced a not-yet-settled turn gets a transient

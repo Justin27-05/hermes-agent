@@ -261,11 +261,13 @@ export async function openGatewayForProfile(profile: string): Promise<void> {
 
 // Make `profile` the active gateway, lazily opening its socket if needed. The
 // primary is a no-op fast path. Background sockets are never closed here.
-export async function ensureGatewayForProfile(profile: string): Promise<void> {
+export async function ensureGatewayForProfile(profile: string, isCurrent: () => boolean = () => true): Promise<void> {
   const key = normKey(profile)
 
   if (key === g.primaryProfile) {
-    setActive(key)
+    if (isCurrent()) {
+      setActive(key)
+    }
 
     return
   }
@@ -289,7 +291,9 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
     }
   }
 
-  setActive(key)
+  if (isCurrent()) {
+    setActive(key)
+  }
 }
 
 // Reconnect the active gateway after a transient request failure. Primary

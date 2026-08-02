@@ -36,6 +36,8 @@ interface ConversationProps {
   onToggleMute: () => void
 }
 
+export type ComposerBusyAction = 'queue' | 'send' | 'steer' | 'stop'
+
 export function ComposerControls({
   autoSpeak,
   busy,
@@ -53,7 +55,7 @@ export function ComposerControls({
 }: {
   autoSpeak: boolean
   busy: boolean
-  busyAction: 'steer' | 'queue' | 'stop'
+  busyAction: ComposerBusyAction
   canSubmit: boolean
   compactModelPill?: boolean
   conversation: ConversationProps
@@ -73,7 +75,9 @@ export function ComposerControls({
   }
 
   const showVoicePrimary = !busy && !hasComposerPayload
-  const busyLabel = busyAction === 'queue' ? c.queueMessage : busyAction === 'steer' ? c.steer : c.stop
+
+  const busyLabel =
+    busyAction === 'queue' ? c.queueMessage : busyAction === 'steer' ? c.steer : busyAction === 'send' ? c.send : c.stop
 
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
@@ -141,6 +145,8 @@ export function ComposerControls({
                 <Layers3 className={iconSize.sm} />
               ) : busyAction === 'steer' ? (
                 <SteeringWheel className={iconSize.sm} />
+              ) : busyAction === 'send' ? (
+                <Codicon name="arrow-up" size="0.875rem" />
               ) : (
                 <span className="block size-2.5 rounded-[0.1875rem] bg-current" />
               )

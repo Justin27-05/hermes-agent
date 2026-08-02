@@ -4,11 +4,31 @@ import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getSession } from '@/hermes'
+import { en } from '@/i18n/en'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
+import { setPrimaryGateway } from '@/store/gateway'
+import {
+  captureExactLegacySessionAuthority,
+  captureFrozenLegacyDraftAuthority
+} from '@/store/legacy-session-authority'
 import { $notifications, clearNotifications } from '@/store/notifications'
+import { $activeGatewayProfile } from '@/store/profile'
+import {
+  $managedComposerActionsBySession,
+  $optimisticProjectPrompts,
+  resetOptimisticProjectPrompts,
+  retryManagedComposerPrompt
+} from '@/store/project-composer-queue'
+import {
+  $projectRuntimes,
+  configureProjectRuntimeRequester,
+  projectRuntimeAuthority,
+  resetProjectRuntimeStore
+} from '@/store/project-runtime'
+import { $activeProjectId, $projectCatalogAuthority, $projects } from '@/store/projects'
 import {
   $busy,
   $connection,
@@ -27,6 +47,25 @@ import type { SubmitTextOptions } from './utils'
 
 import { uploadComposerAttachment, usePromptActions } from '.'
 
+const projectCommandRuntime = vi.hoisted(() => ({
+  executeProjectMutation: vi.fn(),
+  isProjectMutationRetryAvailable: vi.fn(() => true),
+  retryProjectMutation: vi.fn()
+}))
+
+const executeProjectMutation = projectCommandRuntime.executeProjectMutation
+
+vi.mock('@/store/project-command-runtime', () => projectCommandRuntime)
+
+const projectFeedback = vi.hoisted(() => ({
+  executeProjectMutationWithFeedback: vi.fn()
+}))
+
+vi.mock('@/store/projects', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  ...projectFeedback
+}))
+
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   getSession: vi.fn(),
@@ -41,6 +80,18 @@ vi.mock('@/hermes', () => ({
 // the stored sessions table and 404s on a runtime id. session.title accepts
 // the runtime id directly.
 const RUNTIME_SESSION_ID = 'rt-abc123'
+const testProjectRequester = vi.fn(async () => undefined)
+
+beforeEach(() => {
+  setPrimaryGateway({ request: vi.fn() } as never, 'default')
+  $activeGatewayProfile.set('default')
+  $activeProjectId.set(null)
+  $projectCatalogAuthority.set({ catalogGeneration: 0, contextGeneration: 0, profile: 'default' })
+  $projects.set([])
+  configureProjectRuntimeRequester(testProjectRequester, 'default')
+  $projectRuntimes.set({})
+  setSessions([])
+})
 
 function sessionInfo(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
@@ -76,10 +127,13 @@ async function actRender(ui: React.ReactElement) {
 interface HarnessHandle {
   activeSessionIdRef: MutableRefObject<string | null>
   cancelRun: () => Promise<void>
+  cancelRunRaw: () => Promise<void>
   editMessage: (edited: Parameters<ReturnType<typeof usePromptActions>['editMessage']>[0]) => Promise<void>
   reloadFromMessage: (parentId: null | string) => Promise<void>
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
+  restoreToMessageRaw: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
   redirectPrompt: (text: string) => Promise<boolean>
+  redirectPromptRaw: (text: string) => Promise<boolean>
   /** @deprecated Use `redirectPrompt`. */
   steerPrompt: (text: string) => Promise<boolean>
   submitTextRaw: (text: string, options?: SubmitTextOptions) => Promise<boolean>
@@ -137,6 +191,31 @@ function Harness({
     current: storedSessionId === undefined ? RUNTIME_SESSION_ID : storedSessionId
   }
 
+  const authorityStoredId = selectedStoredSessionIdRef.current
+
+  if (authorityStoredId) {
+    const sessions = $sessions.get()
+
+    const existing = sessions.find(
+      session => session.id === authorityStoredId || session._lineage_root_id === authorityStoredId
+    )
+
+    const profile = existing?.profile || 'default'
+
+    if (!existing) {
+      setSessions([...sessions, sessionInfo({ id: authorityStoredId, project_id: null })])
+    } else if (existing.project_id === undefined) {
+      setSessions(sessions.map(session => (session === existing ? { ...session, project_id: null } : session)))
+    }
+
+    $activeGatewayProfile.set(profile)
+    $projectCatalogAuthority.set({ catalogGeneration: 0, contextGeneration: 0, profile })
+
+    if (Object.keys($projectRuntimes.get()).length === 0 && projectRuntimeAuthority().scope !== profile) {
+      configureProjectRuntimeRequester(testProjectRequester, profile)
+    }
+  }
+
   const localBusyRef = busyRef ?? { current: false }
 
   const stateRef = useRef({
@@ -179,20 +258,24 @@ function Harness({
       activeSessionIdRef,
       cancelRun: (...args: Parameters<typeof actions.cancelRun>) =>
         act(async () => actions.cancelRun(...args)) as Promise<void>,
+      cancelRunRaw: actions.cancelRun,
       editMessage: (...args: Parameters<typeof actions.editMessage>) =>
         act(async () => actions.editMessage(...args)) as Promise<void>,
       reloadFromMessage: (...args: Parameters<typeof actions.reloadFromMessage>) =>
         act(async () => actions.reloadFromMessage(...args)) as Promise<void>,
       restoreToMessage: (...args: Parameters<typeof actions.restoreToMessage>) =>
         act(async () => actions.restoreToMessage(...args)) as Promise<void>,
+      restoreToMessageRaw: actions.restoreToMessage,
       redirectPrompt: (...args: Parameters<typeof actions.redirectPrompt>) =>
         act(async () => actions.redirectPrompt(...args)) as Promise<boolean>,
+      redirectPromptRaw: actions.redirectPrompt,
       steerPrompt: (...args: Parameters<typeof actions.steerPrompt>) =>
         act(async () => actions.steerPrompt(...args)) as Promise<boolean>,
       submitTextRaw: actions.submitText,
       submitText: (...args: Parameters<typeof actions.submitText>) =>
         act(async () => actions.submitText(...args)) as Promise<boolean>
     })
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- actions are individually memoized; the bag is recreated each render.
   }, [
     actions.cancelRun,
     actions.editMessage,
@@ -207,6 +290,671 @@ function Harness({
 
   return null
 }
+
+const managedSnapshot = () => ({
+  active_run: { control_state: 'running' as const, control_version: 1, turn_id: 'turn-running' },
+  artifacts: [],
+  binding_id: 'binding-managed',
+  block: null,
+  canonical_session_id: RUNTIME_SESSION_ID,
+  current_phase: 'implementation',
+  delivery_status: { error_code: null, state: 'caught_up' as const },
+  last_sequence: 2,
+  lifecycle: 'active' as const,
+  pending_approval: null,
+  project_id: 'project-managed',
+  queue: [],
+  transcript: [],
+  transcript_revision: 1,
+  version: 7
+})
+
+describe('usePromptActions managed project submit', () => {
+  beforeEach(() => {
+    $queuedPromptsBySession.set({})
+    resetOptimisticProjectPrompts()
+    resetProjectRuntimeStore()
+    executeProjectMutation.mockReset()
+    projectCommandRuntime.isProjectMutationRetryAvailable.mockReset().mockReturnValue(true)
+    projectCommandRuntime.retryProjectMutation.mockReset()
+    projectFeedback.executeProjectMutationWithFeedback.mockReset().mockResolvedValue({})
+    $activeProjectId.set(null)
+    $projects.set([])
+    clearNotifications()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetProjectRuntimeStore()
+    configureProjectRuntimeRequester(undefined)
+    $activeProjectId.set(null)
+    $projects.set([])
+    resetOptimisticProjectPrompts()
+    vi.restoreAllMocks()
+  })
+
+  it('enqueues busy managed input canonically without using prompt.submit or the local queue', async () => {
+    const runtime = managedSnapshot()
+    $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+    executeProjectMutation.mockResolvedValue({
+      result: {
+        accepted_turn_id: 'turn-accepted',
+        active_control_version: 1,
+        active_run_control: 'running',
+        active_turn_id: 'turn-running',
+        artifact: null,
+        canonical_session_id: RUNTIME_SESSION_ID,
+        current_phase: 'implementation',
+        last_event_sequence: 3,
+        lifecycle: 'active',
+        pending_approval_id: null,
+        project_id: runtime.project_id,
+        queue_depth: 1,
+        version: 7
+      },
+      status: 'succeeded'
+    })
+    const requestGateway = vi.fn(async () => ({}))
+    const busyRef: MutableRefObject<boolean> = { current: true }
+    const states: Record<string, unknown>[] = []
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        busyRef={busyRef}
+        onReady={value => (handle = value)}
+        onSeedState={state => states.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+      />
+    )
+
+    await expect(handle!.submitText('  canonical queue me  ')).resolves.toBe(true)
+
+    expect(executeProjectMutation).toHaveBeenCalledWith({
+      expected_version: runtime.version,
+      name: 'turn.enqueue',
+      payload: { message: 'canonical queue me' },
+      project_id: runtime.project_id
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+    expect(getQueuedPrompts(RUNTIME_SESSION_ID)).toEqual([])
+    expect($optimisticProjectPrompts.get()[runtime.project_id]).toEqual([
+      expect.objectContaining({ accepted_turn_id: 'turn-accepted', text: 'canonical queue me' })
+    ])
+    expect(states.at(-1)?.messages).toEqual([
+      expect.objectContaining({ id: expect.stringMatching(/^project-optimistic-/), role: 'user' })
+    ])
+  })
+
+  it('uses the durable canonical owner when the gateway runtime id is different', async () => {
+    const storedSessionId = 'stored-managed-session'
+    const runtime = { ...managedSnapshot(), canonical_session_id: storedSessionId }
+    $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+    executeProjectMutation.mockResolvedValue({
+      result: { accepted_turn_id: 'turn-durable-owner' },
+      status: 'succeeded'
+    })
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+        seedMessages={[{ id: 'u1', parts: [textPart('original')], role: 'user' }]}
+        selectedStoredSessionIdRef={{ current: storedSessionId }}
+        storedSessionId={storedSessionId}
+      />
+    )
+
+    await expect(handle!.submitText('canonical despite live id')).resolves.toBe(true)
+    await handle!.cancelRun()
+    await handle!.reloadFromMessage(null)
+
+    expect(executeProjectMutation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'turn.enqueue',
+        project_id: runtime.project_id
+      })
+    )
+    expect(projectFeedback.executeProjectMutationWithFeedback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'run.stop',
+        project_id: runtime.project_id
+      })
+    )
+    expect($managedComposerActionsBySession.get()[storedSessionId]).toEqual(
+      expect.objectContaining({ status: 'blocked' })
+    )
+    expect(getQueuedPrompts(storedSessionId)).toEqual([])
+    expect(requestGateway).not.toHaveBeenCalledWith(
+      expect.stringMatching(/^prompt\.submit$|^session\.(interrupt|redirect|resume)$/),
+      expect.anything(),
+      expect.anything()
+    )
+  })
+
+  it('routes a fresh draft in the active managed project without creating a legacy session', async () => {
+    const runtime = { ...managedSnapshot(), canonical_session_id: 'canonical-active-project' }
+    $projects.set([{ id: runtime.project_id, managed: true } as never])
+    $activeProjectId.set(runtime.project_id)
+    $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+    executeProjectMutation.mockResolvedValue({
+      result: { accepted_turn_id: 'turn-active-project' },
+      status: 'succeeded'
+    })
+    const createBackendSessionForSend = vi.fn(async () => 'legacy-created-session')
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        createBackendSessionForSend={createBackendSessionForSend}
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+        storedSessionId={null}
+      />
+    )
+
+    await expect(handle!.submitText('fresh managed work')).resolves.toBe(true)
+
+    expect(executeProjectMutation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'turn.enqueue',
+        project_id: runtime.project_id
+      })
+    )
+    expect(createBackendSessionForSend).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+  })
+
+  it('blocks a catalog-managed fresh draft while its runtime is unavailable', async () => {
+    $projects.set([{ id: 'project-managed', managed: true } as never])
+    $activeProjectId.set('project-managed')
+    const createBackendSessionForSend = vi.fn(async () => 'legacy-created-session')
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        activeSessionId={null}
+        createBackendSessionForSend={createBackendSessionForSend}
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+        storedSessionId={null}
+      />
+    )
+
+    await expect(handle!.submitText('wait for Hermes')).resolves.toBe(false)
+
+    expect(createBackendSessionForSend).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('project-managed')).toEqual([])
+    expect($notifications.get()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'error',
+          message: en.statusStack.managedProject.runtimeUnavailable
+        })
+      ])
+    )
+  })
+
+  it('retains a visible retry-required echo and retries the same frozen intent', async () => {
+    const runtime = managedSnapshot()
+    $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+    executeProjectMutation.mockResolvedValue({ intent_id: 'intent-frozen', status: 'retry_required' })
+    projectCommandRuntime.retryProjectMutation.mockResolvedValue({
+      result: { accepted_turn_id: 'turn-retried' },
+      status: 'succeeded'
+    })
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={async () => ({}) as never}
+      />
+    )
+
+    await expect(handle!.submitText('retry exactly once')).resolves.toBe(true)
+    expect($managedComposerActionsBySession.get()[RUNTIME_SESSION_ID]).toEqual(
+      expect.objectContaining({ intent_id: 'intent-frozen', status: 'retry_required' })
+    )
+
+    await retryManagedComposerPrompt(RUNTIME_SESSION_ID)
+
+    expect(projectCommandRuntime.retryProjectMutation).toHaveBeenCalledWith('intent-frozen')
+    expect(executeProjectMutation).toHaveBeenCalledTimes(1)
+    expect($optimisticProjectPrompts.get()[runtime.project_id]).toEqual([
+      expect.objectContaining({ accepted_turn_id: 'turn-retried' })
+    ])
+  })
+
+  it('allows only one in-flight submit for the same managed binding', async () => {
+    const runtime = managedSnapshot()
+    $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+    let resolveFirst: ((value: unknown) => void) | undefined
+    executeProjectMutation
+      .mockReturnValueOnce(
+        new Promise(resolve => {
+          resolveFirst = resolve
+        })
+      )
+      .mockResolvedValueOnce({ result: { accepted_turn_id: 'turn-second' }, status: 'succeeded' })
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={async () => ({}) as never}
+      />
+    )
+
+    const first = handle!.submitTextRaw('first canonical message')
+    await vi.waitFor(() => expect(executeProjectMutation).toHaveBeenCalledTimes(1))
+
+    await expect(handle!.submitTextRaw('second overlapping message')).resolves.toBe(false)
+    expect(executeProjectMutation).toHaveBeenCalledTimes(1)
+
+    resolveFirst?.({ result: { accepted_turn_id: 'turn-first' }, status: 'succeeded' })
+    await expect(first).resolves.toBe(true)
+    expect($optimisticProjectPrompts.get()[runtime.project_id]).toEqual([
+      expect.objectContaining({ accepted_turn_id: 'turn-first', text: 'first canonical message' })
+    ])
+  })
+
+  it('fails a duplicate canonical-session claim closed without choosing a project', async () => {
+    const first = managedSnapshot()
+    const second = { ...managedSnapshot(), binding_id: 'binding-second', project_id: 'project-second' }
+    $projectRuntimes.set({
+      [first.project_id]: { events: [], snapshot: first },
+      [second.project_id]: { events: [], snapshot: second }
+    })
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+      />
+    )
+
+    await expect(handle!.submitText('do not guess the project')).resolves.toBe(false)
+    expect(executeProjectMutation).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+    expect($optimisticProjectPrompts.get()).toEqual({})
+  })
+
+  it('does not project either transcript when canonical read ownership is ambiguous', async () => {
+    const first = {
+      ...managedSnapshot(),
+      transcript: [{ content: 'first transcript', role: 'assistant' as const }],
+      transcript_revision: 2
+    }
+
+    const second = {
+      ...managedSnapshot(),
+      binding_id: 'binding-second',
+      project_id: 'project-second',
+      transcript: [{ content: 'second transcript', role: 'assistant' as const }],
+      transcript_revision: 2
+    }
+
+    $projectRuntimes.set({
+      [first.project_id]: { events: [], snapshot: first },
+      [second.project_id]: { events: [], snapshot: second }
+    })
+    const updates: Array<{ messages: unknown; sessionId: string }> = []
+
+    await actRender(
+      <Harness
+        onReady={() => undefined}
+        onUpdateState={(sessionId, _storedSessionId, state) => updates.push({ messages: state.messages, sessionId })}
+        refreshSessions={async () => undefined}
+        requestGateway={async () => ({}) as never}
+      />
+    )
+
+    expect(updates).toEqual([{ messages: [], sessionId: RUNTIME_SESSION_ID }])
+  })
+
+  it('actively clears a projected transcript when its unique owner becomes ambiguous', async () => {
+    const first = {
+      ...managedSnapshot(),
+      transcript: [{ content: 'first authoritative transcript', role: 'assistant' as const }],
+      transcript_revision: 2
+    }
+
+    const updates: Array<Record<string, unknown>> = []
+
+    $projectRuntimes.set({
+      [first.project_id]: { events: [], snapshot: first }
+    })
+
+    await actRender(
+      <Harness
+        getRuntimeIdForStoredSession={() => RUNTIME_SESSION_ID}
+        onReady={() => undefined}
+        onUpdateState={(_sessionId, _storedSessionId, state) => updates.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={async () => ({}) as never}
+      />
+    )
+
+    await waitFor(() =>
+      expect(updates.at(-1)?.messages).toEqual([
+        expect.objectContaining({
+          parts: [expect.objectContaining({ text: 'first authoritative transcript' })]
+        })
+      ])
+    )
+    updates.length = 0
+
+    const duplicate = {
+      ...managedSnapshot(),
+      binding_id: 'binding-second',
+      project_id: 'project-second',
+      transcript: [{ content: 'must never project', role: 'assistant' as const }],
+      transcript_revision: 2
+    }
+
+    act(() => {
+      $projectRuntimes.set({
+        [first.project_id]: { events: [], snapshot: first },
+        [duplicate.project_id]: { events: [], snapshot: duplicate }
+      })
+    })
+
+    await waitFor(() => expect(updates.at(-1)?.messages).toEqual([]))
+
+    const restored = {
+      ...first,
+      transcript: [{ content: 'restored authoritative transcript', role: 'assistant' as const }],
+      transcript_revision: 3
+    }
+
+    act(() => {
+      $projectRuntimes.set({
+        [restored.project_id]: { events: [], snapshot: restored }
+      })
+    })
+
+    await waitFor(() =>
+      expect(updates.at(-1)?.messages).toEqual([
+        expect.objectContaining({
+          parts: [expect.objectContaining({ text: 'restored authoritative transcript' })]
+        })
+      ])
+    )
+    expect(JSON.stringify(updates.at(-1)?.messages)).not.toContain('first authoritative transcript')
+  })
+
+  it.each(['resolve', 'reject'] as const)(
+    'fences a stale initial enqueue %s after a profile binding replacement',
+    async settlement => {
+      const initial = managedSnapshot()
+      $projectRuntimes.set({ [initial.project_id]: { events: [], snapshot: initial } })
+      let resolveMutation: ((value: unknown) => void) | undefined
+      let rejectMutation: ((reason: unknown) => void) | undefined
+      executeProjectMutation.mockReturnValue(
+        new Promise((resolve, reject) => {
+          resolveMutation = resolve
+          rejectMutation = reject
+        })
+      )
+      let handle: HarnessHandle | null = null
+
+      await actRender(
+        <Harness
+          onReady={value => (handle = value)}
+          refreshSessions={async () => undefined}
+          requestGateway={async () => ({}) as never}
+        />
+      )
+
+      const pending = handle!.submitTextRaw('scope fenced')
+      await vi.waitFor(() => expect(executeProjectMutation).toHaveBeenCalledTimes(1))
+
+      act(() => {
+        const replacement = { ...initial, binding_id: 'binding-replacement' }
+        $projectRuntimes.set({ [replacement.project_id]: { events: [], snapshot: replacement } })
+      })
+
+      if (settlement === 'resolve') {
+        resolveMutation?.({ result: { accepted_turn_id: 'turn-stale' }, status: 'succeeded' })
+      } else {
+        rejectMutation?.(new Error('old requester failed'))
+      }
+
+      await expect(pending).resolves.toBe(false)
+      expect($managedComposerActionsBySession.get()).toEqual({})
+      expect($optimisticProjectPrompts.get()).toEqual({})
+    }
+  )
+
+  it('blocks managed reload, restore and edit without any legacy history mutation', async () => {
+    const runtime = managedSnapshot()
+
+    const messages = [
+      { id: 'u1', parts: [textPart('original prompt')], role: 'user' as const },
+      { id: 'a1', parts: [textPart('original reply')], role: 'assistant' as const }
+    ]
+
+    $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+    setMessages(messages)
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+        seedMessages={messages}
+      />
+    )
+
+    await handle!.reloadFromMessage('a1')
+    await handle!.restoreToMessage('u1')
+    await handle!.editMessage({
+      content: [{ text: 'edited prompt', type: 'text' }],
+      parentId: null,
+      role: 'user',
+      sourceId: 'u1'
+    } as never)
+
+    expect(requestGateway).not.toHaveBeenCalledWith(
+      expect.stringMatching(/^prompt\.submit$|^session\.(interrupt|redirect|resume)$/),
+      expect.anything(),
+      expect.anything()
+    )
+    expect($managedComposerActionsBySession.get()[RUNTIME_SESSION_ID]).toEqual(
+      expect.objectContaining({
+        message: 'Managed project history changes are not supported yet.',
+        status: 'blocked'
+      })
+    )
+  })
+
+  it('stops a uniquely managed active run through canonical run.stop only', async () => {
+    const runtime = managedSnapshot()
+    $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+      />
+    )
+
+    await handle!.cancelRun()
+
+    expect(projectFeedback.executeProjectMutationWithFeedback).toHaveBeenCalledWith({
+      expected_version: runtime.version,
+      name: 'run.stop',
+      payload: {
+        expected_control_version: runtime.active_run?.control_version,
+        turn_id: runtime.active_run?.turn_id
+      },
+      project_id: runtime.project_id
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('session.interrupt', expect.anything())
+  })
+
+  it('fails ambiguous managed history, stop and redirect closed without legacy calls', async () => {
+    const first = managedSnapshot()
+    const duplicate = { ...first, binding_id: 'binding-duplicate', project_id: 'project-duplicate' }
+    $projectRuntimes.set({
+      [first.project_id]: { events: [], snapshot: first },
+      [duplicate.project_id]: { events: [], snapshot: duplicate }
+    })
+    setMessages([{ id: 'u1', parts: [textPart('original prompt')], role: 'user' }])
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+      />
+    )
+
+    await handle!.reloadFromMessage(null)
+    await handle!.cancelRun()
+    await expect(handle!.redirectPrompt('do not redirect')).resolves.toBe(false)
+
+    expect(projectFeedback.executeProjectMutationWithFeedback).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(
+      $notifications
+        .get()
+        .some(
+          notification =>
+            notification.kind === 'error' && notification.message === en.statusStack.managedProject.ambiguousSession
+        )
+    ).toBe(true)
+  })
+
+  it('rejects a frozen voice target after profile generation and binding replacement', async () => {
+    const initial = managedSnapshot()
+    configureProjectRuntimeRequester(
+      vi.fn(async () => undefined),
+      ' profile-a '
+    )
+    $projectRuntimes.set({ [initial.project_id]: { events: [], snapshot: initial } })
+    const requesterAuthority = projectRuntimeAuthority()
+
+    const frozenAuthority = {
+      bindingId: initial.binding_id,
+      projectId: initial.project_id,
+      requesterGeneration: requesterAuthority.requesterGeneration,
+      requesterScope: requesterAuthority.scope,
+      sessionId: initial.canonical_session_id,
+      status: 'managed'
+    }
+
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+      />
+    )
+
+    configureProjectRuntimeRequester(
+      vi.fn(async () => undefined),
+      'profile-b'
+    )
+    const replacement = { ...initial, binding_id: 'binding-replacement' }
+    $projectRuntimes.set({ [replacement.project_id]: { events: [], snapshot: replacement } })
+
+    await expect(
+      handle!.submitText('voice bound to A', {
+        projectAuthority: frozenAuthority,
+        sessionId: initial.canonical_session_id
+      } as never)
+    ).resolves.toBe(false)
+
+    expect(executeProjectMutation).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it('rejects a captured legacy voice status when durable catalog authority says managed runtime unavailable', async () => {
+    const storedSessionId = 'stored-managed-voice'
+    setSessions([sessionInfo({ id: storedSessionId, project_id: 'project-managed' })])
+    $projects.set([{ id: 'project-managed', managed: true } as never])
+    const authority = projectRuntimeAuthority()
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+        selectedStoredSessionIdRef={{ current: storedSessionId }}
+        storedSessionId={storedSessionId}
+      />
+    )
+
+    await expect(
+      handle!.submitText('must not escape through legacy voice', {
+        projectAuthority: {
+          requesterGeneration: authority.requesterGeneration,
+          requesterScope: authority.scope,
+          sessionId: storedSessionId,
+          status: 'legacy'
+        },
+        sessionId: RUNTIME_SESSION_ID,
+        storedSessionId
+      })
+    ).resolves.toBe(false)
+
+    expect(executeProjectMutation).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it('rejects legacy submit when the live surface belongs to a different managed canonical owner', async () => {
+    const storedSessionId = 'stored-explicit-legacy'
+    const runtime = managedSnapshot()
+    setSessions([sessionInfo({ id: storedSessionId, project_id: null })])
+    $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+    const requestGateway = vi.fn(async () => ({}))
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={value => (handle = value)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+        selectedStoredSessionIdRef={{ current: storedSessionId }}
+        storedSessionId={storedSessionId}
+      />
+    )
+
+    await expect(handle!.submitText('do not route through legacy')).resolves.toBe(false)
+
+    expect(executeProjectMutation).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+})
 
 describe('usePromptActions /title', () => {
   beforeEach(() => {
@@ -1519,6 +2267,10 @@ describe('usePromptActions submit / queue drain semantics', () => {
 
   it('a fromQueue drain sends to its queued session even after the active session changes', async () => {
     $busy.set(false)
+    setSessions(current => [
+      ...current.filter(session => session.id !== 'stored-session-a'),
+      sessionInfo({ id: 'stored-session-a', project_id: null })
+    ])
 
     const updates: { sessionId: string; state: Record<string, unknown>; storedSessionId: null | string | undefined }[] =
       []
@@ -1570,6 +2322,11 @@ describe('usePromptActions submit / queue drain semantics', () => {
       async (method: string, _params?: Record<string, unknown>, _timeoutMs?: number) =>
         (method === 'session.resume' ? { session_id: 'rt-session-a-rebound' } : {}) as never
     )
+
+    setSessions(current => [
+      ...current.filter(session => session.id !== 'stored-session-a'),
+      sessionInfo({ id: 'stored-session-a', project_id: null })
+    ])
 
     let handle: HarnessHandle | null = null
     render(
@@ -1695,6 +2452,66 @@ describe('usePromptActions submit / queue drain semantics', () => {
     )
   })
 
+  it('aborts a busy retry when exact legacy gatewayauthority changes during the retry sleep', async () => {
+    const storedSession = sessionInfo({ id: 'stored-busy-authority', profile: 'default', project_id: null })
+    const gatewayA = { request: vi.fn() } as never
+    const gatewayB = { request: vi.fn() } as never
+    const seeds: Record<string, unknown>[] = []
+    let attempt = 0
+
+    setSessions(() => [storedSession])
+    setPrimaryGateway(gatewayA, 'default')
+    const legacyAuthority = captureExactLegacySessionAuthority({
+      allowCrossProfileGateway: true,
+      requireActiveGateway: true,
+      runtimeSessionId: RUNTIME_SESSION_ID,
+      storedSession,
+      storedSessionId: storedSession.id
+    })
+    expect(legacyAuthority).not.toBeNull()
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        attempt += 1
+        throw new Error('4009: session busy')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => seeds.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={storedSession.id}
+      />
+    )
+
+    let submitting!: Promise<boolean>
+    act(() => {
+      submitting = handle!.submitTextRaw('must not retry against replacement gateway', {
+        legacyAuthority: legacyAuthority!,
+        sessionId: RUNTIME_SESSION_ID,
+        storedSession,
+        storedSessionId: storedSession.id
+      })
+    })
+    await waitFor(() => expect(attempt).toBe(1))
+
+    act(() => setPrimaryGateway(gatewayB, 'default'))
+
+    await expect(submitting).resolves.toBe(false)
+    expect(attempt).toBe(1)
+    expect(
+      seeds.some(
+        state => Array.isArray(state.messages) && (state.messages as { error?: string }[]).some(message => message.error)
+      )
+    ).toBe(false)
+  })
+
   it('a normal (non-queue) submit still respects the busyRef guard', async () => {
     const busyRef = { current: true }
     const requestGateway = vi.fn(async () => ({}) as never)
@@ -1748,6 +2565,46 @@ describe('usePromptActions redirectPrompt', () => {
       role: 'user',
       parts: [{ type: 'text', text: 'nudge the run' }]
     })
+  })
+
+  it('rolls back a redirect whose exact legacy gateway changes while the RPC awaits', async () => {
+    let releaseRedirect!: (value: { status: string }) => void
+    const requestGateway = vi.fn(
+      async (method: string) =>
+        (method === 'session.redirect'
+          ? await new Promise<{ status: string }>(resolve => (releaseRedirect = resolve))
+          : {}) as never
+    )
+    const states: Record<string, unknown>[] = []
+
+    setPrimaryGateway({ request: vi.fn() } as never, 'default')
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => states.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    let redirecting!: Promise<boolean>
+    act(() => {
+      redirecting = handle!.redirectPromptRaw('do not publish after drift')
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.redirect', expect.anything()))
+
+    setPrimaryGateway({ request: vi.fn() } as never, 'default')
+
+    let accepted = true
+    await act(async () => {
+      releaseRedirect({ status: 'redirected' })
+      accepted = await redirecting
+    })
+
+    expect(accepted).toBe(false)
+    expect(states.at(-1)?.messages).toEqual([])
   })
 
   it('reports rejection so the caller queues when the turn already ended', async () => {
@@ -1812,6 +2669,60 @@ describe('usePromptActions redirectPrompt', () => {
       role: 'user',
       parts: [{ type: 'text', text: 'build-window nudge' }]
     })
+  })
+
+  it('does not resume a redirect after exact authority drifts while the owning profile resolves', async () => {
+    const storedSessionId = 'stored-redirect-drift'
+    let resolveStoredSession!: (session: SessionInfo) => void
+    let redirectAttempts = 0
+
+    vi.mocked(getSession).mockImplementation(
+      () => new Promise<SessionInfo>(resolve => (resolveStoredSession = resolve))
+    )
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.redirect') {
+        redirectAttempts += 1
+
+        if (redirectAttempts === 1) {
+          // Force resolveSessionProfile through its awaited backend lookup so
+          // authority can drift in the exact pre-resume window.
+          setSessions(() => [])
+          throw new Error('session not found')
+        }
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: 'runtime-redirect-recovered' } as never
+      }
+
+      return { status: 'redirected' } as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={storedSessionId}
+      />
+    )
+
+    let redirecting!: Promise<boolean>
+    act(() => {
+      redirecting = handle!.redirectPromptRaw('do not resume after drift')
+    })
+    await waitFor(() => expect(getSession).toHaveBeenCalledWith(storedSessionId))
+
+    await act(async () => {
+      configureProjectRuntimeRequester(vi.fn(async () => undefined), 'default')
+      resolveStoredSession(sessionInfo({ id: storedSessionId, profile: 'default', project_id: null }))
+      await Promise.resolve()
+    })
+
+    await expect(redirecting).resolves.toBe(false)
+    expect(requestGateway).not.toHaveBeenCalledWith('session.resume', expect.anything())
   })
 
   it('resumes the stored session and retries once when session.redirect reports "session not found"', async () => {
@@ -1909,6 +2820,42 @@ describe('usePromptActions restoreToMessage', () => {
     )
     expect((lastState.messages as { id: string }[]).map(m => m.id)).toEqual(['u1'])
     expect(lastState.busy).toBe(true)
+  })
+
+  it('rolls an optimistic rewind back when exact legacy gatewayauthority drifts during submit', async () => {
+    let releaseSubmit!: () => void
+    const requestGateway = vi.fn(
+      async (method: string) =>
+        (method === 'prompt.submit' ? await new Promise<void>(resolve => (releaseSubmit = resolve)) : undefined) as never
+    )
+    let lastState: Record<string, unknown> = {}
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => (lastState = state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedMessages={$messages.get()}
+      />
+    )
+
+    let restoring!: Promise<void>
+    act(() => {
+      restoring = handle!.restoreToMessageRaw('u1')
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything()))
+
+    setPrimaryGateway({ request: vi.fn() } as never, 'default')
+
+    await act(async () => {
+      releaseSubmit()
+      await restoring
+    })
+
+    expect((lastState.messages as { id: string }[]).map(message => message.id)).toEqual(['u1', 'a1', 'u2', 'a2'])
+    expect(lastState).toMatchObject({ awaitingResponse: false, busy: false })
   })
 
   it('rethrows gateway failures and clears the busy flags for the dialog to surface', async () => {
@@ -2291,6 +3238,64 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' })
   })
 
+  it('refuses a prompt retry when resumed R2 is managed even though captured R1 remains visibly legacy', async () => {
+    const storedSessionId = 'stored-rebind-owner'
+    const recoveredRuntimeId = 'runtime-managed-R2'
+    const storedSession = sessionInfo({ id: storedSessionId, profile: 'default', project_id: null })
+    const calls: string[] = []
+
+    setSessions(() => [storedSession])
+    setPrimaryGateway({ request: vi.fn() } as never, 'default')
+
+    const legacyAuthority = captureExactLegacySessionAuthority({
+      allowCrossProfileGateway: true,
+      requireActiveGateway: true,
+      runtimeSessionId: RUNTIME_SESSION_ID,
+      storedSession,
+      storedSessionId
+    })
+
+    expect(legacyAuthority).not.toBeNull()
+
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      if (method === 'prompt.submit' && calls.filter(call => call === 'prompt.submit').length === 1) {
+        throw new Error('session not found')
+      }
+
+      if (method === 'session.resume') {
+        const runtime = { ...managedSnapshot(), canonical_session_id: recoveredRuntimeId }
+        $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+
+        return { session_id: recoveredRuntimeId } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={storedSessionId}
+      />
+    )
+
+    const submitted = await handle!.submitText('must not cross into managed R2', {
+      legacyAuthority: legacyAuthority!,
+      sessionId: RUNTIME_SESSION_ID,
+      storedSession,
+      storedSessionId
+    })
+
+    expect(submitted).toBe(false)
+    expect(calls).toEqual(['prompt.submit', 'session.resume'])
+    expect(handle!.activeSessionIdRef.current).toBe(RUNTIME_SESSION_ID)
+  })
+
   // #67603 (second symptom): a recovery resume must re-register on the session's
   // OWNING profile. Resuming on whichever profile is live forks the conversation
   // into the wrong profile's DB — the session then appears under both profiles.
@@ -2341,7 +3346,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
   it('resolves the owning profile across profiles when the session is not cached', async () => {
     // module-factory vi.fn is not reset by restoreAllMocks — reset explicitly in
     // the finally below so this resolved value never leaks into sibling tests.
-    setSessions(() => [])
+    setSessions(() => [sessionInfo({ id: STORED_SESSION_ID, profile: 'work', project_id: null })])
     vi.mocked(getSession).mockResolvedValue(sessionInfo({ id: STORED_SESSION_ID, profile: 'work' }))
 
     const calls: { method: string; params?: Record<string, unknown> }[] = []
@@ -2385,6 +3390,10 @@ describe('usePromptActions sleep/wake session recovery', () => {
   })
 
   it('background queue resume uses the queued stored id and leaves foreground runtime selected', async () => {
+    setSessions(current => [
+      ...current.filter(session => session.id !== STORED_SESSION_ID),
+      sessionInfo({ id: STORED_SESSION_ID, project_id: null })
+    ])
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     let submitAttempts = 0
 
@@ -2480,6 +3489,45 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID })
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID })
+  })
+
+  it('does not resume or retry interrupt after exact gatewayauthority drifts while interrupt awaits', async () => {
+    let rejectInterrupt!: (reason: unknown) => void
+    const calls: string[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      if (method === 'session.interrupt') {
+        return await new Promise<never>((_resolve, reject) => (rejectInterrupt = reject))
+      }
+
+      return {} as never
+    })
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    let stopping!: Promise<void>
+    act(() => {
+      stopping = handle!.cancelRunRaw()
+    })
+    await waitFor(() => expect(calls).toEqual(['session.interrupt']))
+
+    setPrimaryGateway({ request: vi.fn() } as never, 'default')
+
+    await act(async () => {
+      rejectInterrupt(new Error('session not found'))
+      await stopping
+    })
+
+    expect(calls).toEqual(['session.interrupt'])
   })
 
   it('clears the active and cached turn clocks when stopping a turn', async () => {
@@ -3230,6 +4278,316 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
     $composerAttachments.set([])
   })
 
+  it('aborts a fresh-draft submit when its legacy producer disappears during deferred create', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    let routeToken = '/::'
+    let releaseCreate: () => void = () => {}
+
+    setPrimaryGateway({ request: vi.fn() } as never, 'default')
+    const legacyDraftAuthority = captureFrozenLegacyDraftAuthority()
+    const driftWarning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    expect(legacyDraftAuthority).not.toBeNull()
+
+    const createBackendSessionForSend = vi.fn(async () => {
+      await new Promise<void>(resolve => {
+        releaseCreate = resolve
+      })
+      activeSessionIdRef.current = NEW_RUNTIME_ID
+      selectedStoredSessionIdRef.current = NEW_STORED_ID
+      routeToken = `/${NEW_STORED_ID}::`
+
+      return NEW_RUNTIME_ID
+    })
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        getRouteToken={() => routeToken}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    let submitting!: Promise<boolean>
+
+    act(() => {
+      submitting = handle!.submitTextRaw('fresh draft whose producer disappears', {
+        legacyDraftAuthority: legacyDraftAuthority!
+      })
+    })
+    await waitFor(() => expect(createBackendSessionForSend).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $activeProjectId.set('project-managed')
+      $projectRuntimes.set({ 'project-managed': { events: [], snapshot: managedSnapshot() } })
+
+      // Restore the same visible legacy surface. Only the frozen generations show
+      // that the original fresh-draft producer disappeared while create awaited.
+      $activeProjectId.set(null)
+      $projects.set([])
+      $projectRuntimes.set({})
+      $projectCatalogAuthority.set({ catalogGeneration: 1, contextGeneration: 1, profile: 'default' })
+    })
+    let submitted = true
+
+    await act(async () => {
+      releaseCreate()
+      submitted = await submitting
+    })
+
+    expect(submitted).toBe(false)
+    expect(driftWarning).toHaveBeenCalledWith('[submit-drift-abort]', 'legacy-draft-authority', {
+      phase: 'post-create'
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+  })
+
+  it('aborts a fresh legacy draft that becomes managed while attachment upload awaits', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    let routeToken = '/::'
+    let releaseAttach!: () => void
+
+    $connection.set({ mode: 'remote' } as never)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl: vi.fn(async () => 'data:text/plain;base64,aGVsbG8=') }
+    })
+
+    const legacyDraftAuthority = captureFrozenLegacyDraftAuthority()
+    const driftWarning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    expect(legacyDraftAuthority).not.toBeNull()
+
+    const createBackendSessionForSend = vi.fn(async () => {
+      activeSessionIdRef.current = NEW_RUNTIME_ID
+      selectedStoredSessionIdRef.current = NEW_STORED_ID
+      routeToken = `/${NEW_STORED_ID}::`
+
+      return NEW_RUNTIME_ID
+    })
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'file.attach') {
+        await new Promise<void>(resolve => (releaseAttach = resolve))
+
+        return { attached: true, ref_text: '@file:report.txt' } as never
+      }
+
+      return {} as never
+    })
+    const attachment: ComposerAttachment = {
+      id: 'file:report.txt',
+      kind: 'file',
+      label: 'report.txt',
+      path: '/Users/alice/report.txt'
+    }
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        getRouteToken={() => routeToken}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    let submitting!: Promise<boolean>
+    act(() => {
+      submitting = handle!.submitTextRaw('fresh draft with attachment', {
+        attachments: [attachment],
+        legacyDraftAuthority: legacyDraftAuthority!
+      })
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('file.attach', expect.anything()))
+
+    act(() => {
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $activeProjectId.set('project-managed')
+      $projectRuntimes.set({ 'project-managed': { events: [], snapshot: managedSnapshot() } })
+    })
+
+    let submitted = true
+    await act(async () => {
+      releaseAttach()
+      submitted = await submitting
+    })
+
+    expect(submitted).toBe(false)
+    expect(driftWarning).toHaveBeenCalledWith('[submit-drift-abort]', 'legacy-draft-authority', {
+      phase: 'post-attachments'
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+  })
+
+  it('does not start file.attach when fresh-draftauthority drifts while remote bytes are read', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    let routeToken = '/::'
+    let releaseRead!: () => void
+
+    $connection.set({ mode: 'remote' } as never)
+    const readFileDataUrl = vi.fn(async () => {
+      await new Promise<void>(resolve => (releaseRead = resolve))
+
+      return 'data:text/plain;base64,aGVsbG8='
+    })
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+
+    const legacyDraftAuthority = captureFrozenLegacyDraftAuthority()
+    expect(legacyDraftAuthority).not.toBeNull()
+
+    const createBackendSessionForSend = vi.fn(async () => {
+      activeSessionIdRef.current = NEW_RUNTIME_ID
+      selectedStoredSessionIdRef.current = NEW_STORED_ID
+      routeToken = `/${NEW_STORED_ID}::`
+
+      return NEW_RUNTIME_ID
+    })
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'file.attach') {
+        return { attached: true, ref_text: '@file:report.txt' } as never
+      }
+
+      return {} as never
+    })
+    const attachment: ComposerAttachment = {
+      id: 'file:report.txt',
+      kind: 'file',
+      label: 'report.txt',
+      path: '/Users/alice/report.txt'
+    }
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        getRouteToken={() => routeToken}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    let submitting!: Promise<boolean>
+    act(() => {
+      submitting = handle!.submitTextRaw('fresh draft whose attachment must remain local', {
+        attachments: [attachment],
+        legacyDraftAuthority: legacyDraftAuthority!
+      })
+    })
+    await waitFor(() => expect(readFileDataUrl).toHaveBeenCalledWith('/Users/alice/report.txt'))
+    expect(requestGateway).not.toHaveBeenCalledWith('file.attach', expect.anything())
+
+    act(() => {
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $activeProjectId.set('project-managed')
+      $projectRuntimes.set({ 'project-managed': { events: [], snapshot: managedSnapshot() } })
+    })
+
+    let submitted = true
+    await act(async () => {
+      releaseRead()
+      submitted = await submitting
+    })
+
+    expect(submitted).toBe(false)
+    expect(requestGateway).not.toHaveBeenCalledWith('file.attach', expect.anything())
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+  })
+
+  it('does not publish submit success after fresh-draftauthority drifts while prompt.submit awaits', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    let routeToken = '/::'
+    let releaseSubmit!: () => void
+
+    const legacyDraftAuthority = captureFrozenLegacyDraftAuthority()
+    const driftWarning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    expect(legacyDraftAuthority).not.toBeNull()
+
+    const createBackendSessionForSend = vi.fn(async () => {
+      activeSessionIdRef.current = NEW_RUNTIME_ID
+      selectedStoredSessionIdRef.current = NEW_STORED_ID
+      routeToken = `/${NEW_STORED_ID}::`
+
+      return NEW_RUNTIME_ID
+    })
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        await new Promise<void>(resolve => (releaseSubmit = resolve))
+      }
+
+      return {} as never
+    })
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        getRouteToken={() => routeToken}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    let submitting!: Promise<boolean>
+    act(() => {
+      submitting = handle!.submitTextRaw('settle against the frozen producer', {
+        legacyDraftAuthority: legacyDraftAuthority!
+      })
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything()))
+
+    act(() => {
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $activeProjectId.set('project-managed')
+      $projectRuntimes.set({ 'project-managed': { events: [], snapshot: managedSnapshot() } })
+    })
+
+    let submitted = true
+    await act(async () => {
+      releaseSubmit()
+      submitted = await submitting
+    })
+
+    expect(submitted).toBe(false)
+    expect(driftWarning).toHaveBeenCalledWith('[submit-drift-abort]', 'legacy-draft-authority', {
+      phase: 'post-submit'
+    })
+  })
+
   it('delivers the first message of a new chat through the intentional route transition (#62562)', async () => {
     const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
@@ -3644,6 +5002,40 @@ describe('usePromptActions eager attachment upload (drop-time)', () => {
     $composerAttachments.set([])
   })
 
+  it('does not start eager file.attach after exact authority drifts while remote bytes are read', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    let releaseRead!: (value: string) => void
+    const readFileDataUrl = vi.fn(
+      () => new Promise<string>(resolve => (releaseRead = resolve))
+    )
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { readFileDataUrl } })
+
+    const requestGateway = vi.fn(async () => ({
+      attached: true,
+      ref_text: '@file:.hermes/desktop-attachments/drift.pdf',
+      uploaded: true
+    }) as never)
+
+    $composerAttachments.set([
+      { id: 'file:drift', kind: 'file', label: 'drift.pdf', path: '/abs/drift.pdf' }
+    ])
+
+    await actRender(
+      <Harness onReady={() => undefined} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+    await waitFor(() => expect(readFileDataUrl).toHaveBeenCalledWith('/abs/drift.pdf'))
+
+    act(() => {
+      configureProjectRuntimeRequester(vi.fn(async () => undefined), 'default')
+      releaseRead('data:application/pdf;base64,JVBERi0=')
+    })
+    await waitFor(() => expect($composerAttachments.get()[0]?.uploadState).not.toBe('uploading'))
+
+    expect(requestGateway).not.toHaveBeenCalledWith('file.attach', expect.anything())
+    expect($composerAttachments.get()[0]?.attachedSessionId).toBeUndefined()
+    expect($composerAttachments.get()[0]?.uploadState).toBeUndefined()
+  })
+
   it('uploads a dropped file the moment it lands (active session) and rewrites the chip with the gateway ref', async () => {
     // A Finder drop adds a chip with a local path but no attachedSessionId. With
     // a session already open, the hook should stage it right away — so the send
@@ -3837,6 +5229,7 @@ describe('usePromptActions stale-closure session routing', () => {
   // vacuously without ever reaching the routing decision.
   async function renderWithStaleClosure(requestGateway: GatewayMock, seedMessages?: unknown[]) {
     const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
     const updated: string[] = []
 
     if (seedMessages) {
@@ -3853,13 +5246,19 @@ describe('usePromptActions stale-closure session routing', () => {
         refreshSessions={async () => undefined}
         requestGateway={requestGateway}
         seedMessages={seedMessages}
-        selectedStoredSessionIdRef={{ current: null }}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
       />
     )
 
     // The user switches to session B. The ref follows; the prop captured in the
     // memoized surface's closure still says session A.
     activeSessionIdRef.current = RUNTIME_SESSION_B
+    selectedStoredSessionIdRef.current = RUNTIME_SESSION_B
+    setSessions(current => [
+      ...current.filter(session => ![RUNTIME_SESSION_ID, RUNTIME_SESSION_B].includes(session.id)),
+      sessionInfo({ id: RUNTIME_SESSION_ID, project_id: null }),
+      sessionInfo({ id: RUNTIME_SESSION_B, project_id: null })
+    ])
 
     return { handle: handle!, updated }
   }
@@ -3881,6 +5280,37 @@ describe('usePromptActions stale-closure session routing', () => {
       'session.redirect',
       expect.objectContaining({ session_id: RUNTIME_SESSION_ID })
     )
+  })
+
+  it('does not regenerate after exact legacy authority drifts during the optimistic state publication', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never) as unknown as GatewayMock
+    const messages = [
+      { id: 'u1', parts: [textPart('original prompt')], role: 'user', timestamp: 0 },
+      { id: 'a1', parts: [textPart('reply')], role: 'assistant', timestamp: 1 }
+    ]
+    let handle: HarnessHandle | null = null
+    let drifted = false
+
+    setMessages(messages as never)
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onUpdateState={() => {
+          if (!drifted) {
+            drifted = true
+            configureProjectRuntimeRequester(vi.fn(async () => undefined), 'default')
+          }
+        }}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedMessages={messages}
+      />
+    )
+
+    await handle!.reloadFromMessage('u1')
+
+    expect(drifted).toBe(true)
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
   })
 
   it('regenerates against the CURRENT session, not the stale closure session', async () => {

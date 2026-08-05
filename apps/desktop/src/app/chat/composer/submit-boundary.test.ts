@@ -87,6 +87,7 @@ it('rebinds an exact legacy authority from R1 to R2 only while its durable owner
     runtimeSessionId: 'runtime-R1',
     storedSession
   })
+
   const rebound = source ? rebindExactLegacySessionAuthority(source, 'runtime-R2') : null
 
   expect(source?.runtimeSessionId).toBe('runtime-R1')
@@ -224,6 +225,53 @@ it('blocks identical managed authority after requester generation replacement du
   expect(submit).not.toHaveBeenCalled()
 })
 
+it('keeps a managed submit flowing when only non-authority runtime content changes during middleware', async () => {
+  let release!: (value: { text: string }) => void
+
+  const snapshotBase = {
+    active_run: null,
+    artifacts: [],
+    binding_id: 'binding-a',
+    block: null,
+    canonical_session_id: 'same-C',
+    current_phase: 'implementation',
+    delivery_status: { error_code: null, state: 'caught_up' },
+    last_sequence: 1,
+    lifecycle: 'active',
+    pending_approval: null,
+    project_id: 'same-project',
+    queue: [],
+    transcript: [],
+    transcript_revision: 1,
+    version: 1
+  }
+
+  const snapshotA = { ...snapshotBase } as never
+  const snapshotChurned = { ...snapshotBase, last_sequence: 2 } as never
+
+  configureProjectRuntimeRequester(vi.fn(async () => undefined), 'profile-a')
+  $projectRuntimes.set({ 'same-project': { events: [], snapshot: snapshotA } })
+  $activeGatewayProfile.set('profile-a')
+  const submit = vi.fn(async () => true)
+  const row = { id: 'same-C', profile: 'profile-a', project_id: 'same-project' } as never
+
+  const pending = submitAfterComposerMiddleware({
+    middleware: () => new Promise(resolve => (release = resolve)),
+    submit,
+    target: { runtimeSessionId: 'same-R', storedSession: row, storedSessionId: 'same-C' },
+    value: 'keep flowing'
+  })
+
+  // Alleen inhoudelijke runtime-mutatie (sequence) tijdens de await: de
+  // authority-identiteit (binding/project/canonical) verandert niet, dus de
+  // submit moet gewoon doorgaan — de transitieteller is bewust niet over-breed.
+  $projectRuntimes.set({ 'same-project': { events: [], snapshot: snapshotChurned } })
+  release({ text: 'keep flowing' })
+
+  await expect(pending).resolves.toBe(true)
+  expect(submit).toHaveBeenCalled()
+})
+
 it('keeps an initially unavailable target fail-closed when it becomes legacy during middleware', async () => {
   let release!: (value: { text: string }) => void
   $activeGatewayProfile.set('profile-a')
@@ -294,6 +342,7 @@ it('blocks a fresh legacy draft after managed-project ABA while middleware await
 it('invalidates exact legacy authority when the runtime requester generation changes on the same scope', () => {
   const row = { id: 'stored-A', profile: 'profile-a', project_id: null } as never
   setSessions(() => [row])
+
   const authority = captureExactLegacySessionAuthority({
     requireActiveGateway: true,
     runtimeSessionId: 'runtime-A',
@@ -325,6 +374,7 @@ it('invalidates exact legacy authority when the runtime requester generation cha
     storedSession: row,
     storedSessionId: 'stored-A'
   })
+
   expect(recaptured).not.toBeNull()
 
   $projectCatalogAuthority.set({ catalogGeneration: 2, contextGeneration: 2, profile: 'profile-a' })
@@ -346,6 +396,56 @@ it('blocks an exact legacy submit when the gateway object is replaced on the sam
 
   setPrimaryGateway({ request: vi.fn() } as never, 'profile-a')
   release({ text: 'keep gateway A' })
+
+  await expect(pending).resolves.toBe(false)
+  expect(submit).not.toHaveBeenCalled()
+})
+
+it('blocks an exact managed A submit after an A→B→A surface transition during middleware (middleware ABA)', async () => {
+  let release!: (value: { text: string }) => void
+
+  const snapshotBase = {
+    active_run: null,
+    artifacts: [],
+    binding_id: 'binding-a',
+    block: null,
+    canonical_session_id: 'same-C',
+    current_phase: 'implementation',
+    delivery_status: { error_code: null, state: 'caught_up' },
+    last_sequence: 1,
+    lifecycle: 'active',
+    pending_approval: null,
+    project_id: 'same-project',
+    queue: [],
+    transcript: [],
+    transcript_revision: 1,
+    version: 1
+  }
+
+  const snapshotA = { ...snapshotBase } as never
+  const snapshotB = { ...snapshotBase, binding_id: 'binding-b' } as never
+
+  configureProjectRuntimeRequester(vi.fn(async () => undefined), 'profile-a')
+  $projectRuntimes.set({ 'same-project': { events: [], snapshot: snapshotA } })
+  $activeGatewayProfile.set('profile-a')
+  const submit = vi.fn(async () => true)
+  const row = { id: 'same-C', profile: 'profile-a', project_id: 'same-project' } as never
+
+  const pending = submitAfterComposerMiddleware({
+    middleware: () => new Promise(resolve => (release = resolve)),
+    submit,
+    target: { runtimeSessionId: 'same-R', storedSession: row, storedSessionId: 'same-C' },
+    value: 'do not cross ABA'
+  })
+
+  // Middleware-ABA: de managed binding wisselt A→B→A terwijl de middleware
+  // pending is en keert terug naar dezelfde observable identity. De boundary
+  // vergelijkt alleen de eindwaarde met de capture (gelijk ⇒ passeert); een
+  // monotone surface-transitie tijdens de await moet de invocation echter
+  // invalideren, ook al is de eindwaarde identiek aan de startwaarde.
+  $projectRuntimes.set({ 'same-project': { events: [], snapshot: snapshotB } })
+  $projectRuntimes.set({ 'same-project': { events: [], snapshot: snapshotA } })
+  release({ text: 'do not cross ABA' })
 
   await expect(pending).resolves.toBe(false)
   expect(submit).not.toHaveBeenCalled()

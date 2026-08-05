@@ -9,7 +9,10 @@ import {
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { captureProjectSubmitAuthority } from '@/store/project-composer-queue'
 import { projectRuntimeAuthority } from '@/store/project-runtime'
-import { resolveCurrentManagedProjectSurface } from '@/store/project-surface-authority-store'
+import {
+  $projectSurfaceTransitionGeneration,
+  resolveCurrentManagedProjectSurface
+} from '@/store/project-surface-authority-store'
 import type { SessionInfo } from '@/types/hermes'
 
 interface SubmitBoundaryTarget {
@@ -87,6 +90,11 @@ export async function submitAfterComposerMiddleware(deps: {
   const capturedActiveProfile = normalizeProfileKey($activeGatewayProfile.get())
   const capturedGateway = activeGateway()
   const capturedRuntimeAuthority = projectRuntimeAuthority()
+  // Monotonic surface-transition evidence (reviewer-A C1 — middleware ABA):
+  // de teller verhoogt bij elke daadwerkelijke contextverandering, ook bij een
+  // A→B→A-transitie met identieke eindwaarde. Elke verandering tijdens de
+  // pending middleware invalideert de invocation (fail-closed).
+  const capturedSurfaceTransition = $projectSurfaceTransitionGeneration.get()
   const draft = await deps.middleware({ attachments: deps.options?.attachments, text: deps.value })
 
   if (!draft) {
@@ -118,7 +126,11 @@ export async function submitAfterComposerMiddleware(deps: {
       !validateExactLegacySessionAuthority(frozen.legacyAuthority, {
         runtimeSessionId: frozen.sessionId ?? null
       })) ||
-    (frozen.legacyDraftAuthority && !validateFrozenLegacyDraftAuthority(frozen.legacyDraftAuthority))
+    (frozen.legacyDraftAuthority && !validateFrozenLegacyDraftAuthority(frozen.legacyDraftAuthority)) ||
+    // Monotone surface-transitie: ook A→B→A met identieke eindwaarde invalideert.
+    // Gateway-object-ABA loopt via de bestaande `activeGateway() !== capturedGateway`-check
+    // (de gateway-store is geen bron van de surface-context).
+    $projectSurfaceTransitionGeneration.get() !== capturedSurfaceTransition
   ) {
     return false
   }

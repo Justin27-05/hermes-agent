@@ -2,6 +2,9 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $activeGatewayProfile } from '@/store/profile'
+import { configureProjectRuntimeRequester } from '@/store/project-runtime'
+import { $projectCatalogAuthority } from '@/store/projects'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -123,6 +126,9 @@ function openMenu() {
 describe('SessionActionsMenu', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    $activeGatewayProfile.set('default')
+    $projectCatalogAuthority.set({ catalogGeneration: 1, contextGeneration: 1, profile: 'default' })
+    configureProjectRuntimeRequester(vi.fn(async () => undefined), 'default')
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
     mocks.activeGateway.mockReturnValue(null)

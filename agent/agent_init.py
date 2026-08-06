@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
@@ -444,6 +446,69 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _thaw_project_tool_schemas(frozen_schemas: object) -> list[dict]:
+    """Copy the project snapshot's immutable schemas for the mutable agent loop."""
+    if type(frozen_schemas) is not tuple:
+        raise TypeError("project tool schemas must be a frozen tuple")
+
+    def thaw(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {key: thaw(item) for key, item in value.items()}
+        if type(value) is tuple:
+            return [thaw(item) for item in value]
+        return value
+
+    schemas = thaw(frozen_schemas)
+    if (
+        type(schemas) is not list
+        or not all(type(schema) is dict for schema in schemas)
+    ):
+        raise TypeError("project tool schemas must contain mapping schemas")
+    return schemas
+
+
+def _thaw_project_bedrock_guardrail_config(
+    frozen_config: object,
+) -> dict[str, str] | None:
+    """Copy the snapshot's narrow Bedrock guardrail payload for one agent."""
+    if frozen_config is None:
+        return None
+    if not isinstance(frozen_config, Mapping):
+        raise TypeError("project Bedrock guardrail config must be a mapping")
+    allowed_keys = {
+        "guardrailIdentifier",
+        "guardrailVersion",
+        "streamProcessingMode",
+        "trace",
+    }
+    if set(frozen_config) - allowed_keys:
+        raise TypeError("project Bedrock guardrail config has unknown keys")
+    identifier = frozen_config.get("guardrailIdentifier")
+    version = frozen_config.get("guardrailVersion")
+    if (
+        type(identifier) is not str
+        or not identifier
+        or type(version) is not str
+        or not version
+    ):
+        raise TypeError(
+            "project Bedrock guardrail config requires identifier and version"
+        )
+    thawed = {
+        "guardrailIdentifier": identifier,
+        "guardrailVersion": version,
+    }
+    for key in ("streamProcessingMode", "trace"):
+        value = frozen_config.get(key)
+        if value is not None:
+            if type(value) is not str or not value:
+                raise TypeError(
+                    "project Bedrock guardrail config values must be strings"
+                )
+            thawed[key] = value
+    return thawed
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -518,6 +583,19 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    project_execution_gate=None,
+    project_tool_schemas=None,
+    project_registry_generation: int = None,
+    project_request_timeout: float = None,
+    project_bedrock_guardrail_config=None,
+    streaming_callback: callable = None,
+    delivery_callback: callable = None,
+    approval_notifier: callable = None,
+    provider_metadata_prewarm: bool = True,
+    external_memory_sync: bool = True,
+    memory_review: bool = True,
+    skill_review: bool = True,
+    plugin_lifecycle: bool = True,
 ):
     """
     Initialize the AI Agent.
@@ -570,6 +648,93 @@ def init_agent(
             remain skipped.
     """
     _install_safe_stdio()
+
+    project_mode = project_execution_gate is not None
+    agent._hermetic_project_mode = project_mode
+    for option_name, option_value in (
+        ("provider_metadata_prewarm", provider_metadata_prewarm),
+        ("external_memory_sync", external_memory_sync),
+        ("memory_review", memory_review),
+        ("skill_review", skill_review),
+        ("plugin_lifecycle", plugin_lifecycle),
+    ):
+        if type(option_value) is not bool:
+            raise TypeError(f"{option_name} must be bool")
+    if project_mode:
+        if project_tool_schemas is None:
+            raise PermissionError(
+                "project execution requires frozen tool schemas"
+            )
+        if (
+            type(project_registry_generation) is not int
+            or project_registry_generation < 0
+        ):
+            raise TypeError(
+                "project execution requires a frozen registry generation"
+            )
+        if (
+            type(project_request_timeout) not in {int, float}
+            or project_request_timeout <= 0
+        ):
+            raise TypeError(
+                "project execution requires a frozen request timeout"
+            )
+        if any(
+            callback is not None
+            for callback in (
+                streaming_callback,
+                delivery_callback,
+                approval_notifier,
+            )
+        ):
+            raise PermissionError(
+                "project execution callbacks must be disabled"
+            )
+        if any(
+            (
+                provider_metadata_prewarm,
+                external_memory_sync,
+                memory_review,
+                skill_review,
+                plugin_lifecycle,
+                save_trajectories,
+            )
+        ):
+            raise PermissionError(
+                "project execution background lifecycle must be disabled"
+            )
+        if not skip_context_files or not skip_memory or session_db is not None:
+            raise PermissionError(
+                "project execution requires frozen context and no session store"
+            )
+    agent.project_execution_gate = project_execution_gate
+    agent._project_request_timeout = (
+        float(project_request_timeout)
+        if project_mode
+        else None
+    )
+    agent._project_execution_owner_loop = getattr(
+        project_execution_gate,
+        "owner_loop",
+        None,
+    )
+    if project_mode and agent._project_execution_owner_loop is None:
+        try:
+            agent._project_execution_owner_loop = (
+                asyncio.get_running_loop()
+            )
+        except RuntimeError:
+            pass
+    agent._project_streaming_callback = streaming_callback
+    agent._project_delivery_callback = delivery_callback
+    agent._project_approval_notifier = approval_notifier
+    agent._provider_metadata_prewarm_enabled = (
+        provider_metadata_prewarm
+    )
+    agent._external_memory_sync_enabled = external_memory_sync
+    agent._memory_review_enabled = memory_review
+    agent._skill_review_enabled = skill_review
+    agent._plugin_lifecycle_enabled = plugin_lifecycle
 
     agent.model = model
     agent.max_iterations = max_iterations
@@ -648,6 +813,23 @@ def init_agent(
     else:
         agent.api_mode = "chat_completions"
 
+    if project_mode and (
+        agent.api_mode == "codex_app_server"
+        or agent.provider == "copilot-acp"
+        or agent.provider == "moa"
+        or str(agent.base_url or "").lower().startswith(
+            ("acp://copilot", "acp+tcp://")
+        )
+    ):
+        if agent.provider == "moa":
+            raise PermissionError(
+                "MoA runtime is unavailable for project execution"
+            )
+        raise PermissionError(
+            "native Codex and Copilot ACP runtimes are unavailable "
+            "for project execution"
+        )
+
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent
     # was constructed with provider=None and an anthropic.com URL.
@@ -724,7 +906,8 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    if agent._provider_metadata_prewarm_enabled and \
+            (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -835,15 +1018,16 @@ def init_agent(
     # 1h tier costs 2x on write vs 1.25x for 5m, but amortizes across long
     # sessions with >5-minute pauses between turns (#14971).
     agent._cache_ttl = "5m"
-    try:
-        from hermes_cli.config import load_config as _load_pc_cfg
+    if not project_mode:
+        try:
+            from hermes_cli.config import load_config as _load_pc_cfg
 
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        _ttl = _pc_cfg.get("cache_ttl", "5m")
-        if _ttl in {"5m", "1h"}:
-            agent._cache_ttl = _ttl
-    except Exception:
-        pass
+            _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
+            _ttl = _pc_cfg.get("cache_ttl", "5m")
+            if _ttl in {"5m", "1h"}:
+                agent._cache_ttl = _ttl
+        except Exception:
+            pass
 
     # Iteration budget: the LLM is only notified when it actually exhausts
     # the iteration budget (api_call_count >= max_iterations).  At that
@@ -891,7 +1075,11 @@ def init_agent(
     # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
     # (which creates a new AIAgent per message) won't duplicate handlers.
     from hermes_logging import setup_logging, setup_verbose_logging
-    setup_logging(hermes_home=_ra()._hermes_home)
+    # The gateway owns logging before publishing a project runtime graph.
+    # Re-entering setup from a project worker could lazily spawn the global
+    # queue-listener thread outside the three retained gateway executors.
+    if not project_mode:
+        setup_logging(hermes_home=_ra()._hermes_home)
 
     if agent.verbose_logging:
         setup_verbose_logging()
@@ -981,7 +1169,11 @@ def init_agent(
     # every client construction path below (Anthropic native, OpenAI-wire,
     # router-based implicit auth) can apply it consistently.  Bedrock
     # Claude uses its own timeout path and is not covered here.
-    _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
+    _provider_timeout = (
+        agent._project_request_timeout
+        if project_mode
+        else get_provider_request_timeout(agent.provider, agent.model)
+    )
 
     if agent.api_mode == "anthropic_messages":
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
@@ -1087,22 +1279,30 @@ def init_agent(
         # Region is extracted from the base_url or defaults to us-east-1.
         _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
         agent._bedrock_region = _region_match.group(1) if _region_match else "us-east-1"
-        # Guardrail config — read from config.yaml at init time.
+        # Project construction consumes the guardrail payload frozen with the
+        # provider route. Normal agents retain their live config behavior.
         agent._bedrock_guardrail_config = None
-        try:
-            from hermes_cli.config import load_config as _load_br_cfg
-            _gr = _load_br_cfg().get("bedrock", {}).get("guardrail", {})
-            if _gr.get("guardrail_identifier") and _gr.get("guardrail_version"):
-                agent._bedrock_guardrail_config = {
-                    "guardrailIdentifier": _gr["guardrail_identifier"],
-                    "guardrailVersion": _gr["guardrail_version"],
-                }
-                if _gr.get("stream_processing_mode"):
-                    agent._bedrock_guardrail_config["streamProcessingMode"] = _gr["stream_processing_mode"]
-                if _gr.get("trace"):
-                    agent._bedrock_guardrail_config["trace"] = _gr["trace"]
-        except Exception:
-            pass
+        if project_mode:
+            agent._bedrock_guardrail_config = (
+                _thaw_project_bedrock_guardrail_config(
+                    project_bedrock_guardrail_config
+                )
+            )
+        else:
+            try:
+                from hermes_cli.config import load_config as _load_br_cfg
+                _gr = _load_br_cfg().get("bedrock", {}).get("guardrail", {})
+                if _gr.get("guardrail_identifier") and _gr.get("guardrail_version"):
+                    agent._bedrock_guardrail_config = {
+                        "guardrailIdentifier": _gr["guardrail_identifier"],
+                        "guardrailVersion": _gr["guardrail_version"],
+                    }
+                    if _gr.get("stream_processing_mode"):
+                        agent._bedrock_guardrail_config["streamProcessingMode"] = _gr["stream_processing_mode"]
+                    if _gr.get("trace"):
+                        agent._bedrock_guardrail_config["trace"] = _gr["trace"]
+            except Exception:
+                pass
         agent.client = None
         agent._client_kwargs = {}
         if not agent.quiet_mode:
@@ -1286,35 +1486,37 @@ def init_agent(
         # OpenAI SDK's identifying headers swap in a plain User-Agent. (#40033)
         # client_kwargs is the same dict object as agent._client_kwargs, so
         # this mutation is reflected in the client built just below.
-        agent._apply_user_default_headers()
+        if not project_mode:
+            agent._apply_user_default_headers()
 
-        try:
-            from hermes_cli.config import (
-                apply_custom_provider_extra_headers_to_client_kwargs,
-                apply_custom_provider_tls_to_client_kwargs,
-                get_compatible_custom_providers,
-                load_config,
-            )
+        if not project_mode:
+            try:
+                from hermes_cli.config import (
+                    apply_custom_provider_extra_headers_to_client_kwargs,
+                    apply_custom_provider_tls_to_client_kwargs,
+                    get_compatible_custom_providers,
+                    load_config,
+                )
 
-            _cp_config = load_config()
-            _cp_entries = get_compatible_custom_providers(_cp_config)
-            _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
-            apply_custom_provider_tls_to_client_kwargs(
-                client_kwargs,
-                _cp_base_url,
-                _cp_entries,
-            )
-            # Per-provider extra HTTP headers (providers.<name>.extra_headers /
-            # custom_providers[].extra_headers) — proxies, gateways, custom
-            # auth. Applied last so the most specific config level wins.
-            # SECURITY: values may carry credentials — never log them.
-            apply_custom_provider_extra_headers_to_client_kwargs(
-                client_kwargs,
-                _cp_base_url,
-                _cp_entries,
-            )
-        except Exception:
-            logger.debug("custom-provider TLS resolution skipped", exc_info=True)
+                _cp_config = load_config()
+                _cp_entries = get_compatible_custom_providers(_cp_config)
+                _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
+                apply_custom_provider_tls_to_client_kwargs(
+                    client_kwargs,
+                    _cp_base_url,
+                    _cp_entries,
+                )
+                # Per-provider extra HTTP headers (providers.<name>.extra_headers /
+                # custom_providers[].extra_headers) — proxies, gateways, custom
+                # auth. Applied last so the most specific config level wins.
+                # SECURITY: values may carry credentials — never log them.
+                apply_custom_provider_extra_headers_to_client_kwargs(
+                    client_kwargs,
+                    _cp_base_url,
+                    _cp_entries,
+                )
+            except Exception:
+                logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
         agent.api_key = client_kwargs.get("api_key", "")
         agent.base_url = client_kwargs.get("base_url", agent.base_url)
@@ -1375,19 +1577,26 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
-    # Get available tools with filtering. Capture the registry generation this
-    # snapshot is derived from FIRST, so a later concurrent refresh can tell
-    # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
-    try:
-        from tools.registry import registry as _snapshot_registry
-        agent._tool_snapshot_generation = _snapshot_registry._generation
-    except Exception:
-        agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-    )
+    # Project construction consumes the gateway's closed snapshot.  It must
+    # not rediscover tools or inspect the live registry after composition.
+    if project_mode:
+        agent._tool_snapshot_generation = project_registry_generation
+        agent.tools = _thaw_project_tool_schemas(project_tool_schemas)
+    else:
+        # Get available tools with filtering. Capture the registry generation
+        # this snapshot is derived from FIRST, so a later concurrent refresh
+        # can tell whether it holds a newer or staler view (see
+        # refresh_agent_mcp_tools).
+        try:
+            from tools.registry import registry as _snapshot_registry
+            agent._tool_snapshot_generation = _snapshot_registry._generation
+        except Exception:
+            agent._tool_snapshot_generation = 0
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1466,18 +1675,20 @@ def init_agent(
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"
-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    if not project_mode:
+        agent.logs_dir.mkdir(parents=True, exist_ok=True)
     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
     # is opt-in via sessions.write_json_snapshots (default False).  state.db
     # is canonical — the snapshot is only useful for external tooling that
     # reads the JSON files directly.  See run_agent._save_session_log.
     agent._session_json_enabled = False
-    try:
-        from hermes_cli.config import load_config as _load_sess_cfg
-        _sess_cfg = (_load_sess_cfg().get("sessions") or {})
-        agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
-    except Exception:
-        pass
+    if not project_mode:
+        try:
+            from hermes_cli.config import load_config as _load_sess_cfg
+            _sess_cfg = (_load_sess_cfg().get("sessions") or {})
+            agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
+        except Exception:
+            pass
     # logs_dir is retained unconditionally for request_dump_*.json (debug
     # breadcrumb path written by agent_runtime_helpers.dump_api_request_debug).
     
@@ -1543,11 +1754,14 @@ def init_agent(
     agent._todo_store = TodoStore()
     
     # Load config once for memory, skills, and compression sections
-    try:
-        from hermes_cli.config import load_config as _load_agent_config
-        _agent_cfg = _load_agent_config()
-    except Exception:
+    if project_mode:
         _agent_cfg = {}
+    else:
+        try:
+            from hermes_cli.config import load_config as _load_agent_config
+            _agent_cfg = _load_agent_config()
+        except Exception:
+            _agent_cfg = {}
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
@@ -1735,7 +1949,11 @@ def init_agent(
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
     # are noisy.
-    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
+    agent._environment_probe = (
+        False
+        if project_mode
+        else bool(_agent_section.get("environment_probe", True))
+    )
     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
     # subprocess round-trips) and its result lands in the FIRST system
     # prompt build, which sits on the time-to-first-token critical path.
@@ -1826,7 +2044,12 @@ def init_agent(
         )
     except Exception:
         pass
-    compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+    compression_enabled = (
+        False
+        if project_mode
+        else str(_compression_cfg.get("enabled", True)).lower()
+        in {"true", "1", "yes"}
+    )
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # Minimum REAL (actionable) user messages guaranteed to survive in the
@@ -2019,7 +2242,12 @@ def init_agent(
     agent._session_init_model_config["max_tokens"] = agent.max_tokens
 
     # Read explicit context_length override from model config
-    if isinstance(_model_cfg, dict):
+    if project_mode:
+        # Project construction may not inspect live provider metadata.  The
+        # gateway has already frozen the model route; this conservative value
+        # only initializes the disabled built-in compressor deterministically.
+        _config_context_length = 128_000
+    elif isinstance(_model_cfg, dict):
         _config_context_length = _model_cfg.get("context_length")
     else:
         _config_context_length = None
@@ -2044,13 +2272,16 @@ def init_agent(
     # Resolve custom_providers once before route-scoping a global context pin:
     # a named custom provider may keep its base URL only in this list rather
     # than repeating it under ``model``.
-    try:
-        from hermes_cli.config import get_compatible_custom_providers
-        _custom_providers = get_compatible_custom_providers(_agent_cfg)
-    except Exception:
-        _custom_providers = _agent_cfg.get("custom_providers")
-        if not isinstance(_custom_providers, list):
-            _custom_providers = []
+    if project_mode:
+        _custom_providers = []
+    else:
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            _custom_providers = get_compatible_custom_providers(_agent_cfg)
+        except Exception:
+            _custom_providers = _agent_cfg.get("custom_providers")
+            if not isinstance(_custom_providers, list):
+                _custom_providers = []
 
     # ``model.context_length`` describes the configured default model. A
     # process launched directly with ``--model`` / ``-m`` has already replaced
@@ -2498,7 +2729,11 @@ def init_agent(
             _existing_tool_names.add(_tname)
 
     # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
+    if (
+        not project_mode
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,
@@ -2512,7 +2747,11 @@ def init_agent(
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=os.getenv("TERMINAL_CWD") or None,
+        working_dir=(
+            None
+            if project_mode
+            else os.getenv("TERMINAL_CWD") or None
+        ),
     )
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).

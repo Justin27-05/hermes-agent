@@ -29,6 +29,10 @@ RUNTIME_TABLES = {
     "project_operations",
     "project_worker_leases",
 }
+PROFILE_RUNTIME_TABLES = {
+    "project_dispatcher_leases",
+    "project_runtime_membership_counters",
+}
 UNHASHABLE_ENUM_VALUES = (
     pytest.param([], id="list"),
     pytest.param({}, id="dict"),
@@ -116,6 +120,723 @@ def _insert_event(
         """,
         (event_id, project_id, sequence, turn_id),
     )
+
+
+def test_task7_c7_terminal_gate_schema_upgrade_repeat_and_constraints(
+    tmp_path,
+):
+    """C7 upgrades actual pre-C7 rows and converges strict storage."""
+    conn = _connect_db(tmp_path / "c7-legacy.db")
+    conn.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE project_runtime_state (
+            project_id TEXT PRIMARY KEY REFERENCES projects(id),
+            lifecycle TEXT NOT NULL,
+            current_phase TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            conversation_root_id TEXT,
+            conversation_tip_id TEXT,
+            updated_at INTEGER NOT NULL,
+            dispatch_membership_sequence INTEGER
+        );
+        CREATE TABLE project_conversations (
+            conversation_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            parent_conversation_id TEXT,
+            root_conversation_id TEXT,
+            created_at INTEGER NOT NULL,
+            UNIQUE (project_id, conversation_id)
+        );
+        CREATE TABLE project_turns (
+            turn_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            sequence INTEGER NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            origin_binding_id TEXT,
+            status TEXT NOT NULL,
+            attempt_id TEXT,
+            lease_generation INTEGER NOT NULL DEFAULT 0,
+            fencing_token INTEGER NOT NULL DEFAULT 0,
+            execution_state TEXT,
+            terminal_result_id TEXT,
+            recovery_block_key TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE (project_id, turn_id),
+            UNIQUE (project_id, sequence),
+            UNIQUE (project_id, idempotency_key)
+        );
+        INSERT INTO projects
+            (id, slug, name, created_at, archived)
+        VALUES ('c7-project', 'c7-project', 'C7 legacy', 1, 0);
+        INSERT INTO project_conversations (
+            conversation_id, project_id, parent_conversation_id,
+            root_conversation_id, created_at
+        ) VALUES (
+            'c7-root', 'c7-project', NULL, 'c7-root', 1
+        );
+        INSERT INTO project_runtime_state (
+            project_id, lifecycle, current_phase, version,
+            conversation_root_id, conversation_tip_id, updated_at,
+            dispatch_membership_sequence
+        ) VALUES (
+            'c7-project', 'active', 'implementation', 0,
+            'c7-root', 'c7-root', 1, NULL
+        );
+        INSERT INTO project_turns (
+            turn_id, project_id, sequence, idempotency_key, payload_json,
+            status, created_at, updated_at
+        ) VALUES (
+            'c7-turn', 'c7-project', 1, 'c7-turn', '{}',
+            'queued', 1, 1
+        );
+        INSERT INTO project_turns (
+            turn_id, project_id, sequence, idempotency_key, payload_json,
+            status, created_at, updated_at
+        ) VALUES (
+            'c7-turn-succeeded', 'c7-project', 2,
+            'c7-turn-succeeded', '{}', 'queued', 1, 1
+        );
+        """
+    )
+    conn.commit()
+
+    prdb.ensure_schema(conn)
+    state_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(project_runtime_state)")
+    }
+    turn_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(project_turns)")
+    }
+    assert {
+        "transcript_pending_batch_id",
+        "transcript_dispatch_block_key",
+    } <= state_columns
+    assert "transcript_applied_batch_id" in turn_columns
+
+    def c7_contract_schema(connection):
+        column_contract = []
+        for table, names in (
+            (
+                "project_runtime_state",
+                {
+                    "transcript_pending_batch_id",
+                    "transcript_dispatch_block_key",
+                },
+            ),
+            ("project_turns", {"transcript_applied_batch_id"}),
+        ):
+            column_contract.extend(
+                (
+                    table,
+                    row["name"],
+                    row["type"],
+                    row["notnull"],
+                    row["dflt_value"],
+                    row["pk"],
+                )
+                for row in connection.execute(
+                    f"PRAGMA table_info({table})"
+                )
+                if row["name"] in names
+            )
+        triggers = tuple(
+            (
+                row["name"],
+                " ".join(row["sql"].split()),
+            )
+            for row in connection.execute(
+                """
+                SELECT name, sql FROM sqlite_master
+                WHERE type = 'trigger'
+                  AND (
+                      sql LIKE '%transcript_pending_batch_id%'
+                      OR sql LIKE '%transcript_dispatch_block_key%'
+                      OR sql LIKE '%transcript_applied_batch_id%'
+                  )
+                ORDER BY name
+                """
+            )
+        )
+        return tuple(sorted(column_contract)), triggers
+
+    upgraded_contract_schema = c7_contract_schema(conn)
+    fresh_conn = _create_runtime_db(tmp_path / "c7-fresh.db")
+    try:
+        assert c7_contract_schema(fresh_conn) == upgraded_contract_schema
+    finally:
+        fresh_conn.close()
+
+    state_row = conn.execute(
+        "SELECT * FROM project_runtime_state WHERE project_id = 'c7-project'"
+    ).fetchone()
+    assert state_row["transcript_pending_batch_id"] is None
+    assert state_row["transcript_dispatch_block_key"] is None
+    turn_row = conn.execute(
+        "SELECT * FROM project_turns WHERE turn_id = 'c7-turn'"
+    ).fetchone()
+    assert turn_row["transcript_applied_batch_id"] is None
+
+    def c7_schema_snapshot():
+        return tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT type, name, sql
+                FROM sqlite_master
+                WHERE sql LIKE '%transcript_pending_batch_id%'
+                   OR sql LIKE '%transcript_dispatch_block_key%'
+                   OR sql LIKE '%transcript_applied_batch_id%'
+                ORDER BY type, name
+                """
+            )
+        )
+
+    first_schema = c7_schema_snapshot()
+    c7_triggers = [
+        row
+        for row in conn.execute(
+            """
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'trigger'
+              AND (
+                  sql LIKE '%transcript_pending_batch_id%'
+                  OR sql LIKE '%transcript_applied_batch_id%'
+              )
+            ORDER BY name
+            """
+        )
+    ]
+    assert c7_triggers
+    stale_name = c7_triggers[0]["name"]
+    quoted_name = stale_name.replace('"', '""')
+    conn.executescript(
+        f"""
+        DROP TRIGGER "{quoted_name}";
+        CREATE TRIGGER "{quoted_name}"
+        BEFORE UPDATE ON project_runtime_state
+        WHEN 0
+        BEGIN
+            SELECT RAISE(ABORT, 'stale permissive C7 trigger');
+        END;
+        """
+    )
+    assert c7_schema_snapshot() != first_schema
+    prdb.ensure_schema(conn)
+    second_schema = c7_schema_snapshot()
+    assert second_schema == first_schema
+    prdb.ensure_schema(conn)
+    assert c7_schema_snapshot() == second_schema
+
+    valid_batch = "123e4567-e89b-42d3-a456-426614174000"
+    other_batch = "223e4567-e89b-42d3-a456-426614174000"
+
+    for invalid_pending in (
+        "not-a-canonical-uuid",
+        "123e4567-e89b-12d3-a456-426614174000",
+        valid_batch.upper(),
+        sqlite3.Binary(valid_batch.encode()),
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                UPDATE project_runtime_state
+                SET transcript_pending_batch_id = ?
+                WHERE project_id = 'c7-project'
+                """,
+                (invalid_pending,),
+            )
+
+    for invalid_block in ("", sqlite3.Binary(b"count-drift")):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                UPDATE project_runtime_state
+                SET transcript_dispatch_block_key = ?
+                WHERE project_id = 'c7-project'
+                """,
+                (invalid_block,),
+            )
+
+    conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET transcript_pending_batch_id = ?
+        WHERE project_id = 'c7-project'
+        """,
+        (valid_batch,),
+    )
+    assert conn.execute(
+        """
+        SELECT transcript_pending_batch_id
+        FROM project_runtime_state WHERE project_id = 'c7-project'
+        """
+    ).fetchone()[0] == valid_batch
+    conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET transcript_pending_batch_id = NULL
+        WHERE project_id = 'c7-project'
+        """
+    )
+    exact_block = "any exact nonempty conflict key / C7"
+    conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET transcript_dispatch_block_key = ?
+        WHERE project_id = 'c7-project'
+        """,
+        (exact_block,),
+    )
+    assert conn.execute(
+        """
+        SELECT transcript_dispatch_block_key
+        FROM project_runtime_state WHERE project_id = 'c7-project'
+        """
+    ).fetchone()[0] == exact_block
+    conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET transcript_dispatch_block_key = NULL
+        WHERE project_id = 'c7-project'
+        """
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            UPDATE project_runtime_state
+            SET transcript_pending_batch_id = ?,
+                transcript_dispatch_block_key = ?
+            WHERE project_id = 'c7-project'
+            """,
+            (valid_batch, exact_block),
+        )
+
+    invalid_applied_values = (
+        "not-a-canonical-uuid",
+        "123e4567-e89b-12d3-a456-426614174000",
+        valid_batch.upper(),
+        sqlite3.Binary(valid_batch.encode()),
+    )
+    for invalid_applied in invalid_applied_values:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                UPDATE project_turns
+                SET status = 'failed', attempt_id = 'c7-invalid-attempt',
+                    lease_generation = 1, fencing_token = 1,
+                    execution_state = 'started', terminal_result_id = ?,
+                    transcript_applied_batch_id = ?
+                WHERE turn_id = 'c7-turn'
+                """,
+                (valid_batch, invalid_applied),
+            )
+    for invalid_applied in invalid_applied_values:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                UPDATE project_turns
+                SET status = 'failed',
+                    attempt_id = 'c7-invalid-shape-attempt',
+                    lease_generation = 1, fencing_token = 1,
+                    execution_state = 'started', terminal_result_id = ?,
+                    transcript_applied_batch_id = ?
+                WHERE turn_id = 'c7-turn'
+                """,
+                (invalid_applied, invalid_applied),
+            )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            UPDATE project_turns
+            SET attempt_id = 'c7-nonterminal-attempt',
+                lease_generation = 1, fencing_token = 1,
+                execution_state = 'started', terminal_result_id = ?,
+                transcript_applied_batch_id = ?
+            WHERE turn_id = 'c7-turn'
+            """,
+            (valid_batch, valid_batch),
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            UPDATE project_turns SET status = 'failed',
+                attempt_id = 'c7-mismatch-attempt',
+                lease_generation = 1, fencing_token = 1,
+                execution_state = 'started', terminal_result_id = ?,
+                transcript_applied_batch_id = ?
+            WHERE turn_id = 'c7-turn'
+            """,
+            (valid_batch, other_batch),
+        )
+
+    conn.execute(
+        """
+        UPDATE project_turns SET status = 'failed',
+            attempt_id = 'c7-failed-attempt',
+            lease_generation = 1, fencing_token = 1,
+            execution_state = 'started', terminal_result_id = ?,
+            transcript_applied_batch_id = ?
+        WHERE turn_id = 'c7-turn'
+        """,
+        (valid_batch, valid_batch),
+    )
+    conn.execute(
+        """
+        UPDATE project_turns
+        SET status = 'succeeded', attempt_id = 'c7-succeeded-attempt',
+            lease_generation = 1, fencing_token = 1,
+            execution_state = 'started', terminal_result_id = ?,
+            transcript_applied_batch_id = ?
+        WHERE turn_id = 'c7-turn-succeeded'
+        """,
+        (other_batch, other_batch),
+    )
+    conn.commit()
+    replacement_batch = "423e4567-e89b-42d3-a456-426614174000"
+    for mutation in (
+        ("terminal_result_id = ?", (replacement_batch,)),
+        ("transcript_applied_batch_id = NULL", ()),
+        ("transcript_applied_batch_id = ?", (replacement_batch,)),
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                f"""
+                UPDATE project_turns SET {mutation[0]}
+                WHERE turn_id = 'c7-turn'
+                """,
+                mutation[1],
+            )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            UPDATE project_turns
+            SET terminal_result_id = ?,
+                transcript_applied_batch_id = ?
+            WHERE turn_id = 'c7-turn'
+            """,
+            (replacement_batch, replacement_batch),
+        )
+
+    def insert_catalog_project(project_id):
+        conn.execute(
+            """
+            INSERT INTO projects
+                (id, slug, name, created_at, archived)
+            VALUES (?, ?, ?, 1, 0)
+            """,
+            (project_id, project_id, project_id),
+        )
+        conn.commit()
+
+    state_insert_cases = (
+        ("pending-generic", "not-a-canonical-uuid", None),
+        (
+            "pending-uuidv1",
+            "123e4567-e89b-12d3-a456-426614174000",
+            None,
+        ),
+        ("pending-uppercase", valid_batch.upper(), None),
+        (
+            "pending-blob",
+            sqlite3.Binary(valid_batch.encode()),
+            None,
+        ),
+        ("block-empty", None, ""),
+        ("block-blob", None, sqlite3.Binary(b"count-drift")),
+        ("mutual", valid_batch, exact_block),
+    )
+    for ordinal, (label, pending, block) in enumerate(
+        state_insert_cases, 100
+    ):
+        insert_project_id = f"c7-insert-state-{label}"
+        insert_catalog_project(insert_project_id)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO project_runtime_state (
+                    project_id, lifecycle, current_phase, version,
+                    conversation_root_id, conversation_tip_id, updated_at,
+                    dispatch_membership_sequence,
+                    transcript_pending_batch_id,
+                    transcript_dispatch_block_key
+                ) VALUES (
+                    ?, 'active', 'implementation', 0,
+                    NULL, NULL, 1, ?, ?, ?
+                )
+                """,
+                (
+                    insert_project_id,
+                    ordinal,
+                    pending,
+                    block,
+                ),
+            )
+
+    valid_insert_project = "c7-insert-state-valid"
+    insert_catalog_project(valid_insert_project)
+    conn.execute(
+        """
+        INSERT INTO project_runtime_state (
+            project_id, lifecycle, current_phase, version,
+            conversation_root_id, conversation_tip_id, updated_at,
+            dispatch_membership_sequence,
+            transcript_pending_batch_id,
+            transcript_dispatch_block_key
+        ) VALUES (
+            ?, 'active', 'implementation', 0,
+            NULL, NULL, 1, 200, ?, NULL
+        )
+        """,
+        (valid_insert_project, valid_batch),
+    )
+    assert conn.execute(
+        """
+        SELECT transcript_pending_batch_id
+        FROM project_runtime_state WHERE project_id = ?
+        """,
+        (valid_insert_project,),
+    ).fetchone()[0] == valid_batch
+
+    def insert_applied_turn(
+        turn_id,
+        sequence,
+        status,
+        terminal_result_id,
+        applied_batch_id,
+    ):
+        return conn.execute(
+            """
+            INSERT INTO project_turns (
+                turn_id, project_id, sequence, idempotency_key,
+                payload_json, status, attempt_id, lease_generation,
+                fencing_token, execution_state, terminal_result_id,
+                transcript_applied_batch_id, created_at, updated_at
+            ) VALUES (
+                ?, 'c7-project', ?, ?, '{}', ?, ?, 1, 1, 'started',
+                ?, ?, 1, 1
+            )
+            """,
+            (
+                turn_id,
+                sequence,
+                turn_id,
+                status,
+                f"{turn_id}-attempt",
+                terminal_result_id,
+                applied_batch_id,
+            ),
+        )
+
+    insert_turn_cases = (
+        (
+            "c7-insert-turn-invalid-generic",
+            10,
+            "failed",
+            "423e4567-e89b-42d3-a456-426614174000",
+            "not-a-canonical-uuid",
+        ),
+        (
+            "c7-insert-turn-invalid-uuidv1",
+            11,
+            "failed",
+            "523e4567-e89b-42d3-a456-426614174000",
+            "123e4567-e89b-12d3-a456-426614174000",
+        ),
+        (
+            "c7-insert-turn-invalid-uppercase",
+            12,
+            "failed",
+            "623e4567-e89b-42d3-a456-426614174000",
+            valid_batch.upper(),
+        ),
+        (
+            "c7-insert-turn-invalid-blob",
+            13,
+            "failed",
+            "723e4567-e89b-42d3-a456-426614174000",
+            sqlite3.Binary(valid_batch.encode()),
+        ),
+        (
+            "c7-insert-turn-nonterminal",
+            14,
+            "queued",
+            "823e4567-e89b-42d3-a456-426614174000",
+            "823e4567-e89b-42d3-a456-426614174000",
+        ),
+        (
+            "c7-insert-turn-mismatch",
+            15,
+            "failed",
+            "923e4567-e89b-42d3-a456-426614174000",
+            "a23e4567-e89b-42d3-a456-426614174000",
+        ),
+        (
+            "c7-insert-turn-equal-invalid-generic",
+            16,
+            "failed",
+            "not-a-canonical-uuid",
+            "not-a-canonical-uuid",
+        ),
+        (
+            "c7-insert-turn-equal-invalid-uuidv1",
+            17,
+            "failed",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "123e4567-e89b-12d3-a456-426614174000",
+        ),
+        (
+            "c7-insert-turn-equal-invalid-uppercase",
+            18,
+            "failed",
+            valid_batch.upper(),
+            valid_batch.upper(),
+        ),
+        (
+            "c7-insert-turn-equal-invalid-blob",
+            19,
+            "failed",
+            sqlite3.Binary(valid_batch.encode()),
+            sqlite3.Binary(valid_batch.encode()),
+        ),
+    )
+    for insert_args in insert_turn_cases:
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_applied_turn(*insert_args)
+
+    third_batch = "323e4567-e89b-42d3-a456-426614174000"
+    insert_applied_turn(
+        "c7-insert-turn-valid",
+        20,
+        "succeeded",
+        third_batch,
+        third_batch,
+    )
+    assert tuple(conn.execute(
+        """
+        SELECT status, transcript_applied_batch_id
+        FROM project_turns WHERE turn_id = 'c7-insert-turn-valid'
+        """
+    ).fetchone()) == ("succeeded", third_batch)
+    failed_insert_batch = "b23e4567-e89b-42d3-a456-426614174000"
+    insert_applied_turn(
+        "c7-insert-turn-valid-failed",
+        21,
+        "failed",
+        failed_insert_batch,
+        failed_insert_batch,
+    )
+    assert tuple(conn.execute(
+        """
+        SELECT status, transcript_applied_batch_id
+        FROM project_turns
+        WHERE turn_id = 'c7-insert-turn-valid-failed'
+        """
+    ).fetchone()) == ("failed", failed_insert_batch)
+    conn.commit()
+
+    state_row = conn.execute(
+        "SELECT * FROM project_runtime_state WHERE project_id = 'c7-project'"
+    ).fetchone()
+    mapped_state = prdb.runtime_state_from_row(state_row)
+    assert mapped_state.transcript_pending_batch_id is None
+    assert mapped_state.transcript_dispatch_block_key is None
+    valid_pending_state = dict(state_row)
+    valid_pending_state["transcript_pending_batch_id"] = valid_batch
+    assert (
+        prdb.runtime_state_from_row(
+            valid_pending_state
+        ).transcript_pending_batch_id
+        == valid_batch
+    )
+    valid_block_state = dict(state_row)
+    valid_block_state["transcript_dispatch_block_key"] = exact_block
+    assert (
+        prdb.runtime_state_from_row(
+            valid_block_state
+        ).transcript_dispatch_block_key
+        == exact_block
+    )
+    for changes in (
+        *(
+            {"transcript_pending_batch_id": invalid}
+            for invalid in (
+                "invalid",
+                "123e4567-e89b-12d3-a456-426614174000",
+                valid_batch.upper(),
+                sqlite3.Binary(valid_batch.encode()),
+            )
+        ),
+        {"transcript_dispatch_block_key": ""},
+        {
+            "transcript_dispatch_block_key": sqlite3.Binary(
+                b"count-drift"
+            )
+        },
+        {
+            "transcript_pending_batch_id": valid_batch,
+            "transcript_dispatch_block_key": exact_block,
+        },
+    ):
+        corrupted_state = dict(state_row)
+        corrupted_state.update(changes)
+        with pytest.raises(RuntimeError):
+            prdb.runtime_state_from_row(corrupted_state)
+
+    turn_row = conn.execute(
+        "SELECT * FROM project_turns WHERE turn_id = 'c7-turn'"
+    ).fetchone()
+    mapped_turn = prdb.runtime_turn_from_row(turn_row)
+    assert mapped_turn.transcript_applied_batch_id == valid_batch
+    succeeded_turn_row = conn.execute(
+        """
+        SELECT * FROM project_turns
+        WHERE turn_id = 'c7-turn-succeeded'
+        """
+    ).fetchone()
+    assert (
+        prdb.runtime_turn_from_row(
+            succeeded_turn_row
+        ).transcript_applied_batch_id
+        == other_batch
+    )
+    for changes in (
+        *(
+            {
+                "transcript_applied_batch_id": invalid,
+            }
+            for invalid in invalid_applied_values
+        ),
+        {"status": "claimed"},
+        {"terminal_result_id": other_batch},
+    ):
+        corrupted_turn = dict(turn_row)
+        corrupted_turn.update(changes)
+        with pytest.raises(RuntimeError):
+            prdb.runtime_turn_from_row(corrupted_turn)
+    for invalid_applied in invalid_applied_values:
+        corrupted_turn = dict(turn_row)
+        corrupted_turn.update(
+            {
+                "terminal_result_id": invalid_applied,
+                "transcript_applied_batch_id": invalid_applied,
+            }
+        )
+        with pytest.raises(RuntimeError):
+            prdb.runtime_turn_from_row(corrupted_turn)
+    conn.close()
 
 
 def test_migrates_existing_projects_without_changing_catalog_records(tmp_path):
@@ -253,9 +974,259 @@ def _schema_snapshot(conn):
     ]
     columns = {
         table: [tuple(row) for row in conn.execute(f"PRAGMA table_info({table})")]
-        for table in RUNTIME_TABLES
+        for table in RUNTIME_TABLES | PROFILE_RUNTIME_TABLES
     }
     return definitions, columns
+
+
+def test_fresh_schema_adds_one_profile_wide_core_dispatcher_lease(runtime_conn):
+    columns = {
+        row["name"]: row
+        for row in runtime_conn.execute(
+            "PRAGMA table_info(project_dispatcher_leases)"
+        )
+    }
+    indexes = {
+        row["name"]
+        for row in runtime_conn.execute(
+            "PRAGMA index_list(project_dispatcher_leases)"
+        )
+    }
+
+    assert tuple(columns) == (
+        "lease_name",
+        "instance_id",
+        "generation",
+        "fencing_token",
+        "expires_at",
+        "updated_at",
+    )
+    assert columns["lease_name"]["pk"] == 1
+    assert {
+        "idx_project_dispatcher_lease_expiry",
+        "sqlite_autoindex_project_dispatcher_leases_1",
+    } <= indexes
+    assert runtime_conn.execute(
+        "SELECT * FROM project_dispatcher_leases"
+    ).fetchall() == []
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        pytest.param(
+            ("other", None, 0, 0, 1, 1),
+            id="non-core-name",
+        ),
+        pytest.param(
+            ("core", None, -1, 0, 1, 1),
+            id="negative-generation",
+        ),
+        pytest.param(
+            ("core", None, 0, -1, 1, 1),
+            id="negative-fence",
+        ),
+        pytest.param(
+            ("core", None, 0, 0, -1, -1),
+            id="negative-time",
+        ),
+        pytest.param(
+            ("core", None, 0, 0, 2, 1),
+            id="released-horizon-mismatch",
+        ),
+        pytest.param(
+            ("core", "not-a-canonical-instance", 1, 1, 2, 1),
+            id="active-instance-wrong-length",
+        ),
+    ),
+)
+def test_core_dispatcher_lease_schema_rejects_malformed_rows(
+    runtime_conn, values
+):
+    with pytest.raises(sqlite3.IntegrityError):
+        runtime_conn.execute(
+            """
+            INSERT INTO project_dispatcher_leases (
+                lease_name, instance_id, generation, fencing_token,
+                expires_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+    runtime_conn.rollback()
+
+
+def test_core_dispatcher_lease_upgrades_task6_without_recertifying(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "task6-upgrade.db"
+    conn = _create_runtime_db(db_path)
+    _insert_project(conn, "p_task6_upgrade")
+    conn.execute(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, command_revision, targets_json,
+            payload_json, status, created_at, updated_at,
+            guard_revision, guard_validated
+        ) VALUES (
+            'legacy-marker-zero', 'p_task6_upgrade', 1, '[', '{',
+            'approved', 1, 1, 1, 0
+        )
+        """
+    )
+    conn.execute(
+        "DROP INDEX IF EXISTS idx_project_dispatcher_lease_expiry"
+    )
+    conn.execute("DROP TABLE IF EXISTS project_dispatcher_leases")
+    conn.commit()
+    before_operation = tuple(
+        conn.execute(
+            """
+            SELECT * FROM project_operations
+            WHERE operation_id = 'legacy-marker-zero'
+            """
+        ).fetchone()
+    )
+    before_maintenance = tuple(
+        conn.execute(
+            """
+            SELECT * FROM project_operation_maintenance
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    )
+
+    def unexpected_recertification(*_args, **_kwargs):
+        raise AssertionError("completed Task-6 history was rescanned")
+
+    monkeypatch.setattr(
+        prdb,
+        "_certify_project_operation_row",
+        unexpected_recertification,
+    )
+    prdb.ensure_schema(conn)
+
+    assert tuple(
+        conn.execute(
+            """
+            SELECT * FROM project_operations
+            WHERE operation_id = 'legacy-marker-zero'
+            """
+        ).fetchone()
+    ) == before_operation
+    assert tuple(
+        conn.execute(
+            """
+            SELECT * FROM project_operation_maintenance
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    ) == before_maintenance
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM sqlite_master
+        WHERE type = 'table' AND name = 'project_dispatcher_leases'
+        """
+    ).fetchone()[0] == 1
+    conn.close()
+
+
+def test_concurrent_core_dispatcher_schema_initializers_converge(tmp_path):
+    db_path = tmp_path / "concurrent-core-schema.db"
+    bootstrap = _create_runtime_db(db_path)
+    bootstrap.execute(
+        "DROP INDEX IF EXISTS idx_project_dispatcher_lease_expiry"
+    )
+    bootstrap.execute("DROP TABLE IF EXISTS project_dispatcher_leases")
+    bootstrap.commit()
+    bootstrap.close()
+    barrier = threading.Barrier(2)
+
+    def initialize():
+        conn = _connect_db(db_path)
+        try:
+            barrier.wait(timeout=5)
+            prdb.ensure_schema(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(initialize) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+
+    conn = _connect_db(db_path)
+    try:
+        definitions = conn.execute(
+            """
+            SELECT type, name
+            FROM sqlite_master
+            WHERE name IN (
+                'project_dispatcher_leases',
+                'idx_project_dispatcher_lease_expiry'
+            )
+            ORDER BY type, name
+            """
+        ).fetchall()
+        assert [tuple(row) for row in definitions] == [
+            ("index", "idx_project_dispatcher_lease_expiry"),
+            ("table", "project_dispatcher_leases"),
+        ]
+        assert conn.execute(
+            "SELECT * FROM project_dispatcher_leases"
+        ).fetchall() == []
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    finally:
+        conn.close()
+
+
+def test_repeat_schema_preserves_live_core_dispatcher_lease(runtime_conn):
+    runtime_conn.execute(
+        """
+        INSERT INTO project_dispatcher_leases (
+            lease_name, instance_id, generation, fencing_token,
+            expires_at, updated_at
+        ) VALUES (
+            'core', '11111111-1111-4111-8111-111111111111',
+            7, 9, 130, 100
+        )
+        """
+    )
+    runtime_conn.commit()
+    before = tuple(
+        runtime_conn.execute(
+            """
+            SELECT * FROM project_dispatcher_leases
+            WHERE lease_name = 'core'
+            """
+        ).fetchone()
+    )
+
+    statements = []
+    runtime_conn.set_trace_callback(statements.append)
+    try:
+        prdb.ensure_schema(runtime_conn)
+        prdb.ensure_schema(runtime_conn)
+    finally:
+        runtime_conn.set_trace_callback(None)
+
+    assert tuple(
+        runtime_conn.execute(
+            """
+            SELECT * FROM project_dispatcher_leases
+            WHERE lease_name = 'core'
+            """
+        ).fetchone()
+    ) == before
+    assert [
+        statement
+        for statement in statements
+        if "project_dispatcher_leases" in statement
+        and statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+    ] == []
 
 
 def test_ensure_schema_is_idempotent(runtime_conn):
@@ -265,6 +1236,409 @@ def test_ensure_schema_is_idempotent(runtime_conn):
     second = _schema_snapshot(runtime_conn)
 
     assert second == first
+
+
+def _task7_membership_counters(conn):
+    return tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT lane, last_sequence
+            FROM project_runtime_membership_counters
+            ORDER BY lane
+            """
+        )
+    )
+
+
+def _normalized_schema_object_sql(sql):
+    return (
+        " ".join(sql.split())
+        .removesuffix(";")
+        .replace(" IF NOT EXISTS ", " ")
+    )
+
+
+def test_task7_membership_fresh_schema_is_exact_and_certified(
+    runtime_conn,
+):
+    runtime_columns = {
+        row["name"]
+        for row in runtime_conn.execute(
+            "PRAGMA table_info(project_runtime_state)"
+        )
+    }
+    operation_columns = {
+        row["name"]
+        for row in runtime_conn.execute(
+            "PRAGMA table_info(project_operations)"
+        )
+    }
+    maintenance_columns = {
+        row["name"]
+        for row in runtime_conn.execute(
+            "PRAGMA table_info(project_operation_maintenance)"
+        )
+    }
+    indexes = {
+        row["name"]: " ".join(row["sql"].lower().split())
+        for row in runtime_conn.execute(
+            """
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'index'
+              AND name IN (
+                  'idx_project_runtime_dispatch_membership',
+                  'idx_project_runtime_dispatch_scan',
+                  'idx_project_operations_recovery_membership',
+                  'idx_project_operations_task7_recovery_page'
+              )
+            """
+        )
+    }
+    triggers = {
+        row["name"]
+        for row in runtime_conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name LIKE 'trg_project_%membership%'
+            """
+        )
+    }
+
+    assert "dispatch_membership_sequence" in runtime_columns
+    assert {
+        "approval_checkpoint_id",
+        "intent_event_id",
+        "recovery_membership_sequence",
+    } <= operation_columns
+    assert "task7_operation_migration_complete" in maintenance_columns
+    assert _task7_membership_counters(runtime_conn) == (
+        ("dispatch", 0),
+        ("operation_recovery", 0),
+    )
+    assert runtime_conn.execute(
+        """
+        SELECT task7_operation_migration_complete
+        FROM project_operation_maintenance
+        WHERE singleton = 1
+        """
+    ).fetchone()[0] == 1
+    assert set(indexes) == {
+        "idx_project_runtime_dispatch_membership",
+        "idx_project_runtime_dispatch_scan",
+        "idx_project_operations_recovery_membership",
+        "idx_project_operations_task7_recovery_page",
+    }
+    assert "guard_revision = 1" in indexes[
+        "idx_project_operations_recovery_membership"
+    ]
+    assert "guard_validated = 1" in indexes[
+        "idx_project_operations_recovery_membership"
+    ]
+    assert "guard_revision = 1" in indexes[
+        "idx_project_operations_task7_recovery_page"
+    ]
+    assert "guard_validated = 1" in indexes[
+        "idx_project_operations_task7_recovery_page"
+    ]
+    assert {
+        "trg_project_runtime_dispatch_membership_insert",
+        "trg_project_runtime_dispatch_membership_update",
+    } <= triggers
+
+
+def test_task7_reviewfix_upgrade_rebuilds_wrong_named_membership_index(
+    runtime_conn,
+):
+    runtime_conn.executescript(
+        """
+        DROP INDEX idx_project_runtime_dispatch_scan;
+        CREATE INDEX idx_project_runtime_dispatch_scan
+        ON project_runtime_state(
+            dispatch_membership_sequence, project_id
+        )
+        WHERE lifecycle = 'active'
+          AND dispatch_membership_sequence IS NOT NULL
+           OR lifecycle = 'completed';
+        """
+    )
+
+    prdb.ensure_schema(runtime_conn)
+
+    stored = runtime_conn.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'index'
+          AND name = 'idx_project_runtime_dispatch_scan'
+        """
+    ).fetchone()
+    assert stored is not None
+    assert _normalized_schema_object_sql(
+        stored["sql"]
+    ) == _normalized_schema_object_sql(
+        """
+        CREATE INDEX idx_project_runtime_dispatch_scan
+        ON project_runtime_state(dispatch_membership_sequence, project_id)
+        WHERE lifecycle = 'active'
+          AND dispatch_membership_sequence IS NOT NULL;
+        """
+    )
+
+
+def test_task7_reviewfix_upgrade_rebuilds_wrong_named_dispatcher_lease_index(
+    runtime_conn,
+):
+    runtime_conn.executescript(
+        """
+        DROP INDEX idx_project_dispatcher_lease_expiry;
+        CREATE INDEX idx_project_dispatcher_lease_expiry
+        ON project_dispatcher_leases(expires_at, lease_name)
+        WHERE instance_id IS NOT NULL;
+        """
+    )
+
+    prdb.ensure_schema(runtime_conn)
+
+    stored = runtime_conn.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'index'
+          AND name = 'idx_project_dispatcher_lease_expiry'
+        """
+    ).fetchone()
+    assert stored is not None
+    assert _normalized_schema_object_sql(
+        stored["sql"]
+    ) == _normalized_schema_object_sql(
+        """
+        CREATE INDEX idx_project_dispatcher_lease_expiry
+        ON project_dispatcher_leases(expires_at, lease_name);
+        """
+    )
+
+
+def test_task7_reviewfix_upgrade_rebuilds_wrong_named_membership_trigger(
+    runtime_conn,
+):
+    _insert_project(runtime_conn, "trigger-upgrade")
+    prdb.create_project_conversation(
+        runtime_conn,
+        project_id="trigger-upgrade",
+        conversation_id="trigger-upgrade-root",
+        current_phase="implementation",
+        now=1,
+    )
+    runtime_conn.executescript(
+        """
+        DROP TRIGGER trg_project_runtime_dispatch_membership_update;
+        CREATE TRIGGER
+        trg_project_runtime_dispatch_membership_update
+        BEFORE UPDATE ON project_runtime_state
+        WHEN NEW.dispatch_membership_sequence
+             IS OLD.dispatch_membership_sequence
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'dispatch membership sequence is immutable'
+            );
+        END;
+        """
+    )
+
+    prdb.ensure_schema(runtime_conn)
+
+    stored = runtime_conn.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'trigger'
+          AND name =
+              'trg_project_runtime_dispatch_membership_update'
+        """
+    ).fetchone()
+    assert stored is not None
+    assert _normalized_schema_object_sql(
+        stored["sql"]
+    ) == _normalized_schema_object_sql(
+        """
+        CREATE TRIGGER
+        trg_project_runtime_dispatch_membership_update
+        BEFORE UPDATE ON project_runtime_state
+        WHEN NEW.dispatch_membership_sequence
+             IS NOT OLD.dispatch_membership_sequence
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'dispatch membership sequence is immutable'
+            );
+        END;
+        """
+    )
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="dispatch membership sequence is immutable",
+    ):
+        runtime_conn.execute(
+            """
+            UPDATE project_runtime_state
+            SET dispatch_membership_sequence = 2
+            WHERE project_id = 'trigger-upgrade'
+            """
+        )
+    runtime_conn.rollback()
+
+
+def test_task7_dispatch_membership_allocates_once_and_is_immutable(
+    runtime_conn,
+):
+    for project_id in ("z-project", "a-project"):
+        _insert_project(runtime_conn, project_id)
+        prdb.create_project_conversation(
+            runtime_conn,
+            project_id=project_id,
+            conversation_id=f"root-{project_id}",
+            current_phase="implementation",
+            now=10,
+        )
+
+    assert tuple(
+        tuple(row)
+        for row in runtime_conn.execute(
+            """
+            SELECT project_id, dispatch_membership_sequence
+            FROM project_runtime_state
+            ORDER BY dispatch_membership_sequence
+            """
+        )
+    ) == (("z-project", 1), ("a-project", 2))
+    assert _task7_membership_counters(runtime_conn)[0] == (
+        "dispatch",
+        2,
+    )
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="dispatch membership sequence is immutable",
+    ):
+        runtime_conn.execute(
+            """
+            UPDATE project_runtime_state
+            SET dispatch_membership_sequence = 3
+            WHERE project_id = 'z-project'
+            """
+        )
+    runtime_conn.rollback()
+
+
+def test_task7_dispatch_membership_migration_backfills_project_id_order(
+    runtime_conn,
+):
+    for project_id in ("z-existing", "a-existing", "m-existing"):
+        _insert_project(runtime_conn, project_id)
+        prdb.create_project_conversation(
+            runtime_conn,
+            project_id=project_id,
+            conversation_id=f"root-{project_id}",
+            current_phase="implementation",
+            now=10,
+        )
+    runtime_conn.executescript(
+        """
+        DROP TRIGGER trg_project_runtime_dispatch_membership_insert;
+        DROP TRIGGER trg_project_runtime_dispatch_membership_update;
+        UPDATE project_runtime_state
+        SET dispatch_membership_sequence = NULL;
+        UPDATE project_runtime_membership_counters
+        SET last_sequence = 0
+        WHERE lane = 'dispatch';
+        UPDATE project_operation_maintenance
+        SET task7_operation_migration_complete = 0
+        WHERE singleton = 1;
+        """
+    )
+    runtime_conn.commit()
+
+    prdb.ensure_schema(runtime_conn)
+
+    expected = (
+        ("a-existing", 1),
+        ("m-existing", 2),
+        ("z-existing", 3),
+    )
+    assert tuple(
+        tuple(row)
+        for row in runtime_conn.execute(
+            """
+            SELECT project_id, dispatch_membership_sequence
+            FROM project_runtime_state
+            ORDER BY dispatch_membership_sequence
+            """
+        )
+    ) == expected
+    assert _task7_membership_counters(runtime_conn)[0] == (
+        "dispatch",
+        3,
+    )
+
+    prdb.ensure_schema(runtime_conn)
+    assert tuple(
+        tuple(row)
+        for row in runtime_conn.execute(
+            """
+            SELECT project_id, dispatch_membership_sequence
+            FROM project_runtime_state
+            ORDER BY dispatch_membership_sequence
+            """
+        )
+    ) == expected
+
+
+def test_task7_dispatch_membership_counter_overflow_rolls_back_adoption(
+    runtime_conn,
+):
+    project_id = "overflow-project"
+    _insert_project(runtime_conn, project_id)
+    runtime_conn.execute(
+        """
+        UPDATE project_runtime_membership_counters
+        SET last_sequence = 9223372036854775807
+        WHERE lane = 'dispatch'
+        """
+    )
+    runtime_conn.commit()
+
+    with pytest.raises(
+        prdb.MembershipSequenceExhaustedError,
+        match="MEMBERSHIP_SEQUENCE_EXHAUSTED",
+    ):
+        prdb.create_project_conversation(
+            runtime_conn,
+            project_id=project_id,
+            conversation_id="root-overflow",
+            current_phase="implementation",
+            now=10,
+        )
+
+    assert runtime_conn.execute(
+        """
+        SELECT last_sequence
+        FROM project_runtime_membership_counters
+        WHERE lane = 'dispatch'
+        """
+    ).fetchone()[0] == 9223372036854775807
+    assert runtime_conn.execute(
+        """
+        SELECT COUNT(*) FROM project_runtime_state
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()[0] == 0
+    assert runtime_conn.execute(
+        """
+        SELECT COUNT(*) FROM project_conversations
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
@@ -905,6 +2279,7 @@ def test_task4_store_refuses_an_illegal_turn_control_edge(runtime_conn):
                 "attempt_id": None,
                 "lease_generation": 0,
                 "fencing_token": 0,
+                "transcript_applied_batch_id": None,
                 "created_at": 1,
                 "updated_at": 1,
             },
@@ -923,6 +2298,7 @@ def test_task4_store_refuses_an_illegal_turn_control_edge(runtime_conn):
                 "attempt_id": None,
                 "lease_generation": "0",
                 "fencing_token": 0,
+                "transcript_applied_batch_id": None,
                 "created_at": 1,
                 "updated_at": 1,
             },

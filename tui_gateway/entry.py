@@ -10,13 +10,16 @@ import hermes_bootstrap
 
 hermes_bootstrap.harden_import_path()
 
-import json
 import logging
 import signal
 import time
 import traceback
 
 from tui_gateway._stdin_recovery import handle_spurious_eof
+from tui_gateway.project_runtime_rpc import (
+    StrictJsonError,
+    strict_json_loads,
+)
 
 from tui_gateway import server
 from tui_gateway.server import _CRASH_LOG, dispatch, resolve_skin, write_json
@@ -415,9 +418,12 @@ def main():
             continue
 
         try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
-            if not write_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "parse error"}, "id": None}):
+            req = strict_json_loads(line)
+        except StrictJsonError as exc:
+            syntax_error = isinstance(exc.__cause__, ValueError)
+            code = -32700 if syntax_error else -32600
+            message = "parse error" if syntax_error else "invalid request"
+            if not write_json({"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": None}):
                 _log_exit("parse-error-response write failed (broken stdout pipe)")
                 sys.exit(0)
             continue

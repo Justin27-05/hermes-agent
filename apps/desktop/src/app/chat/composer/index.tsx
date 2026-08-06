@@ -948,6 +948,7 @@ export function ChatBar({
               its own --status-stack-measured-height so the thread's clearance
               accounts for it. Collapses to nothing when every status is empty. */}
           <ComposerStatusStack
+            managedSessionId={storedSessionId ?? sessionId}
             queue={
               quarantinedManagedPrompts.length > 0 ||
               quarantinedVoicePrompts.length > 0 ||

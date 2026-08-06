@@ -12,14 +12,19 @@ extracted functions reach back through the ``run_agent`` module via
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import json
+from collections.abc import Mapping
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from pathlib import Path
 import logging
 import os
 import random
 import threading
 import time
+from types import MappingProxyType
 from typing import Any, Optional
 
 from agent.display import (
@@ -30,6 +35,10 @@ from agent.display import (
     get_tool_emoji as _get_tool_emoji,
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
+)
+from agent.errors import (
+    ProjectExecutionControlSignal,
+    ProjectToolExecutionDenied,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_dispatch_helpers import (
@@ -51,6 +60,688 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProjectToolInvocation:
+    tool_call_id: str
+    canonical_action: str
+    arguments: Mapping[str, object]
+    route: str
+    effect_capable: bool
+    critical: bool
+
+
+@dataclass(frozen=True)
+class _PreparedProjectCall:
+    invocation: ProjectToolInvocation
+    decision: object
+
+
+@dataclass(frozen=True)
+class _PreparedProjectBatch:
+    agent: object
+    gate: object
+    execution: object
+    calls: Mapping[str, _PreparedProjectCall]
+    user_content: str
+    base_message_count: int
+
+
+_PROJECT_TOOL_BATCH: ContextVar[_PreparedProjectBatch | None] = ContextVar(
+    "hermes_project_tool_batch",
+    default=None,
+)
+_PROJECT_READ_ONLY_ACTIONS = frozenset(
+    {
+        "list_files",
+        "project_status",
+        "read_file",
+        "search_files",
+        "web_search",
+    }
+)
+_PROJECT_AGENT_LOOP_ACTIONS = frozenset(
+    {
+        "clarify",
+        "delegate_task",
+        "memory",
+        "session_search",
+        "skill_manage",
+        "todo",
+    }
+)
+_PROJECT_CRITICAL_ACTIONS = frozenset({"publish"})
+_PROJECT_DELIVERY_ACTIONS = frozenset(
+    {"event.deliver", "internal_delivery"}
+)
+_PROJECT_UNTRUSTED_ARGUMENT_FIELDS = frozenset(
+    {"metadata", "phase", "unknown_effect"}
+)
+
+
+def _project_canonical_action(function_name: str) -> str:
+    return (
+        f"read.{function_name}"
+        if function_name in _PROJECT_READ_ONLY_ACTIONS
+        else function_name
+    )
+
+
+def _freeze_project_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                str(key): _freeze_project_json(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_project_json(item) for item in value)
+    if type(value) in {str, int, float, bool} or value is None:
+        return value
+    raise ProjectToolExecutionDenied(
+        "project tool arguments are not canonical JSON"
+    )
+
+
+def _canonical_project_mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ProjectToolExecutionDenied(
+            "project tool arguments must be an object"
+        )
+    try:
+        detached = json.loads(
+            json.dumps(
+                dict(value),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ProjectToolExecutionDenied(
+            "project tool arguments are not finite canonical JSON"
+        ) from exc
+    frozen = _freeze_project_json(detached)
+    assert isinstance(frozen, Mapping)
+    return frozen
+
+
+def _canonical_project_mapping_json(value: Mapping[str, object]) -> str:
+    def thaw(item: object) -> object:
+        if isinstance(item, Mapping):
+            return {str(key): thaw(child) for key, child in item.items()}
+        if isinstance(item, tuple):
+            return [thaw(child) for child in item]
+        return item
+
+    return json.dumps(
+        thaw(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _complete_project_immediate(value: object, *, label: str) -> object:
+    await_method = getattr(value, "__await__", None)
+    if not callable(await_method):
+        return value
+    iterator = await_method()
+    try:
+        next(iterator)
+    except StopIteration as complete:
+        return complete.value
+    except BaseException:
+        raise
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
+    raise RuntimeError(f"{label} suspended outside the project owner loop")
+
+
+def _call_project_authority(
+    callback: Any,
+    *args: object,
+    label: str,
+    agent: object | None = None,
+    gate: object | None = None,
+) -> object:
+    try:
+        value = callback(*args)
+        if agent is not None and gate is not None:
+            return _project_bridge_call(agent, gate, value)
+        return _complete_project_immediate(value, label=label)
+    except ProjectExecutionControlSignal:
+        raise
+    except PermissionError as exc:
+        raise ProjectToolExecutionDenied(
+            str(exc) or f"{label} failed closed"
+        ) from exc
+    except Exception as exc:
+        raise ProjectToolExecutionDenied(
+            f"{label} failed closed"
+        ) from exc
+
+
+def _project_bridge_call(agent: object, gate: object, value: object) -> object:
+    await_method = getattr(value, "__await__", None)
+    if not callable(await_method):
+        return value
+
+    def close_source() -> None:
+        close = getattr(value, "close", None)
+        if callable(close):
+            try:
+                close()
+            except BaseException:
+                logger.warning(
+                    "project bridge source cleanup failed",
+                    exc_info=True,
+                )
+
+    owner_loop = getattr(gate, "owner_loop", None)
+    agent_owner_loop = getattr(
+        agent,
+        "_project_execution_owner_loop",
+        None,
+    )
+    if not (
+        isinstance(owner_loop, asyncio.AbstractEventLoop)
+        and owner_loop is agent_owner_loop
+        and owner_loop.is_running()
+    ):
+        close_source()
+        raise RuntimeError("project execution owner loop is unavailable")
+
+    async def await_value() -> object:
+        return await value
+
+    wrapper = await_value()
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            wrapper,
+            owner_loop,
+        )
+    except BaseException:
+        try:
+            wrapper.close()
+        finally:
+            close_source()
+        raise
+    return future.result()
+
+
+def _project_execution_for_gate(gate: object) -> object:
+    execution = getattr(gate, "execution", None)
+    if execution is None:
+        raise ProjectToolExecutionDenied(
+            "project execution context is not bound"
+        )
+    return execution
+
+
+def _project_live_transcript(
+    messages: list,
+) -> tuple[Mapping[str, object], ...]:
+    user_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, Mapping) and message.get("role") == "user":
+            user_index = index
+            break
+    if user_index < 0:
+        raise ProjectToolExecutionDenied(
+            "project turn has no canonical user boundary"
+        )
+    boundary_end = len(messages)
+    if boundary_end > user_index + 1:
+        latest = messages[-1]
+        if (
+            isinstance(latest, Mapping)
+            and latest.get("role") == "assistant"
+            and latest.get("tool_calls")
+        ):
+            boundary_end -= 1
+    transcript: list[Mapping[str, object]] = []
+    for message in messages[user_index + 1 : boundary_end]:
+        if not isinstance(message, Mapping):
+            raise ProjectToolExecutionDenied(
+                "project transcript is malformed"
+            )
+        transcript.append(
+            MappingProxyType(
+                json.loads(
+                    json.dumps(
+                        dict(message),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                )
+            )
+        )
+    return tuple(transcript)
+
+
+def _project_current_user(
+    messages: list,
+) -> tuple[str, int]:
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, Mapping) and message.get("role") == "user":
+            content = message.get("content")
+            if type(content) is not str:
+                raise ProjectToolExecutionDenied(
+                    "project user message is not canonical text"
+                )
+            return content, index
+    raise ProjectToolExecutionDenied(
+        "project turn has no canonical user message"
+    )
+
+
+def _project_tool_call(
+    agent: object,
+    tool_call: object,
+) -> tuple[str, Mapping[str, object], bool]:
+    function = getattr(tool_call, "function", None)
+    name = getattr(function, "name", None)
+    tool_call_id = getattr(tool_call, "id", None)
+    raw_arguments = getattr(function, "arguments", None)
+    if not (
+        type(name) is str
+        and bool(name)
+        and type(tool_call_id) is str
+        and bool(tool_call_id)
+        and type(raw_arguments) is str
+    ):
+        raise ProjectToolExecutionDenied(
+            "project tool invocation is malformed"
+        )
+    try:
+        arguments = json.loads(raw_arguments)
+    except (TypeError, ValueError) as exc:
+        raise ProjectToolExecutionDenied(
+            "project tool arguments are malformed"
+        ) from exc
+    canonical_arguments = _canonical_project_mapping(arguments)
+    unwrapped = False
+    try:
+        from tools import tool_search as tool_search
+
+        if name == tool_search.TOOL_CALL_NAME:
+            underlying, underlying_arguments, error = (
+                tool_search.resolve_underlying_call(
+                    json.loads(
+                        _canonical_project_mapping_json(
+                            canonical_arguments
+                        )
+                    )
+                )
+            )
+            if (
+                error
+                or type(underlying) is not str
+                or not underlying
+                or underlying == tool_search.TOOL_CALL_NAME
+                or not isinstance(underlying_arguments, Mapping)
+                or underlying not in _tool_search_scoped_names(agent)
+            ):
+                raise ProjectToolExecutionDenied(
+                    "project tool unwrap is not a single registered call"
+                )
+            name = underlying
+            canonical_arguments = _canonical_project_mapping(
+                underlying_arguments
+            )
+            unwrapped = True
+    except ProjectExecutionControlSignal:
+        raise
+    except Exception as exc:
+        raise ProjectToolExecutionDenied(
+            "project tool unwrap failed closed"
+        ) from exc
+    return name, canonical_arguments, unwrapped
+
+
+def _project_effect_capable(
+    name: str,
+    arguments: Mapping[str, object],
+) -> bool:
+    return (
+        name not in _PROJECT_READ_ONLY_ACTIONS
+        or bool(_PROJECT_UNTRUSTED_ARGUMENT_FIELDS.intersection(arguments))
+    )
+
+
+def _project_route(
+    name: str,
+    *,
+    batch_route: str,
+    unwrapped: bool,
+) -> str:
+    if unwrapped:
+        return "mcp_single_unwrapped"
+    if batch_route in {"concurrent", "segmented"}:
+        return batch_route
+    if name in _PROJECT_AGENT_LOOP_ACTIONS:
+        return "agent_loop"
+    if name == "c14_effect":
+        return "registry"
+    if name in _PROJECT_DELIVERY_ACTIONS:
+        return "direct"
+    return "sequential"
+
+
+def prepare_project_tool_batch(
+    agent: object,
+    assistant_message: object,
+    messages: list,
+    effective_task_id: str,
+) -> tuple[Token, bool]:
+    del effective_task_id
+    gate = getattr(agent, "project_execution_gate", None)
+    if gate is None:
+        raise RuntimeError("project gate is unavailable")
+    execution = _project_execution_for_gate(gate)
+    calls = tuple(getattr(assistant_message, "tool_calls", ()) or ())
+    if not calls:
+        raise ProjectToolExecutionDenied("project tool batch is empty")
+
+    decoded: list[tuple[object, str, Mapping[str, object], bool]] = []
+    for tool_call in calls:
+        name, arguments, unwrapped = _project_tool_call(
+            agent,
+            tool_call,
+        )
+        decoded.append((tool_call, name, arguments, unwrapped))
+    effect_flags = tuple(
+        _project_effect_capable(name, arguments)
+        for _, name, arguments, _ in decoded
+    )
+    if len(decoded) > 1 and any(effect_flags) and not all(effect_flags):
+        batch_route = "segmented"
+    elif len(decoded) > 1 and not any(effect_flags):
+        batch_route = "concurrent"
+    else:
+        batch_route = "sequential"
+
+    invocations = tuple(
+        ProjectToolInvocation(
+            tool_call_id=getattr(tool_call, "id"),
+            canonical_action=_project_canonical_action(name),
+            arguments=arguments,
+            route=_project_route(
+                name,
+                batch_route=batch_route,
+                unwrapped=unwrapped,
+            ),
+            effect_capable=effect_capable,
+            critical=name in _PROJECT_CRITICAL_ACTIONS,
+        )
+        for (
+            tool_call,
+            name,
+            arguments,
+            unwrapped,
+        ), effect_capable in zip(decoded, effect_flags, strict=True)
+    )
+    if len({item.tool_call_id for item in invocations}) != len(invocations):
+        raise ProjectToolExecutionDenied(
+            "project tool call identities are not unique"
+        )
+
+    transcript = _project_live_transcript(messages)
+    classify_batch = getattr(gate, "classify_batch", None)
+    if callable(classify_batch):
+        classified = _call_project_authority(
+            classify_batch,
+            execution,
+            invocations,
+            transcript,
+            label="project batch classifier",
+            agent=agent,
+            gate=gate,
+        )
+        try:
+            classified_items = tuple(classified)
+        except TypeError as exc:
+            raise ProjectToolExecutionDenied(
+                "project batch classifier returned malformed authority"
+            ) from exc
+        if (
+            len(classified_items) != len(invocations)
+            or any(
+                classified is not original
+                for classified, original in zip(
+                    classified_items,
+                    invocations,
+                    strict=True,
+                )
+            )
+        ):
+            raise ProjectToolExecutionDenied(
+                "project batch classifier changed an invocation"
+            )
+
+    critical = tuple(
+        item for item in invocations if item.critical
+    )
+    effectful = tuple(
+        item for item in invocations if item.effect_capable
+    )
+    if len(critical) > 1 or (critical and len(effectful) > 1):
+        raise ProjectToolExecutionDenied(
+            "critical project batch denied"
+        )
+
+    authorize = getattr(gate, "authorize", None)
+    if not callable(authorize):
+        raise ProjectToolExecutionDenied(
+            "project tool authorizer is unavailable"
+    )
+    prepared: dict[str, _PreparedProjectCall] = {}
+    for invocation in invocations:
+        decision = _call_project_authority(
+            authorize,
+            execution,
+            invocation,
+            transcript,
+            label="project tool authorization",
+            agent=agent,
+            gate=gate,
+        )
+        action = getattr(decision, "action", None)
+        if action == "deny":
+            raise ProjectToolExecutionDenied(
+                "project tool execution denied"
+            )
+        if action not in {
+            "allow_read_only",
+            "typed_project_operation",
+        }:
+            raise ProjectToolExecutionDenied(
+                "project tool authorizer returned malformed authority"
+            )
+        if action == "typed_project_operation" and (
+            getattr(decision, "authority", None) is None
+            or getattr(decision, "policy", None) is None
+        ):
+            raise ProjectToolExecutionDenied(
+                "typed project operation authority is incomplete"
+            )
+        prepared[invocation.tool_call_id] = _PreparedProjectCall(
+            invocation,
+            decision,
+        )
+
+    user_content, derived_base_message_count = _project_current_user(
+        messages
+    )
+    base_message_count = getattr(
+        gate,
+        "base_message_count",
+        derived_base_message_count,
+    )
+    if type(base_message_count) is not int or base_message_count < 0:
+        raise ProjectToolExecutionDenied(
+            "project transcript authority is malformed"
+        )
+    state = _PreparedProjectBatch(
+        agent,
+        gate,
+        execution,
+        MappingProxyType(prepared),
+        user_content,
+        base_message_count,
+    )
+    token = _PROJECT_TOOL_BATCH.set(state)
+    return token, bool(effectful)
+
+
+def clear_project_tool_batch(token: Token | None) -> None:
+    if token is not None:
+        _PROJECT_TOOL_BATCH.reset(token)
+
+
+def execute_prepared_project_tool(
+    agent: object,
+    tool_call: object,
+    function_name: str,
+    function_args: Mapping[str, object],
+) -> tuple[bool, object | None]:
+    state = _PROJECT_TOOL_BATCH.get()
+    if state is None or state.agent is not agent:
+        raise ProjectToolExecutionDenied(
+            "project tool batch authority is unavailable"
+        )
+    tool_call_id = getattr(tool_call, "id", None)
+    prepared = state.calls.get(tool_call_id)
+    if prepared is None:
+        raise ProjectToolExecutionDenied(
+            "project tool call was not preauthorized"
+        )
+    invocation = prepared.invocation
+    actual_arguments = _canonical_project_mapping(function_args)
+    if (
+        invocation.canonical_action
+        != _project_canonical_action(function_name)
+        or _canonical_project_mapping_json(invocation.arguments)
+        != _canonical_project_mapping_json(actual_arguments)
+    ):
+        raise ProjectToolExecutionDenied(
+            "project tool invocation changed after authorization"
+        )
+    decision = prepared.decision
+    action = getattr(decision, "action", None)
+    if action == "allow_read_only":
+        return False, None
+    if action != "typed_project_operation":
+        raise ProjectToolExecutionDenied(
+            "project tool authority is no longer valid"
+        )
+
+    authority = getattr(decision, "authority", None)
+    policy = getattr(decision, "policy", None)
+    approval = getattr(decision, "approval", None)
+    if approval is None:
+        coordinator = getattr(
+            state.gate,
+            "typed_project_operation",
+            None,
+        )
+        if not callable(coordinator):
+            raise ProjectToolExecutionDenied(
+                "typed project operation coordinator is unavailable"
+            )
+        result = _project_bridge_call(
+            agent,
+            state.gate,
+            coordinator(state.execution, authority, policy),
+        )
+        operation_id = getattr(
+            getattr(authority, "intent", None),
+            "operation_id",
+            None,
+        )
+        expected = json.dumps(
+            {
+                "operation_id": operation_id,
+                "status": "reconciled",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if type(operation_id) is not str or result != expected:
+            raise RuntimeError(
+                "typed project operation returned a nondeterministic result"
+            )
+        return True, result
+
+    checkpoint = getattr(
+        state.gate,
+        "checkpoint_operation_intent",
+        None,
+    )
+    if not callable(checkpoint):
+        raise ProjectToolExecutionDenied(
+            "project approval checkpoint coordinator is unavailable"
+        )
+    approval_id = getattr(approval, "approval_id", None)
+    operation_id = getattr(
+        getattr(authority, "intent", None),
+        "operation_id",
+        None,
+    )
+    if not (
+        type(approval_id) is str
+        and approval_id
+        and type(operation_id) is str
+        and operation_id
+    ):
+        raise ProjectToolExecutionDenied(
+            "project approval authority is malformed"
+        )
+    checkpoint_messages = (
+        {"role": "user", "content": state.user_content},
+        {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "approval_id": approval_id,
+                    "kind": "project_operation_awaiting_approval",
+                    "operation_id": operation_id,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        },
+    )
+    _project_bridge_call(
+        agent,
+        state.gate,
+        checkpoint(
+            state.execution,
+            authority,
+            policy,
+            approval,
+            base_message_count=state.base_message_count,
+            messages=checkpoint_messages,
+        ),
+    )
+    raise RuntimeError(
+        "project approval checkpoint returned without a dedicated signal"
+    )
 
 
 def _ensure_file_checkpoint(
@@ -442,6 +1133,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         }, ensure_ascii=False)
         except Exception:
             pass
+
+        if getattr(agent, "project_execution_gate", None) is not None:
+            handled, project_result = execute_prepared_project_tool(
+                agent,
+                tool_call,
+                function_name,
+                function_args,
+            )
+            if handled:
+                raise RuntimeError(
+                    "effect-capable project calls cannot enter "
+                    "the concurrent executor"
+                )
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
@@ -1122,6 +1826,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         )
         except Exception:
             pass
+
+        if getattr(agent, "project_execution_gate", None) is not None:
+            handled, project_result = execute_prepared_project_tool(
+                agent,
+                tool_call,
+                function_name,
+                function_args,
+            )
+            if handled:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": function_name,
+                        "tool_call_id": tool_call.id,
+                        "content": project_result,
+                    }
+                )
+                continue
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,

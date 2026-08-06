@@ -20,6 +20,7 @@ from gateway.stream_events import (
     MessageStop,
     ToolCallChunk,
     ToolCallFinished,
+    canonical_project_event_notice,
 )
 
 
@@ -180,3 +181,30 @@ def test_dispatch_swallows_render_errors():
     adapter.render_message_event = _boom
     d = GatewayEventDispatcher(adapter, _FakeSink())
     d.dispatch(MessageChunk("x"))  # must not raise
+
+
+def test_project_event_notice_is_only_a_replay_hint():
+    from types import MappingProxyType
+
+    from hermes_cli.project_events import ProjectEvent
+
+    event = ProjectEvent(
+        event_id="event-1",
+        project_id="project-1",
+        sequence=7,
+        kind="run.progress",
+        turn_id="turn-1",
+        payload=MappingProxyType({"text": "not-for-live-hint"}),
+        created_at="2026-07-29T00:00:00Z",
+    )
+
+    notice = canonical_project_event_notice(event)
+
+    assert notice == GatewayNotice(
+        kind="project_event",
+        extra={
+            "event_id": "event-1",
+            "project_id": "project-1",
+            "sequence": 7,
+        },
+    )

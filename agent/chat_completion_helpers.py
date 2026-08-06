@@ -433,13 +433,20 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
 
 
 def should_use_direct_api_call(agent) -> bool:
-    """Whether a cron OpenAI-wire request should skip the interrupt worker.
+    """Whether an already-managed request should skip the interrupt worker.
 
     Issue #62151 is specific to OpenRouter's chat-completions path inside the
     gateway cron thread stack. Keep native/Codex/Bedrock/MoA transports on their
     established workers: their cancellation and client ownership differ, and
     the report provides no evidence that those paths share the pre-HTTP wedge.
+
+    Project turns already run in the gateway's retained agent executor and bind
+    cancellation through their execution gate. A second daemon request thread
+    would escape that ownership boundary, so every project transport stays on
+    the retained conversation worker.
     """
+    if getattr(agent, "_hermetic_project_mode", False):
+        return True
     return (
         getattr(agent, "platform", None) == "cron"
         and getattr(agent, "api_mode", None) == "chat_completions"
@@ -459,24 +466,42 @@ def direct_api_call(agent, api_kwargs: dict):
     """
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
-    request_client_holder = {"client": None}
+    request_client_holder = {"client": None, "kind": "openai"}
     request_client_lock = threading.Lock()
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from cron's watchdog/interrupt thread."""
         with request_client_lock:
             request_client = request_client_holder["client"]
+            request_client_kind = request_client_holder["kind"]
         if request_client is not None:
-            agent._abort_request_openai_client(request_client, reason=reason)
+            if request_client_kind == "anthropic_messages":
+                agent._abort_request_anthropic_client(
+                    request_client,
+                    reason=reason,
+                )
+            else:
+                agent._abort_request_openai_client(
+                    request_client,
+                    reason=reason,
+                )
 
     def _make_client(reason: str, kind: str = "openai"):
         # direct_api_call only runs for OpenAI-wire chat_completions cron
         # requests (see should_use_direct_api_call), so the anthropic branch of
         # the dispatch — the only caller that passes kind — is never reached
         # here; the ``kind`` parameter exists purely for signature parity.
-        client = agent._create_request_openai_client(reason=reason, api_kwargs=api_kwargs)
+        client = (
+            agent._create_request_anthropic_client(reason=reason)
+            if kind == "anthropic_messages"
+            else agent._create_request_openai_client(
+                reason=reason,
+                api_kwargs=api_kwargs,
+            )
+        )
         with request_client_lock:
             request_client_holder["client"] = client
+            request_client_holder["kind"] = kind
         agent._active_request_abort = _abort_active_request
         return client
 
@@ -498,9 +523,19 @@ def direct_api_call(agent, api_kwargs: dict):
             agent._active_request_abort = None
         with request_client_lock:
             request_client = request_client_holder["client"]
+            request_client_kind = request_client_holder["kind"]
             request_client_holder["client"] = None
         if request_client is not None:
-            agent._close_request_openai_client(request_client, reason="request_complete")
+            if request_client_kind == "anthropic_messages":
+                agent._close_request_anthropic_client(
+                    request_client,
+                    reason="request_complete",
+                )
+            else:
+                agent._close_request_openai_client(
+                    request_client,
+                    reason="request_complete",
+                )
 
 
 def interruptible_api_call(agent, api_kwargs: dict):

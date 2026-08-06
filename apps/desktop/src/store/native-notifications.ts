@@ -3,8 +3,15 @@ import { atom } from 'nanostores'
 import { persistString, storedString } from '@/lib/storage'
 
 import { $gateway } from './gateway'
-import { clearApprovalRequest } from './prompts'
+import { $activeGatewayProfile, normalizeProfileKey } from './profile'
+import {
+  type ManagedProjectApproval,
+  managedProjectApprovalForSurface,
+  resolveManagedProjectApproval
+} from './project-approval'
+import { type ApprovalRequest, clearApprovalRequest, sessionApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
+import { $sessionStates } from './session-states'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
 // toast feed in `notifications.ts`. Each kind toggles independently.
@@ -138,6 +145,14 @@ export interface NativeNotificationAction {
   text: string
 }
 
+export type NativeApprovalNotificationContext =
+  | { approval: ManagedProjectApproval; kind: 'managed' }
+  | { kind: 'legacy'; token: string }
+
+export type NativeApprovalNotificationSource =
+  | { approval: ManagedProjectApproval; kind: 'managed' }
+  | { kind: 'legacy'; request: ApprovalRequest }
+
 export interface NativeNotificationInput {
   kind: NativeNotificationKind
   title: string
@@ -151,6 +166,56 @@ export interface NativeNotificationInput {
   global?: boolean
   silent?: boolean
   actions?: NativeNotificationAction[]
+  approvalSource?: NativeApprovalNotificationSource
+}
+
+interface LegacyApprovalRegistration {
+  gateway: ReturnType<typeof $gateway.get>
+  profile: string
+  request: ApprovalRequest
+  sessionId: null | string
+}
+
+const MAX_LEGACY_APPROVAL_REGISTRATIONS = 64
+const legacyApprovalRegistrations = new Map<string, LegacyApprovalRegistration>()
+let legacyApprovalSequence = 0
+
+function registerApprovalNotification(
+  source: NativeApprovalNotificationSource | undefined
+): NativeApprovalNotificationContext | undefined {
+  if (!source) {
+    return undefined
+  }
+
+  if (source.kind === 'managed') {
+    return { approval: { ...source.approval }, kind: 'managed' }
+  }
+
+  for (const [token, registered] of legacyApprovalRegistrations) {
+    if (registered.sessionId === source.request.sessionId) {
+      legacyApprovalRegistrations.delete(token)
+    }
+  }
+
+  const token = `legacy-approval-${Date.now()}-${++legacyApprovalSequence}`
+  legacyApprovalRegistrations.set(token, {
+    gateway: $gateway.get(),
+    profile: normalizeProfileKey($activeGatewayProfile.get()),
+    request: source.request,
+    sessionId: source.request.sessionId
+  })
+
+  while (legacyApprovalRegistrations.size > MAX_LEGACY_APPROVAL_REGISTRATIONS) {
+    const oldest = legacyApprovalRegistrations.keys().next().value as string | undefined
+
+    if (!oldest) {
+      break
+    }
+
+    legacyApprovalRegistrations.delete(oldest)
+  }
+
+  return { kind: 'legacy', token }
 }
 
 export function dispatchNativeNotification(input: NativeNotificationInput): void {
@@ -168,8 +233,11 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     return
   }
 
+  const approvalContext = input.kind === 'approval' ? registerApprovalNotification(input.approvalSource) : undefined
+
   void window.hermesDesktop?.notify({
     actions: input.actions,
+    approvalContext,
     body: input.body,
     kind: input.kind,
     sessionId: input.sessionId ?? undefined,
@@ -179,17 +247,83 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
 }
 
 // Resolve a pending approval from a notification button, mirroring the in-app
-// Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+// Run/Reject bar. The transported context identifies the exact prompt that
+// created this notification; session id alone never authorizes a response.
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  actionId: string,
+  approvalContext?: NativeApprovalNotificationContext
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
-  if (!choice) {
+  if (!choice || !approvalContext || typeof approvalContext !== 'object') {
     return
   }
 
+  const storedSessionId = sessionId ? $sessionStates.get()[sessionId]?.storedSessionId : null
+
+  // A notification callback only carries the ephemeral gateway id. Never
+  // reinterpret it as durable identity: the runtime cache is the upstream
+  // authority that paired this live process id with its stored conversation.
+  if (!sessionId || !storedSessionId) {
+    return
+  }
+
+  const managedSelection = managedProjectApprovalForSurface(sessionId, storedSessionId).get()
+
+  if (approvalContext.kind === 'managed') {
+    if (!approvalContext.approval || typeof approvalContext.approval !== 'object') {
+      return
+    }
+
+    const current = managedSelection.approval
+
+    if (
+      !managedSelection.managed ||
+      !current ||
+      current.approvalId !== approvalContext.approval.approvalId ||
+      current.approvalKind !== approvalContext.approval.approvalKind ||
+      current.bindingId !== approvalContext.approval.bindingId ||
+      current.projectId !== approvalContext.approval.projectId ||
+      current.requesterGeneration !== approvalContext.approval.requesterGeneration ||
+      current.requesterScope !== approvalContext.approval.requesterScope ||
+      current.runtimeSessionId !== approvalContext.approval.runtimeSessionId ||
+      current.sessionId !== approvalContext.approval.sessionId ||
+      current.storedSessionId !== approvalContext.approval.storedSessionId ||
+      current.version !== approvalContext.approval.version
+    ) {
+      return
+    }
+
+    clearApprovalRequest(sessionId)
+
+    try {
+      await resolveManagedProjectApproval(approvalContext.approval, choice === 'once' ? 'approved' : 'denied')
+    } catch {
+      // Canonical state remains authoritative and the in-app managed surface
+      // exposes conflict/retry/failure feedback.
+    }
+
+    return
+  }
+
+  if (approvalContext.kind !== 'legacy' || typeof approvalContext.token !== 'string') {
+    return
+  }
+
+  const registered = legacyApprovalRegistrations.get(approvalContext.token)
+  legacyApprovalRegistrations.delete(approvalContext.token)
   const gateway = $gateway.get()
 
-  if (!gateway) {
+  if (
+    managedSelection.managed ||
+    !registered ||
+    !gateway ||
+    registered.gateway !== gateway ||
+    registered.profile !== normalizeProfileKey($activeGatewayProfile.get()) ||
+    registered.sessionId !== sessionId ||
+    sessionApprovalRequest(sessionId).get() !== registered.request
+  ) {
     return
   }
 

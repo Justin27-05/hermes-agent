@@ -97,6 +97,7 @@ export function SidebarSessionRow({
       pinned={isPinned}
       profile={session.profile}
       sessionId={session.id}
+      storedSession={session}
       title={title}
     >
       <SidebarRowShell
@@ -115,6 +116,7 @@ export function SidebarSessionRow({
               pinned={isPinned}
               profile={session.profile}
               sessionId={session.id}
+              storedSession={session}
               title={title}
               tooltip={r.actionsFor(title)}
             >

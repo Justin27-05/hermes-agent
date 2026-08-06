@@ -24,9 +24,15 @@ import {
   stopBackgroundProcess
 } from '@/store/composer-status'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
+import {
+  $managedComposerActionsBySession,
+  $managedComposerAmbiguitiesBySession,
+  retryManagedComposerPrompt
+} from '@/store/project-composer-queue'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
+import { ManagedProjectActionRow } from './managed-project-action-row'
 import { PreviewStatusRow } from './preview-row'
 import { StatusItemRow } from './status-row'
 
@@ -58,6 +64,7 @@ const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
 interface ComposerStatusStackProps {
   /** The queue, built by the composer (it owns the queue's callbacks). Rendered
    *  as the last group so it stays fused to the composer like before. */
+  managedSessionId?: null | string
   queue: ReactNode
   sessionId: null | string
 }
@@ -67,11 +74,13 @@ interface ComposerStatusStackProps {
  * every session-scoped status — subagents, background tasks, queue — grouped by
  * type and separated by light dividers. Collapses to nothing when empty.
  */
-export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackProps) {
+export function ComposerStatusStack({ managedSessionId, queue, sessionId }: ComposerStatusStackProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
   const itemsBySession = useStore($statusItemsBySession)
   const previewsBySession = useStore($previewStatusBySession)
+  const managedActionsBySession = useStore($managedComposerActionsBySession)
+  const managedAmbiguitiesBySession = useStore($managedComposerAmbiguitiesBySession)
   const scrolledUp = useStore($threadScrolledUp)
   const billing = useStore($billingBlock)
 
@@ -126,12 +135,50 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const previewBlock = <div className="px-1 py-0.5">{previewRows}</div>
 
   const sections: { key: string; node: ReactNode }[] = []
+  const managedStatusSessionId = managedSessionId ?? sessionId
+  const managedAction = managedStatusSessionId ? managedActionsBySession[managedStatusSessionId] : undefined
+  const managedAmbiguous = managedStatusSessionId ? managedAmbiguitiesBySession[managedStatusSessionId] : undefined
 
   // Billing wall sits at the very top of the stack — it's the most important
   // thing above the composer when the account is out of credits. Rendered here
   // (not as a composer-disable) so slash commands stay usable.
   if (billing && sessionId && billing.sessionId === sessionId) {
     sections.push({ key: 'billing', node: <BillingBanner sessionId={sessionId} /> })
+  }
+
+  if (managedAction && managedStatusSessionId) {
+    sections.push({
+      key: 'managed-project-action',
+      node: (
+        <StatusSection
+          defaultCollapsed={false}
+          icon={<Codicon className="text-amber-500/80" name="sync-ignored" size="0.8rem" />}
+          label={t.statusStack.managedProject.title}
+        >
+          <ManagedProjectActionRow
+            action={managedAction}
+            onRetry={() => void retryManagedComposerPrompt(managedStatusSessionId).catch(() => undefined)}
+          />
+        </StatusSection>
+      )
+    })
+  }
+
+  if (managedAmbiguous) {
+    sections.push({
+      key: 'managed-project-ambiguity',
+      node: (
+        <StatusSection
+          defaultCollapsed={false}
+          icon={<Codicon className="text-amber-500/80" name="warning" size="0.8rem" />}
+          label={t.statusStack.managedProject.title}
+        >
+          <div className="px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+            {t.statusStack.managedProject.ambiguousSession}
+          </div>
+        </StatusSection>
+      )
+    })
   }
 
   for (const group of groups) {

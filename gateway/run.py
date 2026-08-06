@@ -28,6 +28,8 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import functools
+import hashlib
 import inspect
 import json
 import logging
@@ -42,9 +44,12 @@ import threading
 import time
 import sqlite3
 from collections import OrderedDict
-from contextvars import copy_context
+from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime
+from types import MappingProxyType, SimpleNamespace
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Union, cast
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -83,6 +88,10 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # wall deadlines plus readiness; other platforms retain the 30s isolation bound.
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# Background watchers are already cancelled before this join.  Bound the
+# final quiescence wait so a watcher which suppresses CancelledError cannot
+# prevent the remaining database and executor teardown from running.
+_BACKGROUND_TASK_JOIN_TIMEOUT_SECONDS = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
@@ -2102,6 +2111,10 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
+    ProjectApprovalCheckpointReadFacade,
+    ProjectBatchSettlementFacade,
+    ProjectBatchWorkerFacade,
+    ProjectTask7TerminalReadbackFacade,
     SessionEntry,
     SessionStore,
     SessionSource,
@@ -2112,6 +2125,33 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+)
+from gateway.project_runtime_dispatcher import (
+    ProjectDispatcherOperationFacade,
+    ProjectDispatcherRuntimeFacade,
+    ProjectRuntimeDispatcher,
+)
+from gateway.project_runtime_worker import (
+    BoundProjectOperationAuthority,
+    CanonicalApprovedOperationTurn,
+    CanonicalProjectOperationCheckpointCoordinator,
+    CanonicalProjectOperationExecutionCoordinator,
+    CanonicalProjectRuntimeWorker,
+    GatewayProjectAgentFactory,
+    ProjectAgentRevisions,
+    ProjectOperationExecutionFacade,
+    ProjectOperationPrepareFacade,
+    ProjectRuntimeWorkerFacade,
+    ProjectToolPolicySnapshotFacade,
+    canonical_uuid4,
+)
+from hermes_cli.project_policy import (
+    ActorContext,
+    ContractPolicyView,
+    ProjectBindingView,
+    ProjectCommand,
+    ProjectPolicyView,
+    decide as decide_project_policy,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -2334,6 +2374,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "guardrail_config": runtime.get("guardrail_config"),
     }
 
 
@@ -3257,6 +3298,517 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+_PROJECT_TURN_CONTEXT: ContextVar[object | None] = ContextVar(
+    "hermes_project_turn_context",
+    default=None,
+)
+
+
+def _freeze_project_value(value: object) -> object:
+    """Detach one composition-time value into the closed project snapshot."""
+    if value is None or type(value) in {bool, int, float, str, bytes}:
+        return value
+    if isinstance(value, Path):
+        return value
+    if type(value) is ProjectAgentRevisions:
+        return value
+    if isinstance(value, Mapping):
+        if not all(type(key) is str for key in value):
+            raise TypeError("project snapshot mappings require string keys")
+        return MappingProxyType(
+            {
+                key: _freeze_project_value(nested)
+                for key, nested in value.items()
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_project_value(nested) for nested in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_project_value(nested) for nested in value)
+    raise TypeError(
+        "project snapshot contains a non-freezable dependency: "
+        f"{type(value).__name__}"
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _FrozenProjectAgentSnapshot:
+    runtime_kind: str
+    resolved_agent: str
+    resolved_provider: str
+    registry_generation: object
+    declared_registry_generation: object
+    base_signature: str
+    declared_base_signature: str
+    tool_revision: str
+    declared_tool_revision: str
+    model_revision: str
+    declared_model_revision: str
+    revisions: ProjectAgentRevisions
+    constructor_kwargs: Mapping[str, object]
+    tool_descriptors: tuple[str, ...]
+    tool_schemas: tuple[Mapping[str, object], ...]
+    enabled_toolsets: tuple[str, ...]
+    prompt_cache_settings: Mapping[str, object]
+    memory_settings: Mapping[str, object]
+    skill_settings: Mapping[str, object]
+    compression_settings: Mapping[str, object]
+    runtime_settings: Mapping[str, object]
+
+
+def _compose_frozen_project_agent_snapshot() -> _FrozenProjectAgentSnapshot:
+    """Resolve every live agent dependency once, before project execution."""
+    from hermes_cli.timeouts import get_provider_request_timeout
+    from run_agent import get_tool_definitions
+    from tools.registry import registry
+    from utils import env_float
+
+    config = _load_gateway_runtime_config()
+    model = _resolve_gateway_model(config)
+    model_config = config.get("model", {}) if isinstance(config, dict) else {}
+    requested_provider = (
+        model_config.get("provider")
+        if isinstance(model_config, dict)
+        else None
+    )
+    if not isinstance(requested_provider, str) or not requested_provider:
+        requested_provider = "openai"
+    runtime = dict(
+        _resolve_runtime_agent_kwargs_for_provider(requested_provider)
+    )
+    if runtime.get("provider") == "moa":
+        raise PermissionError(
+            "MoA runtime is unavailable for project execution"
+        )
+    if (
+        runtime.get("max_tokens") is None
+        and isinstance(model_config, dict)
+        and type(model_config.get("max_tokens")) is int
+    ):
+        runtime["max_tokens"] = model_config["max_tokens"]
+
+    toolset_config = (
+        config.get("platform_toolsets", {})
+        if isinstance(config, dict)
+        else {}
+    )
+    enabled_raw = (
+        toolset_config.get("local", ())
+        if isinstance(toolset_config, dict)
+        else ()
+    )
+    enabled_toolsets = tuple(
+        str(value)
+        for value in enabled_raw
+        if isinstance(value, str) and value
+    )
+    tool_schema_rows = get_tool_definitions(
+        enabled_toolsets=list(enabled_toolsets),
+        disabled_toolsets=None,
+    )
+    frozen_tool_schemas = _freeze_project_value(tool_schema_rows)
+    if not isinstance(frozen_tool_schemas, tuple):
+        raise TypeError("project tool schemas must freeze to a tuple")
+    tool_descriptors = tuple(
+        str(schema.get("function", {}).get("name", ""))
+        for schema in tool_schema_rows
+        if isinstance(schema, Mapping)
+        and isinstance(schema.get("function"), Mapping)
+        and schema.get("function", {}).get("name")
+    )
+    registry_generation = getattr(registry, "_generation", None)
+    prompt_cache = GatewayRunner._extract_cache_busting_config(config)
+    base_signature = GatewayRunner._agent_config_signature(
+        model,
+        runtime,
+        list(enabled_toolsets),
+        "",
+        prompt_cache,
+    )
+    resolved_provider = str(
+        runtime.get("provider") or requested_provider
+    )
+    request_timeout = get_provider_request_timeout(
+        resolved_provider,
+        model,
+    )
+    if request_timeout is None:
+        request_timeout = env_float("HERMES_API_TIMEOUT", 1800.0)
+    tool_revision = (
+        f"generation={registry_generation};"
+        f"toolsets={','.join(enabled_toolsets)};"
+        f"tools={','.join(tool_descriptors)}"
+    )
+    model_revision = (
+        "hermes:"
+        f"model={model};provider={resolved_provider};"
+        f"base_url={runtime.get('base_url') or ''};"
+        f"api_mode={runtime.get('api_mode') or ''}"
+    )
+    revisions = ProjectAgentRevisions(
+        base_signature,
+        tool_revision,
+        model_revision,
+    )
+    runtime_settings = {
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider"),
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": runtime.get("args") or (),
+        "credential_pool": runtime.get("credential_pool"),
+        "max_tokens": runtime.get("max_tokens"),
+    }
+    constructor_kwargs = {
+        "model": model,
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": resolved_provider,
+        "requested_provider": (
+            runtime.get("requested_provider") or requested_provider
+        ),
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": runtime.get("args") or (),
+        "credential_pool": runtime.get("credential_pool"),
+        "max_tokens": runtime.get("max_tokens"),
+        "enabled_toolsets": enabled_toolsets,
+        "project_tool_schemas": frozen_tool_schemas,
+        "project_registry_generation": registry_generation,
+        "project_request_timeout": request_timeout,
+        "project_bedrock_guardrail_config": runtime.get("guardrail_config"),
+    }
+    frozen_constructor = _freeze_project_value(constructor_kwargs)
+    frozen_runtime = _freeze_project_value(runtime_settings)
+    frozen_prompt_cache = _freeze_project_value(prompt_cache)
+    frozen_memory = _freeze_project_value(
+        config.get("memory", {}) if isinstance(config, dict) else {}
+    )
+    frozen_skills = _freeze_project_value(
+        config.get("skills", {}) if isinstance(config, dict) else {}
+    )
+    frozen_compression = _freeze_project_value(
+        config.get("compression", {}) if isinstance(config, dict) else {}
+    )
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            frozen_constructor,
+            frozen_runtime,
+            frozen_prompt_cache,
+            frozen_memory,
+            frozen_skills,
+            frozen_compression,
+        )
+    ):
+        raise TypeError("project snapshot mappings did not freeze")
+    return _FrozenProjectAgentSnapshot(
+        runtime_kind="hermes",
+        resolved_agent=model,
+        resolved_provider=resolved_provider,
+        registry_generation=registry_generation,
+        declared_registry_generation=registry_generation,
+        base_signature=base_signature,
+        declared_base_signature=base_signature,
+        tool_revision=tool_revision,
+        declared_tool_revision=tool_revision,
+        model_revision=model_revision,
+        declared_model_revision=model_revision,
+        revisions=revisions,
+        constructor_kwargs=cast(Mapping[str, object], frozen_constructor),
+        tool_descriptors=tool_descriptors,
+        tool_schemas=cast(
+            tuple[Mapping[str, object], ...],
+            frozen_tool_schemas,
+        ),
+        enabled_toolsets=enabled_toolsets,
+        prompt_cache_settings=cast(
+            Mapping[str, object],
+            frozen_prompt_cache,
+        ),
+        memory_settings=cast(Mapping[str, object], frozen_memory),
+        skill_settings=cast(Mapping[str, object], frozen_skills),
+        compression_settings=cast(
+            Mapping[str, object],
+            frozen_compression,
+        ),
+        runtime_settings=cast(Mapping[str, object], frozen_runtime),
+    )
+
+
+class _ProjectPolicyConnection:
+    """Narrow production loader used only by the policy snapshot facade."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def load_project_policy_snapshot(
+        self,
+        project_id: str,
+        contract_revision: int,
+        origin: object,
+    ) -> object:
+        from hermes_cli import project_runtime_db
+
+        connection = self._connection
+        state = project_runtime_db.runtime_state_for_project(
+            connection,
+            project_id,
+        )
+        contract_row = connection.execute(
+            """
+            SELECT contract_id, revision, contract_json, status
+            FROM project_contracts
+            WHERE project_id = ? AND revision = ?
+            """,
+            (project_id, contract_revision),
+        ).fetchone()
+        binding_rows = connection.execute(
+            """
+            SELECT binding_id, surface, external_binding_id, actor_id
+            FROM project_surface_bindings
+            WHERE project_id = ?
+            ORDER BY binding_id
+            """,
+            (project_id,),
+        ).fetchall()
+        folder_rows = connection.execute(
+            """
+            SELECT path
+            FROM project_folders
+            WHERE project_id = ?
+            ORDER BY is_primary DESC, path
+            """,
+            (project_id,),
+        ).fetchall()
+        if state is None or contract_row is None:
+            raise PermissionError("project policy authority is unavailable")
+        try:
+            contract_payload = json.loads(contract_row["contract_json"])
+            matching = next(
+                row
+                for row in binding_rows
+                if row["binding_id"] == getattr(origin, "binding_id", None)
+            )
+            if not (
+                matching["surface"] == getattr(origin, "surface", None)
+                and matching["external_binding_id"]
+                == getattr(origin, "external_binding_id", None)
+                and matching["actor_id"] == getattr(origin, "actor_id", None)
+            ):
+                raise PermissionError("project owner binding drift")
+            allowed_action_classes = frozenset(
+                contract_payload["allowed_action_classes"]
+            )
+            allowed_phases = frozenset(
+                contract_payload["allowed_phases"]
+            )
+        except (
+            KeyError,
+            StopIteration,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise PermissionError(
+                "project policy authority is malformed"
+            ) from exc
+        return SimpleNamespace(
+            project_id=project_id,
+            lifecycle=state.lifecycle,
+            current_phase=state.current_phase,
+            roots=tuple(
+                row["path"].replace("\\", "/")
+                for row in folder_rows
+            ),
+            approved_plan_ref=contract_payload.get("approved_plan_ref"),
+            contract_id=contract_row["contract_id"],
+            contract_status=contract_row["status"],
+            contract_revision=contract_row["revision"],
+            contract_json_sha256=hashlib.sha256(
+                contract_row["contract_json"].encode("utf-8")
+            ).hexdigest(),
+            allowed_action_classes=allowed_action_classes,
+            allowed_phases=allowed_phases,
+            actor_id=matching["actor_id"],
+            actor_surface=matching["surface"],
+            binding_id=matching["binding_id"],
+            actor_is_owner=True,
+            control_version=0,
+            runtime_version=state.version,
+            delivery_bindings=tuple(
+                (
+                    row["binding_id"],
+                    row["surface"],
+                    row["actor_id"],
+                )
+                for row in binding_rows
+                if row["actor_id"] is not None
+            ),
+        )
+
+
+def _materialize_project_policy_snapshot(snapshot: object) -> object:
+    return SimpleNamespace(
+        project=ProjectPolicyView(
+            snapshot.project_id,
+            snapshot.lifecycle,
+            snapshot.current_phase,
+            snapshot.roots,
+            snapshot.approved_plan_ref,
+            tuple(
+                ProjectBindingView(
+                    binding_id,
+                    surface,
+                    actor_id,
+                    snapshot.project_id,
+                )
+                for binding_id, surface, actor_id
+                in snapshot.delivery_bindings
+            ),
+        ),
+        contract_id=snapshot.contract_id,
+        contract_status=snapshot.contract_status,
+        contract_json_sha256=snapshot.contract_json_sha256,
+        contract=ContractPolicyView(
+            snapshot.contract_revision,
+            snapshot.allowed_action_classes,
+            snapshot.allowed_phases,
+            snapshot.approved_plan_ref,
+        ),
+        actor=ActorContext(
+            snapshot.actor_id,
+            snapshot.actor_surface,
+            snapshot.binding_id,
+            snapshot.actor_is_owner,
+        ),
+        control_version=snapshot.control_version,
+        runtime_version=snapshot.runtime_version,
+    )
+
+
+def _bind_project_read(
+    snapshot: object,
+    execution: object,
+    proposal: object,
+) -> ProjectCommand:
+    return ProjectCommand(
+        proposal.canonical_action,
+        execution.attempt.project_id,
+        snapshot.contract_revision,
+        proposal.canonical_action,
+        proposal.targets,
+        proposal.policy_batch_id,
+        proposal.batch_items,
+        {"phase": snapshot.current_phase},
+    )
+
+
+def _canonical_project_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _bind_project_operation(
+    snapshot: object,
+    execution: object,
+    proposal: object,
+) -> BoundProjectOperationAuthority:
+    intent = proposal.intent
+    command = ProjectCommand(
+        intent.canonical_action,
+        execution.attempt.project_id,
+        snapshot.contract_revision,
+        intent.canonical_action,
+        intent.targets,
+        proposal.policy_batch_id,
+        intent.batch_items,
+        {"phase": snapshot.current_phase},
+    )
+    effect_scope = json.loads(proposal.effect_scope_json)
+    authority_json = _canonical_project_json(
+        {
+            "command": {
+                "name": command.name,
+                "project_id": command.project_id,
+                "revision": command.revision,
+                "action_class": command.action_class,
+                "targets": list(command.targets),
+                "batch_id": command.batch_id,
+                "batch_items": list(command.batch_items),
+                "metadata": dict(command.metadata),
+            },
+            "intent": {
+                "operation_id": intent.operation_id,
+                "project_id": intent.project_id,
+                "turn_id": intent.turn_id,
+                "idempotency_key": intent.idempotency_key,
+                "canonical_action": intent.canonical_action,
+                "command_revision": intent.command_revision,
+                "targets": list(intent.targets),
+                "batch_items": list(intent.batch_items),
+                "payload": dict(intent.payload),
+                "readback_kind": intent.readback_kind,
+                "remote_idempotency_supported": (
+                    intent.remote_idempotency_supported
+                ),
+            },
+            "policy_batch_id": proposal.policy_batch_id,
+            "capability_fingerprint": list(
+                proposal.capability_fingerprint
+            ),
+            "effect_scope": effect_scope,
+        }
+    )
+    return BoundProjectOperationAuthority(
+        command,
+        intent,
+        proposal.policy_batch_id,
+        proposal.effect_scope_json,
+        proposal.effect_scope_sha256,
+        authority_json,
+        hashlib.sha256(authority_json.encode("utf-8")).hexdigest(),
+    )
+
+
+@contextmanager
+def _bind_project_turn_context(execution: object):
+    token = _PROJECT_TURN_CONTEXT.set(execution)
+    try:
+        yield execution
+    finally:
+        _PROJECT_TURN_CONTEXT.reset(token)
+
+
+class _ApprovedProjectOperationPort:
+    def __init__(self, coordinator: object) -> None:
+        self._coordinator = coordinator
+
+    def create_turn(
+        self,
+        execution: object,
+        operation: object,
+        *,
+        base_message_count: int,
+    ) -> object:
+        return CanonicalApprovedOperationTurn(
+            execution,
+            operation,
+            base_message_count=base_message_count,
+            coordinator=self._coordinator,
+        )
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -3418,6 +3970,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
+        self._project_executor_lock = threading.Lock()
+        self._project_io_executor: Optional[
+            concurrent.futures.ThreadPoolExecutor
+        ] = None
+        self._project_capability_executor: Optional[
+            concurrent.futures.ThreadPoolExecutor
+        ] = None
+        self._project_executors_closing = False
+        self._project_runtime_dispatcher: object | None = None
+        self._project_runtime_dispatcher_home = Path(
+            _hermes_home
+        ).resolve()
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
@@ -3675,6 +4239,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Cancellation-resistant tasks remain runner-owned until they actually
+        # finish, even after the bounded shutdown join has released resources.
+        self._shutdown_lingering_tasks: set[asyncio.Task] = set()
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -8565,6 +9132,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.error("Recovered watcher setup error: %s", e)
 
+        # Hermes owns the canonical project runtime. Every supervised restart
+        # builds a fresh graph; the Core lease decides leader versus standby.
+        self._spawn_supervised(
+            self._run_project_runtime_dispatcher_supervised,
+            "project_runtime_dispatcher",
+        )
+        self._start_discord_project_surface_supervisor()
+        self._start_discord_project_event_delivery_supervisor()
+
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
@@ -8725,6 +9301,149 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         task.add_done_callback(_done)
         return task
+
+    def _start_discord_project_surface_supervisor(self) -> bool:
+        """Start reconciliation only for one connected, enabled Discord port."""
+        from gateway.config import Platform, _getenv
+        from gateway.project_surfaces import (
+            ProjectSurfaceConfigurationError,
+            project_surfaces_for_config,
+        )
+
+        try:
+            surfaces = project_surfaces_for_config(
+                self.config,
+                discord_allowed_users=_getenv("DISCORD_ALLOWED_USERS", ""),
+            )
+        except (ProjectSurfaceConfigurationError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Discord project surface supervisor is disabled: %s", exc
+            )
+            return False
+        if len(surfaces) != 1:
+            return False
+        self._spawn_supervised(
+            lambda: self._run_discord_project_surface_supervisor(surfaces[0]),
+            "discord_project_surface_supervisor",
+        )
+        return True
+
+    async def _run_discord_project_surface_supervisor(
+        self,
+        surface,
+        *,
+        poll_seconds: float = 1.0,
+    ) -> None:
+        """Reconcile one durable Discord surface without holding a DB tx over I/O."""
+        from gateway.project_surface_lifecycle import SurfaceLifecycleProjector
+        from gateway.config import Platform
+        from hermes_cli import projects_db
+
+        if poll_seconds <= 0:
+            raise ValueError("surface supervisor poll_seconds must be positive")
+        worker_id = f"gateway-discord-surface-{os.getpid()}-{id(self):x}"
+        while self._running:
+            port = self.adapters.get(Platform.DISCORD)
+            if not all(
+                callable(getattr(port, method, None))
+                for method in ("ensure_channel", "read_channel")
+            ):
+                await asyncio.sleep(poll_seconds)
+                continue
+            conn = projects_db.connect()
+            try:
+                projector = SurfaceLifecycleProjector(
+                    conn,
+                    surface=surface,
+                    port=port,
+                    worker_id=worker_id,
+                )
+                await projector.project_pending(limit=25)
+            finally:
+                conn.close()
+            # A real poll wait bounds retries for leased, pending, and blocked
+            # work; a terminal batch is still capped above to preserve loop I/O.
+            await asyncio.sleep(poll_seconds)
+
+    def _start_discord_project_event_delivery_supervisor(self) -> bool:
+        """Start exactly one delivery loop for an enabled Discord workspace."""
+        from gateway.config import _getenv
+        from gateway.project_surfaces import (
+            ProjectSurfaceConfigurationError,
+            project_surfaces_for_config,
+        )
+
+        if getattr(
+            self,
+            "_discord_project_event_delivery_started",
+            False,
+        ):
+            return False
+        try:
+            surfaces = project_surfaces_for_config(
+                self.config,
+                discord_allowed_users=_getenv(
+                    "DISCORD_ALLOWED_USERS",
+                    "",
+                ),
+            )
+        except (
+            ProjectSurfaceConfigurationError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            logger.warning(
+                "Discord project event delivery is disabled: %s",
+                exc,
+            )
+            return False
+        if len(surfaces) != 1:
+            return False
+        self._discord_project_event_delivery_started = True
+        self._spawn_supervised(
+            self._run_discord_project_event_delivery_supervisor,
+            "discord_project_event_delivery_supervisor",
+        )
+        return True
+
+    async def _run_discord_project_event_delivery_supervisor(
+        self,
+        *,
+        poll_seconds: float = 1.0,
+    ) -> None:
+        """Project one fair Discord binding-head batch per fresh connection."""
+        from gateway.config import Platform
+        from gateway.project_event_delivery import (
+            ProjectEventDeliveryWorker,
+        )
+        from hermes_cli import projects_db
+
+        if poll_seconds <= 0:
+            raise ValueError(
+                "event delivery poll_seconds must be positive"
+            )
+        worker_id = (
+            f"gateway-discord-delivery-{os.getpid()}-{id(self):x}"
+        )
+        while self._running:
+            port = self.adapters.get(Platform.DISCORD)
+            if not all(
+                callable(getattr(port, method, None))
+                for method in ("find_event_message", "publish_event")
+            ):
+                await asyncio.sleep(poll_seconds)
+                continue
+            conn = projects_db.connect()
+            try:
+                worker = ProjectEventDeliveryWorker(
+                    conn,
+                    port=port,
+                    worker_id=worker_id,
+                )
+                await worker.deliver_pending(limit=25)
+            finally:
+                conn.close()
+            await asyncio.sleep(poll_seconds)
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
@@ -9456,7 +10175,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._restart_detached = detached_restart
             self._restart_via_service = service_restart
         if self._stop_task is not None:
-            await self._stop_task
+            await asyncio.shield(self._stop_task)
             return
 
         async def _stop_impl() -> None:
@@ -9582,6 +10301,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+
+            dispatcher = getattr(
+                self,
+                "_project_runtime_dispatcher",
+                None,
+            )
+            if dispatcher is not None:
+                try:
+                    await dispatcher.close()
+                except Exception:
+                    logger.exception(
+                        "Project runtime dispatcher close failed"
+                    )
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -9763,6 +10495,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            _cancelled_background_tasks = []
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
                     continue
@@ -9773,6 +10506,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # _exit_code = 75 (#12875).  It self-terminates anyway.
                     continue
                 _task.cancel()
+                _cancelled_background_tasks.append(_task)
+            if _cancelled_background_tasks:
+                _done_background_tasks, _pending_background_tasks = (
+                    await asyncio.wait(
+                        _cancelled_background_tasks,
+                        timeout=_BACKGROUND_TASK_JOIN_TIMEOUT_SECONDS,
+                    )
+                )
+                if _done_background_tasks:
+                    await asyncio.gather(
+                        *_done_background_tasks,
+                        return_exceptions=True,
+                    )
+                if _pending_background_tasks:
+                    logger.warning(
+                        "Shutdown: %d cancelled background task(s) did not "
+                        "quiesce before the bounded join timeout",
+                        len(_pending_background_tasks),
+                    )
+                    _lingering = getattr(
+                        self,
+                        "_shutdown_lingering_tasks",
+                        None,
+                    )
+                    if _lingering is None:
+                        _lingering = set()
+                        self._shutdown_lingering_tasks = _lingering
+                    _lingering.update(_pending_background_tasks)
+
+                    def _release_lingering_task(_task):
+                        try:
+                            consume_detached_task_result(_task)
+                        finally:
+                            _lingering.discard(_task)
+
+                    for _task in _pending_background_tasks:
+                        _task.add_done_callback(_release_lingering_task)
             self._background_tasks.clear()
 
             self.adapters.clear()
@@ -9830,6 +10600,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _db.close()
                 except Exception as _e:
                     logger.debug("SessionDB close error: %s", _e)
+            GatewayRunner._shutdown_project_executors(self)
             GatewayRunner._shutdown_executor(self)
             logger.info(
                 "Shutdown phase: SessionDB close done at +%.2fs",
@@ -9939,7 +10710,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info("Gateway stopped (total teardown %.2fs)", _phase_elapsed())
 
         self._stop_task = asyncio.create_task(_stop_impl())
-        await self._stop_task
+        await asyncio.shield(self._stop_task)
 
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
@@ -10742,6 +11513,116 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return switched
 
+    async def _route_bound_project_message(self, event: MessageEvent):
+        """Route one authenticated bound Discord message off the event loop."""
+        return await self._route_bound_project_ingress(event)
+
+    async def _route_bound_project_command(self, event: MessageEvent):
+        """Route a parsed managed-project control command before busy queues."""
+        from gateway.project_runtime_ingress import ProjectIngressResult
+        from gateway.slash_commands import parse_project_slash_command
+
+        command = parse_project_slash_command(event.text)
+        if command is None:
+            return ProjectIngressResult(handled=False)
+        return await self._route_bound_project_ingress(
+            event, command=command
+        )
+
+    async def _route_bound_project_ingress(
+        self,
+        event: MessageEvent,
+        *,
+        command: object | None = None,
+    ):
+        """Compose one trusted project ingress operation off the event loop."""
+        from gateway.project_runtime_ingress import (
+            ProjectIngressResult,
+            ProjectRuntimeIngress,
+        )
+        from gateway.project_surfaces import (
+            ProjectSurfaceConfigurationError,
+            project_surfaces_for_config,
+        )
+        from gateway.config import _getenv
+        from hermes_cli import projects_db
+
+        dispatcher = getattr(
+            self, "_project_runtime_dispatcher", None
+        )
+        wake = getattr(dispatcher, "wake", None)
+
+        def build_ingress():
+            config = getattr(self, "config", None)
+            try:
+                surfaces = project_surfaces_for_config(
+                    config,
+                    discord_allowed_users=_getenv(
+                        "DISCORD_ALLOWED_USERS", ""
+                    ),
+                )
+            except (ProjectSurfaceConfigurationError, TypeError, ValueError):
+                return None
+            # The runtime is capability-bearing.  Do not construct it unless
+            # one (and only one) validated Discord surface selected it.
+            if len(surfaces) != 1:
+                return None
+            return ProjectRuntimeIngress(
+                db_factory=projects_db.connect,
+                wake=wake if callable(wake) else None,
+                accept_new_turns=not bool(
+                    getattr(self, "_external_drain_active", False)
+                ),
+                surface=surfaces[0],
+            )
+
+        def route_ingress(ingress):
+            if command is None:
+                return ingress.route(event)
+            return ingress.route_command(event, command)
+
+        if getattr(
+            getattr(self, "config", None),
+            "multiplex_profiles",
+            False,
+        ):
+            profile_home = self._resolve_profile_home_for_source(
+                event.source
+            )
+            dispatcher_home = getattr(
+                self, "_project_runtime_dispatcher_home", None
+            )
+            if (
+                dispatcher_home is None
+                or Path(profile_home).resolve()
+                != Path(dispatcher_home).resolve()
+            ):
+                return ProjectIngressResult(
+                    handled=True,
+                    error_code=(
+                        "PROJECT_INGRESS_PROFILE_DISPATCHER_UNAVAILABLE"
+                    ),
+                    response=(
+                        "De projectruntime voor dit profiel is nog niet "
+                        "actief; het bericht is niet uitgevoerd."
+                    ),
+                )
+
+            def route_in_profile_scope():
+                with _profile_runtime_scope(profile_home):
+                    ingress = build_ingress()
+                    if ingress is None:
+                        return ProjectIngressResult(handled=False)
+                    return route_ingress(ingress)
+
+            return await self._run_project_runtime_io(
+                route_in_profile_scope
+            )
+        ingress = build_ingress()
+        if ingress is None:
+            return ProjectIngressResult(handled=False)
+        return await self._run_project_runtime_io(route_ingress, ingress)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -10907,7 +11788,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
+        if not is_internal:
+            project_ingress = (
+                await self._route_bound_project_message(event)
+            )
+            if project_ingress.handled:
+                return project_ingress.response
+
+            project_command = await self._route_bound_project_command(event)
+            if project_command.handled:
+                return project_command.response
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -17442,16 +18334,317 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
 
-    async def _run_in_executor_with_context(self, func, *args):
-        """Run blocking work in the thread pool while preserving session contextvars."""
+    @staticmethod
+    async def _run_retained_executor_call(
+        executor,
+        func,
+        *args,
+        **kwargs,
+    ):
+        """Join submitted work before propagating caller cancellation."""
         loop = asyncio.get_running_loop()
         ctx = copy_context()
-        return await loop.run_in_executor(
+        submitted = loop.run_in_executor(
+            executor,
+            functools.partial(ctx.run, func, *args, **kwargs),
+        )
+        task = asyncio.ensure_future(submitted)
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+            except BaseException:
+                break
+        if cancelled:
+            try:
+                task.result()
+            except BaseException:
+                pass
+            raise asyncio.CancelledError()
+        return task.result()
+
+    async def _run_in_executor_with_context(self, func, *args, **kwargs):
+        """Run retained agent work while preserving session contextvars."""
+        return await self._run_retained_executor_call(
             self._get_executor(),
-            ctx.run,
             func,
             *args,
+            **kwargs,
         )
+
+    async def _run_project_runtime_io(self, func, *args, **kwargs):
+        return await self._run_retained_executor_call(
+            self._get_project_executor("io"),
+            func,
+            *args,
+            **kwargs,
+        )
+
+    async def _run_project_capability_effect(
+        self,
+        func,
+        *args,
+        **kwargs,
+    ):
+        return await self._run_retained_executor_call(
+            self._get_project_executor("capability"),
+            func,
+            *args,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _prime_managed_executor(
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> None:
+        """Create every managed worker before the runtime graph is published."""
+        if getattr(executor, "_hermes_fully_primed", False):
+            return
+        worker_count = int(getattr(executor, "_max_workers", 1))
+        barrier = threading.Barrier(worker_count + 1)
+
+        def wait_until_all_workers_exist() -> None:
+            barrier.wait(timeout=10)
+
+        futures = [
+            executor.submit(wait_until_all_workers_exist)
+            for _ in range(worker_count)
+        ]
+        barrier.wait(timeout=10)
+        for future in futures:
+            future.result(timeout=10)
+        executor._hermes_fully_primed = True
+
+    def _get_project_executor(
+        self,
+        kind: str,
+    ) -> concurrent.futures.ThreadPoolExecutor:
+        if kind not in {"io", "capability"}:
+            raise ValueError("unknown project executor kind")
+        lock = getattr(self, "_project_executor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._project_executor_lock = lock
+        with lock:
+            if getattr(self, "_project_executors_closing", False):
+                raise RuntimeError(
+                    "Gateway is shutting down; project executor unavailable"
+                )
+            attribute = (
+                "_project_io_executor"
+                if kind == "io"
+                else "_project_capability_executor"
+            )
+            executor = getattr(self, attribute, None)
+            if executor is None or getattr(executor, "_shutdown", False):
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=4,
+                    thread_name_prefix=(
+                        "hermes-project-io"
+                        if kind == "io"
+                        else "hermes-project-capability"
+                    ),
+                )
+                setattr(self, attribute, executor)
+            return executor
+
+    def _shutdown_project_executors(self) -> None:
+        lock = getattr(self, "_project_executor_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._project_executors_closing = True
+            capability = getattr(
+                self,
+                "_project_capability_executor",
+                None,
+            )
+            project_io = getattr(self, "_project_io_executor", None)
+            self._project_capability_executor = None
+            self._project_io_executor = None
+        for executor in (capability, project_io):
+            if executor is None:
+                continue
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+
+    def _build_project_runtime_dispatcher(self):
+        """Build one fresh, capability-closed C14 runtime graph."""
+        from hermes_cli import projects_db
+
+        def projects_db_factory():
+            return projects_db.connect()
+
+        def policy_db_factory():
+            return _ProjectPolicyConnection(projects_db.connect())
+
+        def state_db_factory():
+            import hermes_state
+
+            return hermes_state.SessionDB()
+
+        async def io_runner(func, *args, **kwargs):
+            return await self._run_project_runtime_io(
+                func,
+                *args,
+                **kwargs,
+            )
+
+        async def effect_runner(func, *args, **kwargs):
+            return await self._run_project_capability_effect(
+                func,
+                *args,
+                **kwargs,
+            )
+
+        async def off_loop_runner(func, *args, **kwargs):
+            return await self._run_in_executor_with_context(
+                func,
+                *args,
+                **kwargs,
+            )
+
+        @contextmanager
+        def turn_context_binder(execution):
+            with _bind_project_turn_context(execution) as entered:
+                yield entered
+
+        # Own all three pools before publishing the graph. Successor graphs
+        # reuse them, while every graph-local runner remains a fresh capability.
+        project_io_executor = self._get_project_executor("io")
+        capability_executor = self._get_project_executor("capability")
+        agent_executor = self._get_executor()
+        for executor in (
+            project_io_executor,
+            capability_executor,
+            agent_executor,
+        ):
+            self._prime_managed_executor(executor)
+
+        capabilities = MappingProxyType({})
+
+        terminal_readback = ProjectTask7TerminalReadbackFacade(
+            state_db_factory,
+            io_runner=io_runner,
+        )
+        approval_checkpoints = ProjectApprovalCheckpointReadFacade(
+            state_db_factory,
+            io_runner=io_runner,
+        )
+        runtime = ProjectDispatcherRuntimeFacade(
+            projects_db_factory,
+            terminal_readback=terminal_readback,
+            io_runner=io_runner,
+        )
+        operations = ProjectDispatcherOperationFacade(
+            projects_db_factory,
+            approval_checkpoints=approval_checkpoints,
+            executor_capabilities=capabilities,
+            io_runner=io_runner,
+        )
+        settlement = ProjectBatchSettlementFacade(
+            state_db_factory,
+            projects_db_factory=projects_db_factory,
+            io_runner=io_runner,
+        )
+        batches = ProjectBatchWorkerFacade(
+            state_db_factory,
+            projects_db_factory=projects_db_factory,
+            io_runner=io_runner,
+        )
+        prepare = ProjectOperationPrepareFacade(
+            projects_db_factory,
+            io_runner=io_runner,
+        )
+        checkpoint = CanonicalProjectOperationCheckpointCoordinator(
+            batches=batches,
+            operations=prepare,
+            batch_id_factory=canonical_uuid4,
+            on_published=lambda messages: None,
+        )
+        policy = ProjectToolPolicySnapshotFacade(
+            policy_db_factory,
+            read_binder=_bind_project_read,
+            operation_binder=_bind_project_operation,
+            capability_registry=capabilities,
+            policy_decider=decide_project_policy,
+            snapshot_materializer=_materialize_project_policy_snapshot,
+            authority_clock=time.time,
+            approval_id_factory=canonical_uuid4,
+            io_runner=io_runner,
+        )
+        frozen_snapshot = _compose_frozen_project_agent_snapshot()
+
+        def snapshot_resolver(context, contract_revision):
+            del context, contract_revision
+            return frozen_snapshot
+
+        def agent_builder(snapshot, **constructor):
+            if snapshot is not frozen_snapshot:
+                raise ValueError("project agent snapshot identity drift")
+            from run_agent import AIAgent
+
+            return AIAgent(**constructor)
+
+        agent_factory = GatewayProjectAgentFactory(
+            snapshot_resolver=snapshot_resolver,
+            agent_builder=agent_builder,
+            off_loop_runner=off_loop_runner,
+            turn_context_binder=turn_context_binder,
+            tool_authorizer=policy,
+            checkpoint_coordinator=checkpoint,
+        )
+        execution = ProjectOperationExecutionFacade(
+            projects_db_factory,
+            approval_checkpoints=approval_checkpoints,
+            io_runner=io_runner,
+        )
+        approved_coordinator = (
+            CanonicalProjectOperationExecutionCoordinator(
+                execution_facade=execution,
+                capability_registry=capabilities,
+                effect_runner=effect_runner,
+            )
+        )
+        worker = CanonicalProjectRuntimeWorker(
+            ProjectRuntimeWorkerFacade(
+                projects_db_factory,
+                io_runner=io_runner,
+            ),
+            batches,
+            agent_factory,
+            self.config,
+            profile_home=_hermes_home,
+            lease_seconds=90,
+            heartbeat_interval_seconds=30,
+            approved_operations=_ApprovedProjectOperationPort(
+                approved_coordinator
+            ),
+        )
+        return ProjectRuntimeDispatcher(
+            runtime,
+            operations,
+            worker,
+            settlement=settlement,
+            io_runner=io_runner,
+            uuid_factory=canonical_uuid4,
+        )
+
+    async def _run_project_runtime_dispatcher_supervised(self) -> None:
+        dispatcher = self._build_project_runtime_dispatcher()
+        self._project_runtime_dispatcher = dispatcher
+        try:
+            await dispatcher.run()
+        finally:
+            try:
+                await dispatcher.close()
+            finally:
+                if self._project_runtime_dispatcher is dispatcher:
+                    self._project_runtime_dispatcher = None
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""

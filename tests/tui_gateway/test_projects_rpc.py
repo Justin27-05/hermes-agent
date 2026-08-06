@@ -31,6 +31,88 @@ def test_methods_registered():
         "projects.for_cwd",
     ):
         assert m in server._methods
+    assert "project.command" in server._methods
+    assert "project.command" in server._LONG_HANDLERS
+
+
+def test_project_command_create_and_status_share_canonical_runtime():
+    create = server._methods["project.command"](
+        1,
+        {
+            "name": "project.create",
+            "project_id": None,
+            "payload": {
+                "name": "Command managed",
+                "current_phase": "planning",
+            },
+            "idempotency_key": "create-command-managed",
+            "expected_version": 0,
+        },
+    )
+    assert "error" not in create, create.get("error")
+    created = create["result"]
+
+    status = server._methods["project.command"](
+        2,
+        {
+            "name": "project.status",
+            "project_id": created["project_id"],
+            "payload": {},
+            "idempotency_key": None,
+            "expected_version": None,
+        },
+    )
+
+    assert "error" not in status, status.get("error")
+    assert status["result"]["project_id"] == created["project_id"]
+    assert status["result"]["canonical_session_id"] == (
+        created["canonical_session_id"]
+    )
+    assert status["result"]["version"] == created["version"] == 0
+
+
+def test_project_command_can_create_multiple_projects():
+    created = []
+    for index in (1, 2):
+        response = server._methods["project.command"](
+            index,
+            {
+                "name": "project.create",
+                "project_id": None,
+                "payload": {
+                    "name": f"Managed project {index}",
+                    "current_phase": "planning",
+                },
+                "idempotency_key": f"create-managed-{index}",
+                "expected_version": 0,
+            },
+        )
+        assert "error" not in response, response.get("error")
+        created.append(response["result"]["project_id"])
+
+    assert len(set(created)) == 2
+
+
+def test_project_command_never_accepts_client_supplied_actor():
+    response = server._methods["project.command"](
+        1,
+        {
+            "name": "project.status",
+            "project_id": "project-forged",
+            "payload": {},
+            "idempotency_key": None,
+            "expected_version": None,
+            "actor": {
+                "actor_id": "hermes",
+                "surface": "system",
+                "binding_id": "core",
+                "is_owner": False,
+            },
+        },
+    )
+
+    assert response["error"]["code"] == 5065
+    assert response["error"]["data"] == {"code": "invalid_request"}
 
 
 def test_for_cwd_is_a_long_handler():
@@ -153,10 +235,54 @@ def test_warm_roots_probes_in_parallel_and_fills_the_cache(monkeypatch):
 def test_create_list_roundtrip(tmp_path):
     created = _call("projects.create", {"name": "Demo", "folders": [str(tmp_path)], "use": True})
     assert created["project"]["slug"] == "demo"
+    assert created["project"]["managed"] is False
 
     listing = _call("projects.list")
     assert [p["slug"] for p in listing["projects"]] == ["demo"]
+    assert listing["projects"][0]["managed"] is False
     assert listing["active_id"] == created["project"]["id"]
+
+
+def test_managed_marker_uses_the_same_durable_evidence_as_delete_guard(
+    tmp_path,
+):
+    from hermes_cli import project_runtime_db as prdb
+    from hermes_cli import projects_db as pdb
+
+    legacy_id = _call(
+        "projects.create",
+        {"name": "Legacy marker", "folders": [str(tmp_path)]},
+    )["project"]["id"]
+    managed_id = _call(
+        "projects.create",
+        {"name": "Managed marker", "folders": [str(tmp_path)]},
+    )["project"]["id"]
+    with pdb.connect_closing() as conn:
+        prdb.bind_surface(
+            conn,
+            binding_id="desktop-marker",
+            project_id=managed_id,
+            surface="desktop",
+            external_binding_id="private-window-marker",
+            actor_id="owner-marker",
+            now=1,
+        )
+        assert pdb.project_is_managed(conn, legacy_id) is False
+        assert pdb.project_is_managed(conn, managed_id) is True
+
+    by_id = {
+        project["id"]: project
+        for project in _call("projects.list")["projects"]
+    }
+    assert by_id[legacy_id]["managed"] is False
+    assert by_id[managed_id]["managed"] is True
+
+    deleted = server._methods["projects.delete"](1, {"id": legacy_id})
+    guarded = server._methods["projects.delete"](2, {"id": managed_id})
+    assert "error" not in deleted
+    assert guarded["error"]["data"] == {
+        "code": "PROJECT_MANAGED_DELETE_FORBIDDEN"
+    }
 
 
 def test_add_folder_and_for_cwd(tmp_path):
@@ -238,10 +364,88 @@ def test_get_unknown_returns_error():
 
 def test_delete_removes_project(tmp_path):
     pid = _call("projects.create", {"name": "Doomed", "folders": [str(tmp_path)]})["project"]["id"]
+    _call("projects.set_active", {"id": pid})
     payload = _call("projects.delete", {"id": pid})
 
     assert all(p["id"] != pid for p in payload["projects"])
+    assert payload["active_id"] is None
     assert "projects.delete" in server._methods
+
+
+def test_delete_rejects_managed_project_with_stable_safe_error(tmp_path):
+    from hermes_cli import project_runtime_db as prdb
+    from hermes_cli import projects_db as pdb
+
+    pid = _call(
+        "projects.create",
+        {"name": "Managed", "folders": [str(tmp_path)]},
+    )["project"]["id"]
+    with pdb.connect_closing() as conn:
+        prdb.bind_surface(
+            conn,
+            binding_id="desktop-managed",
+            project_id=pid,
+            surface="desktop",
+            external_binding_id="window-managed",
+            actor_id="owner-1",
+            now=1,
+        )
+
+    response = server._methods["projects.delete"](1, {"id": pid})
+
+    assert response["error"]["code"] == 5064
+    assert (
+        response["error"]["data"]["code"]
+        == "PROJECT_MANAGED_DELETE_FORBIDDEN"
+    )
+    assert "archive" in response["error"]["message"].lower()
+    assert "sqlite" not in response["error"]["message"].lower()
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, pid) is not None
+
+
+def test_legacy_rpc_rejects_managed_rename_and_active_archive(tmp_path):
+    from hermes_cli import project_runtime_db as prdb
+    from hermes_cli import projects_db as pdb
+
+    pid = _call(
+        "projects.create",
+        {"name": "Managed mutation", "folders": [str(tmp_path)]},
+    )["project"]["id"]
+    with pdb.connect_closing() as conn:
+        prdb.create_project_conversation(
+            conn,
+            project_id=pid,
+            conversation_id="managed-rpc-session",
+            current_phase="implementation",
+            now=1,
+        )
+
+    renamed = server._methods["projects.update"](
+        1, {"id": pid, "name": "Bypassed"}
+    )
+    archived = server._methods["projects.archive"](
+        2, {"id": pid}
+    )
+
+    assert renamed["error"]["code"] == 5067
+    assert (
+        renamed["error"]["data"]["code"]
+        == "PROJECT_MANAGED_MUTATION_REQUIRES_COMMAND"
+    )
+    assert archived["error"]["code"] == 5066
+    assert (
+        archived["error"]["data"]["code"]
+        == "PROJECT_MANAGED_ARCHIVE_REQUIRES_COMPLETION"
+    )
+    with pdb.connect_closing() as conn:
+        project = pdb.get_project(conn, pid)
+        assert project.name == "Managed mutation"
+        assert project.archived is False
+        assert conn.execute(
+            "SELECT COUNT(*) FROM project_events WHERE project_id = ?",
+            (pid,),
+        ).fetchone()[0] == 0
 
 
 def test_discover_repos_is_registered_long_handler():

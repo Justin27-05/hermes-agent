@@ -168,6 +168,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
+    project_mode = (
+        getattr(agent, "_hermetic_project_mode", False) is True
+    )
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
@@ -254,7 +257,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         from agent.prompt_builder import computer_use_guidance
         stable_parts.append(computer_use_guidance())
 
-    nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    nous_subscription_prompt = (
+        ""
+        if project_mode
+        else _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    )
     if nous_subscription_prompt:
         stable_parts.append(nous_subscription_prompt)
     # Tool-use enforcement: tells the model to actually call tools instead
@@ -342,7 +349,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
+    _env_hints = "" if project_mode else _r.build_environment_hints()
     if _env_hints:
         stable_parts.append(_env_hints)
 
@@ -353,7 +360,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # stay in their historical position after the workspace snapshot.
     coding_workspace_parts: List[str] = []
     coding_trailing_parts: List[str] = []
-    if agent.valid_tool_names:
+    if agent.valid_tool_names and not project_mode:
         try:
             from agent.coding_context import coding_system_prompt_parts
 
@@ -517,15 +524,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
-    from hermes_time import now as _hermes_now
-    now = _hermes_now()
-    # Date-only (not minute-precision) so the system prompt is byte-stable
-    # for the full day.  Minute-precision changes invalidate prefix-cache KV
-    # on every rebuild path (compression boundary, fresh-agent gateway turns,
-    # session resume without a stored prompt).  The model can still query the
-    # exact wall-clock time via tools when it actually needs it.
-    # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    if project_mode:
+        timestamp_line = "Hermes project execution context"
+    else:
+        from hermes_time import now as _hermes_now
+        now = _hermes_now()
+        # Date-only (not minute-precision) so the system prompt is byte-stable
+        # for the full day.  Minute-precision changes invalidate prefix-cache KV
+        # on every rebuild path (compression boundary, fresh-agent gateway turns,
+        # session resume without a stored prompt).  The model can still query the
+        # exact wall-clock time via tools when it actually needs it.
+        # Credit: @iamfoz (PR #20451).
+        timestamp_line = (
+            f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+        )
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:

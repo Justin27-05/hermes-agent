@@ -37,6 +37,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
 
+from hermes_cli.project_events import ProjectEvent
+
 
 # ── Message (assistant text) events ──────────────────────────────────────────
 
@@ -145,6 +147,20 @@ class GatewayNotice:
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
+def canonical_project_event_notice(event: ProjectEvent) -> GatewayNotice:
+    """Project one durable event into a payload-free live replay hint."""
+    if type(event) is not ProjectEvent:
+        raise TypeError("event must be a ProjectEvent")
+    return GatewayNotice(
+        kind="project_event",
+        extra={
+            "event_id": event.event_id,
+            "project_id": event.project_id,
+            "sequence": event.sequence,
+        },
+    )
+
+
 # Union of every event the consumer's dispatcher accepts.  Kept explicit (rather
 # than a marker base class) so a missing ``case`` in an exhaustive match is a
 # visible type error rather than a silent fall-through.
@@ -167,5 +183,6 @@ __all__ = [
     "ToolCallFinished",
     "LongToolHint",
     "GatewayNotice",
+    "canonical_project_event_notice",
     "StreamEvent",
 ]

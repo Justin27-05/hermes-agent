@@ -401,6 +401,33 @@ async def test_recovery_does_not_treat_unmentioned_message_as_dispatched(adapter
 
 
 @pytest.mark.asyncio
+async def test_recovered_managed_message_reuses_canonical_route_without_mention(
+    adapter, monkeypatch
+):
+    from gateway.project_surfaces import DiscordProjectWorkspaceConfig
+
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter.config.project_workspaces = DiscordProjectWorkspaceConfig(
+        enabled=True,
+        guild_id="777",
+        owner_user_id="42",
+        active_category_id="10",
+        completed_category_id="20",
+    )
+    adapter.handle_message = AsyncMock()
+    channel = FakeChannel(channel_id=123)
+    channel.category_id = 10
+    message = make_message(message_id=97, channel=channel, content="recover project")
+
+    assert await adapter._dispatch_recovered_message(message) is True
+    assert await adapter._dispatch_recovered_message(message) is False
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert getattr(event, "_hermes_managed_project_candidate", False) is True
+    adapter._handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_recovered_messages_bypass_live_text_debounce(adapter, monkeypatch):
     bot_user = adapter._client.user
     message = make_message(

@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -154,6 +155,122 @@ async def test_gateway_stop_interrupts_after_drain_timeout():
 
     running_agent.interrupt.assert_called_once_with("Gateway shutting down")
     disconnect_mock.assert_awaited_once()
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_bounds_background_task_that_swallows_cancellation(
+    monkeypatch,
+):
+    """A cancellation-resistant watcher cannot block executor teardown."""
+    runner, _adapter = make_restart_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_BACKGROUND_TASK_JOIN_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    shutdown_trace: list[str] = []
+
+    class RecordingExecutor:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def shutdown(self, wait=True, *, cancel_futures=False) -> None:
+            shutdown_trace.append(self.label)
+
+    runner._project_executor_lock = threading.Lock()
+    runner._project_executors_closing = False
+    runner._project_capability_executor = RecordingExecutor("capability")
+    runner._project_io_executor = RecordingExecutor("project-io")
+    runner._executor_lock = threading.Lock()
+    runner._executor_closing = False
+    runner._executor = RecordingExecutor("agent")
+
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def swallow_cancellation() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    stuck_task = asyncio.create_task(swallow_cancellation())
+    runner._background_tasks.add(stuck_task)
+    await asyncio.sleep(0)
+    try:
+        with (
+            patch("gateway.status.remove_pid_file"),
+            patch("gateway.status.write_runtime_status"),
+        ):
+            await asyncio.wait_for(runner.stop(), timeout=0.25)
+
+        assert cancelled.is_set()
+        assert shutdown_trace == ["capability", "project-io", "agent"]
+        assert runner._shutdown_event.is_set() is True
+        assert stuck_task in runner._shutdown_lingering_tasks
+    finally:
+        release.set()
+        await asyncio.wait_for(stuck_task, timeout=1)
+        await asyncio.sleep(0)
+        assert stuck_task not in runner._shutdown_lingering_tasks
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_caller_cancellation_does_not_cancel_cleanup(
+    monkeypatch,
+):
+    """The shared teardown task outlives cancellation of one stop caller."""
+    runner, _adapter = make_restart_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_BACKGROUND_TASK_JOIN_TIMEOUT_SECONDS",
+        1.0,
+        raising=False,
+    )
+    shutdown_trace: list[str] = []
+
+    class RecordingExecutor:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def shutdown(self, wait=True, *, cancel_futures=False) -> None:
+            shutdown_trace.append(self.label)
+
+    runner._project_executor_lock = threading.Lock()
+    runner._project_executors_closing = False
+    runner._project_capability_executor = RecordingExecutor("capability")
+    runner._project_io_executor = RecordingExecutor("project-io")
+    runner._executor_lock = threading.Lock()
+    runner._executor_closing = False
+    runner._executor = RecordingExecutor("agent")
+
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def swallow_cancellation() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    stuck_task = asyncio.create_task(swallow_cancellation())
+    runner._background_tasks.add(stuck_task)
+    await asyncio.sleep(0)
+    stop_caller = asyncio.create_task(runner.stop())
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    stop_caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stop_caller
+
+    assert runner._stop_task is not None
+    assert not runner._stop_task.done()
+    release.set()
+    await asyncio.wait_for(asyncio.shield(runner._stop_task), timeout=1)
+    assert shutdown_trace == ["capability", "project-io", "agent"]
     assert runner._shutdown_event.is_set() is True
 
 

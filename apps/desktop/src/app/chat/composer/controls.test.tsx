@@ -76,4 +76,12 @@ describe('ComposerControls shortcut tooltips', () => {
 
     await expectShortcutTooltip('Queue message', 'Ctrl+↵')
   })
+
+  it('shows one Send action for a busy managed payload without steer or queue controls', () => {
+    renderControls({ busy: true, busyAction: 'send', hasComposerPayload: true })
+
+    expect(screen.getByRole('button', { name: 'Send' })).not.toBeNull()
+    expect(screen.queryByRole('button', { name: 'Steer the current run' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Queue message' })).toBeNull()
+  })
 })

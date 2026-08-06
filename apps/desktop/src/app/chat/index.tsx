@@ -153,6 +153,7 @@ function ChatHeader({
           pinned={selectedIsPinned}
           sessionId={selectedSessionId || activeSessionId || ''}
           sideOffset={8}
+          storedSession={activeStoredSession ?? undefined}
           title={title}
         >
           <TitleMenuTrigger>{title}</TitleMenuTrigger>

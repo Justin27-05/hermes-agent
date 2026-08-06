@@ -2,10 +2,13 @@ import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime }
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $activeGatewayProfile } from '@/store/profile'
+import { $projectCatalogAuthority, $projects } from '@/store/projects'
 import { clearAllPrompts, setApprovalRequest } from '@/store/prompts'
-import { $activeSessionId } from '@/store/session'
+import { $activeSessionId, $selectedStoredSessionId, $sessions } from '@/store/session'
 import { clearDismissedToolRows } from '@/store/tool-dismiss'
 import { $toolDisclosureStates } from '@/store/tool-view'
+import type { SessionInfo } from '@/types/hermes'
 
 import { Thread } from '../thread'
 
@@ -199,7 +202,19 @@ function GroupHarness({ message }: { message: ThreadMessage }) {
 
 beforeEach(() => {
   clearAllPrompts()
+  $activeGatewayProfile.set('default')
+  $projectCatalogAuthority.set({ catalogGeneration: 1, contextGeneration: 1, profile: 'default' })
+  $projects.set([])
+  $sessions.set([
+    {
+      _lineage_root_id: null,
+      id: 'sess-1',
+      profile: 'default',
+      project_id: null
+    } as SessionInfo
+  ])
   $activeSessionId.set('sess-1')
+  $selectedStoredSessionId.set('sess-1')
   $toolDisclosureStates.set({})
   clearDismissedToolRows()
 })
@@ -208,6 +223,10 @@ afterEach(() => {
   cleanup()
   clearAllPrompts()
   $activeSessionId.set(null)
+  $selectedStoredSessionId.set(null)
+  $sessions.set([])
+  $projects.set([])
+  $projectCatalogAuthority.set({ catalogGeneration: null, contextGeneration: 0, profile: null })
   clearDismissedToolRows()
 })
 

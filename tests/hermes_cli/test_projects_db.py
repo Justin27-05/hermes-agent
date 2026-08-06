@@ -125,6 +125,129 @@ def test_create_get_list(conn):
     assert len(pdb.list_projects(conn)) == 1
 
 
+def test_delete_project_rejects_any_surface_managed_project(conn):
+    from hermes_cli import project_runtime_db as prdb
+
+    project_id = pdb.create_project(conn, name="Managed")
+    prdb.bind_surface(
+        conn,
+        binding_id="managed-desktop",
+        project_id=project_id,
+        surface="desktop",
+        external_binding_id="window-managed",
+        actor_id="owner",
+        now=1,
+    )
+
+    with pytest.raises(
+        pdb.ManagedProjectDeleteError,
+        match="PROJECT_MANAGED_DELETE_FORBIDDEN",
+    ) as raised:
+        pdb.delete_project(conn, project_id)
+
+    assert raised.value.code == "PROJECT_MANAGED_DELETE_FORBIDDEN"
+    assert pdb.get_project(conn, project_id) is not None
+
+
+def test_managed_project_archive_requires_completed_lifecycle(conn):
+    from hermes_cli import project_runtime_db as prdb
+
+    project_id = pdb.create_project(conn, name="Managed archive")
+    prdb.create_project_conversation(
+        conn,
+        project_id=project_id,
+        conversation_id="managed-archive-session",
+        current_phase="implementation",
+        now=1,
+    )
+
+    with pytest.raises(
+        pdb.ManagedProjectArchiveError,
+        match="PROJECT_MANAGED_ARCHIVE_REQUIRES_COMPLETION",
+    ):
+        pdb.archive_project(conn, project_id)
+    assert pdb.get_project(conn, project_id).archived is False
+
+    conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET lifecycle = 'completed'
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    )
+    conn.commit()
+
+    assert pdb.archive_project(conn, project_id) is True
+    assert pdb.get_project(conn, project_id).archived is True
+
+
+def test_managed_project_name_requires_canonical_command(conn):
+    from hermes_cli import project_runtime_db as prdb
+
+    project_id = pdb.create_project(conn, name="Managed name")
+    prdb.create_project_conversation(
+        conn,
+        project_id=project_id,
+        conversation_id="managed-name-session",
+        current_phase="implementation",
+        now=1,
+    )
+
+    with pytest.raises(
+        pdb.ManagedProjectMutationError,
+        match="PROJECT_MANAGED_MUTATION_REQUIRES_COMMAND",
+    ):
+        pdb.update_project(conn, project_id, name="Bypassed name")
+
+    assert pdb.get_project(conn, project_id).name == "Managed name"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM project_events WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()[0] == 0
+
+
+def test_managed_delete_table_guard_matches_restrictive_runtime_schema(conn):
+    runtime_tables = {
+        row["name"]
+        for row in conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name LIKE 'project_%'
+            """
+        )
+        if any(
+            fk["table"] == "projects"
+            and fk["from"] == "project_id"
+            and fk["on_delete"].upper() == "RESTRICT"
+            for fk in conn.execute(
+                f"PRAGMA foreign_key_list({row['name']})"
+            )
+        )
+    }
+
+    assert runtime_tables == set(pdb.MANAGED_PROJECT_RUNTIME_TABLES)
+
+
+def test_delete_project_preserves_legacy_delete_for_never_managed_project(conn):
+    project_id = pdb.create_project(conn, name="Legacy")
+
+    assert pdb.delete_project(conn, project_id) is True
+    assert pdb.get_project(conn, project_id) is None
+
+
+def test_delete_active_legacy_project_clears_active_pointer(conn):
+    project_id = pdb.create_project(conn, name="Active legacy")
+    pdb.set_active(conn, project_id)
+
+    assert pdb.delete_project(conn, project_id) is True
+    assert pdb.get_active_id(conn) is None
+
+
+def test_delete_unknown_project_is_a_noop(conn):
+    assert pdb.delete_project(conn, "project-missing") is False
+
+
 def test_slug_collision_disambiguates(conn):
     pdb.create_project(conn, name="Hermes Agent")
     pdb.create_project(conn, name="Hermes Agent")

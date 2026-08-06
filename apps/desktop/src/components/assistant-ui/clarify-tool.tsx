@@ -27,6 +27,7 @@ import { cn } from '@/lib/utils'
 import { clearClarifyRequest, normalizeChoices, sessionClarifyRequest, warnDroppedChoices } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
+import { projectBlockingInputSurface } from '@/store/project-blocking-inputs'
 
 import { selectMessageRunning } from './tool/fallback-model'
 import { parseMaybeObject } from './tool/fallback-model/format'
@@ -275,7 +276,44 @@ function ClarifyToolSettled({ args, result }: ToolCallMessagePartProps) {
   )
 }
 
-function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
+function ClarifyToolPending(props: ToolCallMessagePartProps) {
+  const view = useSessionView()
+  const runtimeSessionId = useStore(view.$runtimeId)
+  const storedSessionId = useStore(view.$storedId)
+
+  const $surface = useMemo(
+    () => projectBlockingInputSurface(runtimeSessionId, storedSessionId),
+    [runtimeSessionId, storedSessionId]
+  )
+
+  const surface = useStore($surface)
+
+  return surface.status === 'conclusively-legacy' ? (
+    <LegacyClarifyToolPending {...props} />
+  ) : (
+    <ManagedClarifyUnsupported args={props.args} />
+  )
+}
+
+function ManagedClarifyUnsupported({ args }: Pick<ToolCallMessagePartProps, 'args'>) {
+  const { t } = useI18n()
+  const question = useMemo(() => readClarifyArgs(args).question, [args])
+
+  return (
+    <ClarifyShell className="grid gap-1.5 px-2.5 py-2" data-clarify-managed-block="unsupported" role="status">
+      {question ? (
+        <ClarifyLine icon={MessageQuestion}>
+          <span className="whitespace-pre-wrap font-medium leading-(--conversation-line-height)">{question}</span>
+        </ClarifyLine>
+      ) : null}
+      <ClarifyLine icon={CircleLetterA}>
+        <p className="text-(--ui-text-tertiary)">{t.assistant.clarify.managedUnsupported}</p>
+      </ClarifyLine>
+    </ClarifyShell>
+  )
+}
+
+function LegacyClarifyToolPending({ args }: ToolCallMessagePartProps) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   // The tool row is in whichever session's transcript rendered it — read THAT

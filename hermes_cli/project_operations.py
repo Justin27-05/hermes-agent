@@ -2,28 +2,42 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import sqlite3
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
-from typing import Literal, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol
 
 from hermes_cli import project_runtime_db as runtime_db
 from hermes_cli.project_policy import (
     ActorContext,
+    ContractPolicyView,
     Decision,
     PolicyDecision,
+    ProjectBindingView,
+    ProjectCommand,
+    ProjectPolicyView,
     approval_class_for_action,
     canonicalize_targets,
+    decide as decide_project_policy,
 )
 from hermes_cli.project_runtime import (
+    DispatcherLease,
     JSONValue,
     ProjectRuntime,
     ProjectRuntimeError,
     RuntimeErrorCode,
     SQLITE_INT_MAX,
+    TurnAttemptIdentity,
     TurnClaim,
+    TurnExecutionInput,
+    TurnOrigin,
+    WorkerStart,
     _decode_canonical_object,
+    _require_dispatcher_lease,
     canonical_json_object,
 )
 
@@ -182,6 +196,11 @@ class ProjectOperation:
     fencing_token: int
     created_at: int
     updated_at: int
+    policy_authority_sha256: str | None = None
+
+    @property
+    def approval_checkpoint_id(self) -> str | None:
+        return getattr(self, "_approval_checkpoint_id", None)
 
 
 @dataclass(frozen=True)
@@ -215,11 +234,148 @@ class OperationReadbackResult:
             )
 
 
+@dataclass(frozen=True)
+class OperationRecoveryCursor:
+    recovery_membership_sequence: int
+    project_id: str
+    operation_id: str
+    turn_id: str
+
+
+@dataclass(frozen=True)
+class OperationRecoveryMember:
+    recovery_membership_sequence: int
+    project_id: str
+    operation_id: str
+    turn_id: str
+    status: OperationStatus
+
+
+@dataclass(frozen=True)
+class OperationRecoveryMemberScanResult:
+    members: tuple[OperationRecoveryMember, ...]
+    scanned_through: OperationRecoveryCursor | None
+    reached_epoch_end: bool
+
+
+@dataclass(frozen=True)
+class OperationRecoveryScanResult:
+    starts: tuple[WorkerStart, ...]
+    scanned_through: OperationRecoveryCursor | None
+    reached_epoch_end: bool
+
+
+@dataclass(frozen=True)
+class ApprovalCheckpointIdentity:
+    checkpoint_id: str
+    attempt: TurnAttemptIdentity
+    operation_id: str
+    approval_id: str
+
+
+@dataclass(frozen=True)
+class ApprovalCheckpointDecision:
+    action: Literal["wait", "publish", "discard"]
+
+
+def _require_operation_membership_sequence(value: object) -> int:
+    if not (
+        type(value) is int
+        and 1 <= value <= SQLITE_INT_MAX
+    ):
+        raise ProjectOperationError(
+            OperationErrorCode.INVALID_OPERATION_ARGUMENT
+        )
+    return value
+
+
+def _require_operation_recovery_cursor(
+    value: object,
+) -> OperationRecoveryCursor:
+    if type(value) is not OperationRecoveryCursor:
+        raise ProjectOperationError(
+            OperationErrorCode.INVALID_OPERATION_ARGUMENT
+        )
+    _require_operation_membership_sequence(
+        value.recovery_membership_sequence
+    )
+    if not all(
+        type(item) is str and bool(item)
+        for item in (
+            value.project_id,
+            value.operation_id,
+            value.turn_id,
+        )
+    ):
+        raise ProjectOperationError(
+            OperationErrorCode.INVALID_OPERATION_ARGUMENT
+        )
+    return value
+
+
 class OperationReadbackPort(Protocol):
     def read_operation(
         self,
         request: OperationReadbackRequest,
     ) -> OperationReadbackResult: ...
+
+
+class ApprovalCheckpointReadPort(Protocol):
+    def publication_state(
+        self,
+        checkpoint: ApprovalCheckpointIdentity,
+    ) -> Literal[
+        "published", "waiting", "permanent_conflict"
+    ]: ...
+
+
+class _FixedOperationReadback:
+    def __init__(self, result: OperationReadbackResult) -> None:
+        self._result = result
+
+    def read_operation(
+        self,
+        request: OperationReadbackRequest,
+    ) -> OperationReadbackResult:
+        return self._result
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _canonical_policy_value(value: object) -> object:
+    value_type = type(value)
+    if value is None or value_type in {str, int, float, bool}:
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Mapping):
+        if not all(type(key) is str for key in value):
+            raise TypeError("policy authority keys must be strings")
+        return {
+            key: _canonical_policy_value(value[key])
+            for key in sorted(value)
+        }
+    if value_type in {tuple, list}:
+        return [_canonical_policy_value(item) for item in value]
+    if value_type in {set, frozenset}:
+        return sorted(_canonical_policy_value(item) for item in value)
+    if is_dataclass(value):
+        return {
+            field.name: _canonical_policy_value(
+                getattr(value, field.name)
+            )
+            for field in fields(value)
+        }
+    raise TypeError("unsupported policy authority value")
+
+
+def _canonical_policy_authority_json(value: object) -> str:
+    converted = _canonical_policy_value(value)
+    if type(converted) is not dict:
+        raise TypeError("policy authority must be a dataclass object")
+    return canonical_json_object(converted)
 
 
 class ProjectOperationGuard:
@@ -230,6 +386,1450 @@ class ProjectOperationGuard:
             raise TypeError("runtime must be a ProjectRuntime")
         self._runtime = runtime
         self._conn: sqlite3.Connection = runtime._conn
+
+    @staticmethod
+    def _c14_types() -> tuple[type[Any], type[Any], type[Any]]:
+        from gateway.project_runtime_worker import (
+            BoundProjectOperationAuthority,
+            CertifiedProjectOperationExecutionRequest,
+            ProjectPolicyDecisionCarrier,
+        )
+
+        return (
+            BoundProjectOperationAuthority,
+            ProjectPolicyDecisionCarrier,
+            CertifiedProjectOperationExecutionRequest,
+        )
+
+    @staticmethod
+    def _attempt_matches_claim(
+        attempt: object,
+        claim: TurnClaim,
+    ) -> bool:
+        return (
+            type(attempt) is TurnAttemptIdentity
+            and attempt.project_id == claim.project_id
+            and attempt.turn_id == claim.turn_id
+            and attempt.sequence == claim.sequence
+            and attempt.worker_id == claim.worker_id
+            and attempt.attempt_id == claim.attempt_id
+            and attempt.lease_generation == claim.lease_generation
+            and attempt.fencing_token == claim.fencing_token
+            and attempt.canonical_session_id
+            == claim.canonical_session_id
+            and attempt.lease_expires_at <= claim.lease_expires_at
+        )
+
+    @staticmethod
+    def _authority_storage(
+        intent: OperationIntent,
+        authority: object,
+        policy: PolicyDecision,
+        policy_authority: object,
+    ) -> tuple[str, str, str, str, str, str]:
+        (
+            authority_type,
+            carrier_type,
+            _,
+        ) = ProjectOperationGuard._c14_types()
+        if not (
+            type(authority) is authority_type
+            and type(policy_authority) is carrier_type
+            and type(policy) is PolicyDecision
+            and authority == policy_authority.operation_authority
+            and intent == authority.intent
+            and policy == policy_authority.decision
+        ):
+            raise PermissionError("operation policy authority mismatch")
+
+        command = authority.command
+        effect_scope = json.loads(authority.effect_scope_json)
+        if type(effect_scope) is not dict:
+            raise PermissionError("operation effect scope is not an object")
+        expected_authority = {
+            "command": {
+                "name": command.name,
+                "project_id": command.project_id,
+                "revision": command.revision,
+                "action_class": command.action_class,
+                "targets": list(command.targets),
+                "batch_id": command.batch_id,
+                "batch_items": list(command.batch_items),
+                "metadata": dict(command.metadata),
+            },
+            "intent": {
+                "operation_id": intent.operation_id,
+                "project_id": intent.project_id,
+                "turn_id": intent.turn_id,
+                "idempotency_key": intent.idempotency_key,
+                "canonical_action": intent.canonical_action,
+                "command_revision": intent.command_revision,
+                "targets": list(intent.targets),
+                "batch_items": list(intent.batch_items),
+                "payload": dict(intent.payload),
+                "readback_kind": intent.readback_kind,
+                "remote_idempotency_supported": (
+                    intent.remote_idempotency_supported
+                ),
+            },
+            "policy_batch_id": authority.policy_batch_id,
+            "capability_fingerprint": [
+                intent.canonical_action,
+                intent.command_revision,
+                intent.readback_kind,
+                intent.remote_idempotency_supported,
+            ],
+            "effect_scope": effect_scope,
+        }
+        expected_scope = canonical_json_object(effect_scope)
+        expected_authority_json = canonical_json_object(
+            expected_authority
+        )
+        if not (
+            authority.effect_scope_json == expected_scope
+            and authority.effect_scope_sha256
+            == _sha256_text(expected_scope)
+            and authority.authority_json == expected_authority_json
+            and authority.authority_sha256
+            == _sha256_text(expected_authority_json)
+            and command.project_id == intent.project_id
+            and command.name == intent.canonical_action
+            and command.targets == intent.targets
+            and command.batch_id == authority.policy_batch_id
+            and command.batch_items == intent.batch_items
+            and tuple(effect_scope.get("targets", ()))
+            == intent.targets
+            and tuple(effect_scope.get("batch_items", ()))
+            == intent.batch_items
+            and effect_scope.get(
+                "payload_effects",
+                effect_scope.get("payload"),
+            )
+            == dict(intent.payload)
+            and not (
+                set(effect_scope)
+                - {
+                    "targets",
+                    "batch_items",
+                    "payload_effects",
+                    "payload",
+                }
+            )
+        ):
+            raise PermissionError("operation authority serialization drift")
+        policy_json = _canonical_policy_authority_json(
+            policy_authority
+        )
+        return (
+            expected_authority_json,
+            authority.authority_sha256,
+            expected_scope,
+            authority.effect_scope_sha256,
+            policy_json,
+            _sha256_text(policy_json),
+        )
+
+    def _current_policy_views(
+        self,
+        *,
+        project_id: str,
+        contract_id: str,
+        origin: TurnOrigin,
+    ) -> tuple[
+        ProjectPolicyView,
+        str,
+        str,
+        ContractPolicyView,
+        ActorContext,
+    ]:
+        state = runtime_db.runtime_state_for_project(
+            self._conn,
+            project_id,
+        )
+        contract_row = self._conn.execute(
+            """
+            SELECT contract_id, revision, contract_json, status
+            FROM project_contracts
+            WHERE project_id = ? AND contract_id = ?
+            """,
+            (project_id, contract_id),
+        ).fetchone()
+        binding_rows = self._conn.execute(
+            """
+            SELECT binding_id, surface, external_binding_id, actor_id
+            FROM project_surface_bindings
+            WHERE project_id = ?
+            ORDER BY binding_id
+            """,
+            (project_id,),
+        ).fetchall()
+        folder_rows = self._conn.execute(
+            """
+            SELECT path FROM project_folders
+            WHERE project_id = ?
+            ORDER BY is_primary DESC, path
+            """,
+            (project_id,),
+        ).fetchall()
+        if state is None or contract_row is None:
+            raise PermissionError("project policy authority is unavailable")
+        try:
+            contract_payload = json.loads(
+                contract_row["contract_json"]
+            )
+            allowed_action_classes = frozenset(
+                contract_payload["allowed_action_classes"]
+            )
+            allowed_phases = frozenset(
+                contract_payload["allowed_phases"]
+            )
+            approved_plan_ref = contract_payload.get(
+                "approved_plan_ref"
+            )
+            contract = ContractPolicyView(
+                contract_row["revision"],
+                allowed_action_classes,
+                allowed_phases,
+                approved_plan_ref,
+            )
+            bindings = tuple(
+                ProjectBindingView(
+                    row["binding_id"],
+                    row["surface"],
+                    row["actor_id"],
+                    project_id,
+                )
+                for row in binding_rows
+                if row["actor_id"] is not None
+            )
+            project = ProjectPolicyView(
+                project_id,
+                state.lifecycle,
+                state.current_phase,
+                tuple(
+                    row["path"].replace("\\", "/")
+                    for row in folder_rows
+                ),
+                approved_plan_ref,
+                bindings,
+            )
+            matching = next(
+                row
+                for row in binding_rows
+                if row["binding_id"] == origin.binding_id
+            )
+            if not (
+                matching["surface"] == origin.surface
+                and matching["external_binding_id"]
+                == origin.external_binding_id
+                and matching["actor_id"] == origin.actor_id
+            ):
+                raise PermissionError("project owner binding drift")
+            actor = ActorContext(
+                matching["actor_id"],
+                matching["surface"],
+                matching["binding_id"],
+                True,
+            )
+        except (
+            KeyError,
+            StopIteration,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise PermissionError(
+                "project policy authority is malformed"
+            ) from exc
+        return (
+            project,
+            contract_row["status"],
+            _sha256_text(contract_row["contract_json"]),
+            contract,
+            actor,
+        )
+
+    def _require_prepare_policy_authority(
+        self,
+        *,
+        claim: TurnClaim,
+        intent: OperationIntent,
+        authority: object,
+        policy: PolicyDecision,
+        policy_authority: object,
+        state: object,
+        control: object,
+    ) -> None:
+        _, carrier_type, _ = self._c14_types()
+        if type(policy_authority) is not carrier_type:
+            raise PermissionError("invalid project policy authority")
+        carrier = policy_authority
+        if not self._attempt_matches_claim(
+            carrier.execution_attempt,
+            claim,
+        ):
+            raise PermissionError("project attempt authority drift")
+        (
+            project,
+            contract_status,
+            contract_digest,
+            contract,
+            actor,
+        ) = self._current_policy_views(
+            project_id=claim.project_id,
+            contract_id=carrier.contract_id,
+            origin=carrier.execution_origin,
+        )
+        command = authority.command
+        fresh_decision = decide_project_policy(
+            command,
+            project,
+            contract,
+            actor,
+        )
+        checks = {
+            "origin": (
+                carrier.execution_origin.actor_id == actor.actor_id
+            ),
+            "project": carrier.project == project,
+            "contract_status": (
+                carrier.contract_status == contract_status == "active"
+            ),
+            "contract_digest": (
+                carrier.contract_json_sha256 == contract_digest
+            ),
+            "contract": carrier.contract == contract,
+            "actor": carrier.actor == actor,
+            "control": (
+                carrier.control_version
+                == getattr(control, "control_version", None)
+            ),
+            "runtime": (
+                carrier.runtime_version == getattr(state, "version", None)
+            ),
+            "decision": (
+                carrier.decision == policy == fresh_decision
+            ),
+            "command_project": command.project_id == claim.project_id,
+            "command_revision": command.revision == contract.revision,
+            "action_class": (
+                command.action_class in contract.allowed_action_classes
+            ),
+            "phase": (
+                command.metadata == {"phase": project.current_phase}
+            ),
+            "intent": (
+                intent.project_id == claim.project_id
+                and intent.turn_id == claim.turn_id
+            ),
+        }
+        failed = tuple(
+            label for label, accepted in checks.items() if not accepted
+        )
+        if failed:
+            raise PermissionError(
+                "project policy authority drift: " + ",".join(failed)
+            )
+
+    @staticmethod
+    def _claim_from_attempt(
+        attempt: TurnAttemptIdentity,
+    ) -> TurnClaim:
+        if type(attempt) is not TurnAttemptIdentity:
+            raise TypeError("execution attempt must be exact")
+        return TurnClaim(
+            turn_id=attempt.turn_id,
+            project_id=attempt.project_id,
+            sequence=attempt.sequence,
+            worker_id=attempt.worker_id,
+            attempt_id=attempt.attempt_id,
+            lease_generation=attempt.lease_generation,
+            fencing_token=attempt.fencing_token,
+            lease_expires_at=attempt.lease_expires_at,
+            canonical_session_id=attempt.canonical_session_id,
+        )
+
+    def _require_c14_record_authority(
+        self,
+        record: runtime_db.ProjectOperationRecord,
+    ) -> tuple[
+        Mapping[str, object],
+        Mapping[str, object],
+        Mapping[str, object],
+    ]:
+        certificate = (
+            record.operation_authority_json,
+            record.operation_authority_sha256,
+            record.effect_scope_json,
+            record.effect_scope_sha256,
+            record.policy_authority_json,
+            record.policy_authority_sha256,
+        )
+        if not all(type(value) is str and value for value in certificate):
+            raise PermissionError("operation has no C14 policy authority")
+        (
+            authority_json,
+            authority_sha256,
+            effect_scope_json,
+            effect_scope_sha256,
+            policy_authority_json,
+            policy_authority_sha256,
+        ) = certificate
+        try:
+            authority = json.loads(authority_json)
+            effect_scope = json.loads(effect_scope_json)
+            policy_authority = json.loads(policy_authority_json)
+            command = authority["command"]
+            intent = authority["intent"]
+            stored_targets = json.loads(record.targets_json)
+            stored_batch_items = json.loads(record.batch_items_json)
+            stored_payload = json.loads(record.payload_json)
+            nested_authority = policy_authority[
+                "operation_authority"
+            ]
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise PermissionError(
+                "malformed stored operation authority"
+            ) from exc
+        if not (
+            type(authority) is dict
+            and type(effect_scope) is dict
+            and type(policy_authority) is dict
+            and type(command) is dict
+            and type(intent) is dict
+            and type(nested_authority) is dict
+            and canonical_json_object(authority) == authority_json
+            and canonical_json_object(effect_scope) == effect_scope_json
+            and canonical_json_object(policy_authority)
+            == policy_authority_json
+            and _sha256_text(authority_json) == authority_sha256
+            and _sha256_text(effect_scope_json) == effect_scope_sha256
+            and _sha256_text(policy_authority_json)
+            == policy_authority_sha256
+            and authority.get("effect_scope") == effect_scope
+            and command.get("name") == record.canonical_action
+            and command.get("project_id") == record.project_id
+            and command.get("targets") == stored_targets
+            and command.get("batch_items") == stored_batch_items
+            and intent.get("operation_id") == record.operation_id
+            and intent.get("project_id") == record.project_id
+            and intent.get("turn_id") == record.turn_id
+            and intent.get("idempotency_key")
+            == record.idempotency_key
+            and intent.get("canonical_action")
+            == record.canonical_action
+            and intent.get("command_revision")
+            == record.command_revision
+            and intent.get("targets") == stored_targets
+            and intent.get("batch_items") == stored_batch_items
+            and intent.get("payload") == stored_payload
+            and intent.get("readback_kind") == record.readback_kind
+            and intent.get("remote_idempotency_supported")
+            is record.remote_idempotency_supported
+            and effect_scope.get("targets") == stored_targets
+            and effect_scope.get("batch_items") == stored_batch_items
+            and effect_scope.get(
+                "payload_effects",
+                effect_scope.get("payload"),
+            )
+            == stored_payload
+            and authority.get("capability_fingerprint")
+            == [
+                record.canonical_action,
+                record.command_revision,
+                record.readback_kind,
+                record.remote_idempotency_supported,
+            ]
+            and nested_authority.get("authority_json")
+            == authority_json
+            and nested_authority.get("authority_sha256")
+            == authority_sha256
+            and nested_authority.get("effect_scope_json")
+            == effect_scope_json
+            and nested_authority.get("effect_scope_sha256")
+            == effect_scope_sha256
+            and nested_authority.get("command") == command
+            and nested_authority.get("intent") == intent
+        ):
+            raise PermissionError("stored operation authority drift")
+        return authority, effect_scope, policy_authority
+
+    def _require_current_operation_policy(
+        self,
+        record: runtime_db.ProjectOperationRecord,
+    ) -> None:
+        authority, _, stored = self._require_c14_record_authority(
+            record
+        )
+        try:
+            origin_value = stored["execution_origin"]
+            command_value = authority["command"]
+            origin = TurnOrigin(
+                origin_value["binding_id"],
+                origin_value["surface"],
+                origin_value["external_binding_id"],
+                origin_value["actor_id"],
+            )
+            command = ProjectCommand(
+                command_value["name"],
+                command_value["project_id"],
+                command_value["revision"],
+                command_value["action_class"],
+                tuple(command_value["targets"]),
+                command_value["batch_id"],
+                tuple(command_value["batch_items"]),
+                command_value["metadata"],
+            )
+            (
+                project,
+                contract_status,
+                contract_digest,
+                contract,
+                actor,
+            ) = self._current_policy_views(
+                project_id=record.project_id,
+                contract_id=stored["contract_id"],
+                origin=origin,
+            )
+            fresh_decision = decide_project_policy(
+                command,
+                project,
+                contract,
+                actor,
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise PermissionError(
+                "current operation policy authority is malformed"
+            ) from exc
+        if not (
+            contract_status == stored.get("contract_status") == "active"
+            and contract_digest
+            == stored.get("contract_json_sha256")
+            and _canonical_policy_value(project)
+            == stored.get("project")
+            and _canonical_policy_value(contract)
+            == stored.get("contract")
+            and _canonical_policy_value(actor)
+            == stored.get("actor")
+            and _canonical_policy_value(fresh_decision)
+            == stored.get("decision")
+            and command.action_class
+            in contract.allowed_action_classes
+            and command.metadata
+            == {"phase": project.current_phase}
+        ):
+            raise PermissionError(
+                "current project operation policy drift"
+            )
+
+    def _record_for_public_operation(
+        self,
+        operation: ProjectOperation,
+    ) -> runtime_db.ProjectOperationRecord:
+        if type(operation) is not ProjectOperation:
+            raise TypeError("operation must be exact")
+        try:
+            record = runtime_db._project_operation_for_id(
+                self._conn,
+                project_id=operation.project_id,
+                operation_id=operation.operation_id,
+            )
+        except (
+            RuntimeError,
+            runtime_db.LegacyOperationUnmanagedError,
+        ) as exc:
+            raise PermissionError(
+                "operation certificate is unavailable"
+            ) from exc
+        if record is None or self._public_operation(record) != operation:
+            raise PermissionError("public operation authority drift")
+        return record
+
+    def certified_execution_request(
+        self,
+        execution: TurnExecutionInput,
+        operation: ProjectOperation,
+    ) -> object:
+        if type(execution) is not TurnExecutionInput:
+            raise TypeError("execution must be exact")
+        record = self._record_for_public_operation(operation)
+        authority, _, _ = self._require_c14_record_authority(record)
+        claim = self._claim_from_attempt(execution.attempt)
+        now = self._runtime._now()
+        self._runtime._require_live_operation_claim(claim, now=now)
+        if not (
+            operation.status == "approved"
+            and record.status == "approved"
+            and record.project_id == execution.attempt.project_id
+            and record.turn_id == execution.attempt.turn_id
+            and record.attempt_id == execution.attempt.attempt_id
+            and record.lease_generation
+            == execution.attempt.lease_generation
+            and record.fencing_token == execution.attempt.fencing_token
+            and type(record.readback_kind) is str
+            and bool(record.readback_kind)
+            and record.remote_idempotency_supported is True
+        ):
+            raise PermissionError(
+                "operation is not certified for this execution"
+            )
+        payload = authority["intent"]["payload"]
+        if type(payload) is not dict:
+            raise PermissionError("operation payload is not canonical")
+        _, _, request_type = self._c14_types()
+        return request_type(
+            operation=operation,
+            attempt=execution.attempt,
+            payload=_immutable_json_mapping(payload),
+            approval_checkpoint_id=record.approval_checkpoint_id,
+            operation_authority_json=record.operation_authority_json,
+            operation_authority_sha256=(
+                record.operation_authority_sha256
+            ),
+            effect_scope_json=record.effect_scope_json,
+            effect_scope_sha256=record.effect_scope_sha256,
+            policy_authority_sha256=record.policy_authority_sha256,
+            remote_idempotency_supported=(
+                record.remote_idempotency_supported
+            ),
+            capability_fingerprint=(
+                record.canonical_action,
+                record.command_revision,
+                record.readback_kind,
+                record.remote_idempotency_supported,
+            ),
+        )
+
+    def operation_recovery_membership_upper_watermark(
+        self,
+    ) -> int | None:
+        """Read the inclusive upper bound for one recovery scan epoch."""
+        member = runtime_db._operation_recovery_membership_upper(
+            self._conn
+        )
+        return (
+            member.recovery_membership_sequence
+            if member is not None
+            else None
+        )
+
+    def scan_operation_recovery_members(
+        self,
+        *,
+        after: OperationRecoveryCursor | None,
+        through_membership_sequence: int,
+        limit: int,
+    ) -> OperationRecoveryMemberScanResult:
+        """Read one bounded certified recovery page without acting."""
+        if after is not None:
+            after = _require_operation_recovery_cursor(after)
+        through_membership_sequence = (
+            _require_operation_membership_sequence(
+                through_membership_sequence
+            )
+        )
+        if not (
+            type(limit) is int
+            and 1 <= limit <= 100
+        ):
+            raise ProjectOperationError(
+                OperationErrorCode.INVALID_OPERATION_ARGUMENT
+            )
+        if (
+            after is not None
+            and after.recovery_membership_sequence
+            > through_membership_sequence
+        ):
+            raise ProjectOperationError(
+                OperationErrorCode.INVALID_OPERATION_ARGUMENT
+            )
+
+        raw_members = (
+            runtime_db._operation_recovery_membership_page(
+                self._conn,
+                after=(
+                    (
+                        after.recovery_membership_sequence,
+                        after.project_id,
+                        after.operation_id,
+                        after.turn_id,
+                    )
+                    if after is not None
+                    else None
+                ),
+                through_membership_sequence=(
+                    through_membership_sequence
+                ),
+                limit=limit,
+            )
+        )
+        members = tuple(
+            OperationRecoveryMember(
+                member.recovery_membership_sequence,
+                member.project_id,
+                member.operation_id,
+                member.turn_id,
+                member.status,
+            )
+            for member in raw_members
+        )
+        scanned_through = (
+            OperationRecoveryCursor(
+                raw_members[-1].recovery_membership_sequence,
+                raw_members[-1].project_id,
+                raw_members[-1].operation_id,
+                raw_members[-1].turn_id,
+            )
+            if raw_members
+            else after
+        )
+        reached_epoch_end = not raw_members
+        if raw_members:
+            reached_epoch_end = (
+                raw_members[-1].recovery_membership_sequence
+                == through_membership_sequence
+                or not runtime_db._operation_recovery_membership_remaining(
+                    self._conn,
+                    after=(
+                        raw_members[
+                            -1
+                        ].recovery_membership_sequence,
+                        raw_members[-1].project_id,
+                        raw_members[-1].operation_id,
+                        raw_members[-1].turn_id,
+                    ),
+                    through_membership_sequence=(
+                        through_membership_sequence
+                    ),
+                )
+            )
+        return OperationRecoveryMemberScanResult(
+            members,
+            scanned_through,
+            reached_epoch_end,
+        )
+
+    def _block_approved_operation_recovery(
+        self,
+        candidate: runtime_db.ProjectOperationRecord,
+        *,
+        expected_checkpoint: ApprovalCheckpointIdentity | None,
+        dispatcher_lease: DispatcherLease,
+        blocked_reason: str,
+    ) -> bool:
+        """Persist one exact approved-operation recovery block."""
+        now = self._runtime._now()
+        with runtime_db.write_transaction(self._conn):
+            self._runtime._require_dispatcher_start_authority(
+                dispatcher_lease,
+                now,
+            )
+            state = runtime_db.runtime_state_for_project(
+                self._conn,
+                candidate.project_id,
+            )
+            if not (
+                state is not None
+                and state.lifecycle == "active"
+                and state.transcript_pending_batch_id is None
+                and state.transcript_dispatch_block_key is None
+            ):
+                return False
+            try:
+                operation = runtime_db._project_operation_for_id(
+                    self._conn,
+                    project_id=candidate.project_id,
+                    operation_id=candidate.operation_id,
+                )
+            except runtime_db.LegacyOperationUnmanagedError:
+                return False
+            if not (
+                operation is not None
+                and operation == candidate
+                and operation.status == "approved"
+                and operation.approval_id is not None
+                and type(blocked_reason) is str
+                and bool(blocked_reason)
+            ):
+                return False
+            try:
+                checkpoint = (
+                    self._checkpoint_event_identity(operation)
+                    if operation.approval_checkpoint_id is not None
+                    else None
+                )
+            except Exception:
+                return False
+            if checkpoint != expected_checkpoint:
+                return False
+
+            turn = runtime_db._runtime_turn_for_project(
+                self._conn,
+                project_id=operation.project_id,
+                turn_id=operation.turn_id,
+            )
+            control = runtime_db._runtime_control_for_turn(
+                self._conn,
+                project_id=operation.project_id,
+                turn_id=operation.turn_id,
+            )
+            lease = runtime_db._current_worker_lease_for_turn(
+                self._conn,
+                project_id=operation.project_id,
+                turn_id=operation.turn_id,
+            )
+            oldest = self._conn.execute(
+                """
+                SELECT turn_id FROM project_turns
+                WHERE project_id = ?
+                  AND status NOT IN ('succeeded', 'failed', 'cancelled')
+                ORDER BY sequence, turn_id
+                LIMIT 1
+                """,
+                (operation.project_id,),
+            ).fetchone()
+            approval = self._conn.execute(
+                """
+                SELECT status, consumed_at
+                FROM project_approvals
+                WHERE project_id = ? AND approval_id = ?
+                  AND operation_id = ? AND turn_id = ?
+                """,
+                (
+                    operation.project_id,
+                    operation.approval_id,
+                    operation.operation_id,
+                    operation.turn_id,
+                ),
+            ).fetchone()
+            live_claim = (
+                turn is not None
+                and control is not None
+                and lease is not None
+                and turn.status == "claimed"
+                and turn.execution_state == "started"
+                and lease.lease_id == operation.attempt_id
+                and lease.worker_id == control.claim_worker_id
+                and lease.lease_generation
+                    == operation.lease_generation
+                and lease.fencing_token == operation.fencing_token
+                and lease.expires_at
+                    == control.claim_lease_expires_at
+                and lease.expires_at <= now
+            )
+            parked_recovery = (
+                runtime_db._recovery_candidate_for_attempt(
+                    self._conn,
+                    project_id=operation.project_id,
+                    turn_id=operation.turn_id,
+                    attempt_id=operation.attempt_id,
+                    lease_generation=operation.lease_generation,
+                    fencing_token=operation.fencing_token,
+                )
+                if (
+                    turn is not None
+                    and turn.status == "reconciling"
+                    and lease is None
+                )
+                else None
+            )
+            if not (
+                turn is not None
+                and control is not None
+                and oldest is not None
+                and oldest["turn_id"] == operation.turn_id
+                and (live_claim or parked_recovery is not None)
+                and turn.recovery_block_key is None
+                and turn.attempt_id == operation.attempt_id
+                and turn.lease_generation
+                    == operation.lease_generation
+                and turn.fencing_token == operation.fencing_token
+                and control.control_state == "running"
+                and control.attempt_id == operation.attempt_id
+                and type(control.claim_worker_id) is str
+                and bool(control.claim_worker_id)
+                and type(control.claim_lease_expires_at) is int
+                and control.claim_canonical_session_id
+                    == state.conversation_tip_id
+                and approval is not None
+                and approval["status"] == "approved"
+                and type(approval["consumed_at"]) is int
+            ):
+                return False
+            if expected_checkpoint is not None:
+                checkpoint_attempt = expected_checkpoint.attempt
+                if not runtime_db._checkpoint_current_authority_relation(
+                    checkpoint_attempt_id=(
+                        checkpoint_attempt.attempt_id
+                    ),
+                    checkpoint_worker_id=checkpoint_attempt.worker_id,
+                    checkpoint_canonical_session_id=(
+                        checkpoint_attempt.canonical_session_id
+                    ),
+                    checkpoint_lease_generation=(
+                        checkpoint_attempt.lease_generation
+                    ),
+                    checkpoint_fencing_token=(
+                        checkpoint_attempt.fencing_token
+                    ),
+                    checkpoint_lease_expires_at=(
+                        checkpoint_attempt.lease_expires_at
+                    ),
+                    current_attempt_id=operation.attempt_id,
+                    current_worker_id=control.claim_worker_id,
+                    current_canonical_session_id=(
+                        control.claim_canonical_session_id
+                    ),
+                    current_lease_generation=(
+                        operation.lease_generation
+                    ),
+                    current_fencing_token=operation.fencing_token,
+                    current_lease_expires_at=(
+                        control.claim_lease_expires_at
+                    ),
+                ):
+                    return False
+
+            try:
+                runtime_db._decertify_project_operation(
+                    self._conn,
+                    operation,
+                )
+                blocked = self._conn.execute(
+                    """
+                    UPDATE project_operations
+                    SET status = 'blocked', blocked_reason = ?,
+                        readback_json = NULL, updated_at = ?
+                    WHERE project_id = ? AND operation_id = ?
+                      AND turn_id = ? AND status = 'approved'
+                      AND guard_validated = 0
+                      AND attempt_id = ?
+                      AND lease_generation = ?
+                      AND fencing_token = ?
+                      AND approval_id = ?
+                      AND approval_checkpoint_id IS ?
+                    """,
+                    (
+                        blocked_reason,
+                        now,
+                        operation.project_id,
+                        operation.operation_id,
+                        operation.turn_id,
+                        operation.attempt_id,
+                        operation.lease_generation,
+                        operation.fencing_token,
+                        operation.approval_id,
+                        operation.approval_checkpoint_id,
+                    ),
+                )
+                if blocked.rowcount != 1:
+                    raise RuntimeError(
+                        "approved operation changed while blocking"
+                    )
+                recovery = parked_recovery
+                if recovery is None:
+                    assert lease is not None
+                    recovery = (
+                        runtime_db
+                        ._park_live_runtime_turn_for_operation_block(
+                        self._conn,
+                        project_id=operation.project_id,
+                        turn_id=operation.turn_id,
+                        sequence=turn.sequence,
+                        attempt_id=operation.attempt_id,
+                        worker_id=lease.worker_id,
+                        lease_generation=operation.lease_generation,
+                        fencing_token=operation.fencing_token,
+                        lease_expires_at=lease.expires_at,
+                        canonical_session_id=(
+                            control.claim_canonical_session_id
+                        ),
+                        control_version=control.control_version,
+                        now=now,
+                    )
+                    )
+                if recovery is None:
+                    raise RuntimeError(
+                        "approved operation recovery disappeared"
+                    )
+                block_key = runtime_db._recovery_block_key(
+                    project_id=recovery.project_id,
+                    turn_id=recovery.turn_id,
+                    attempt_id=recovery.attempt_id,
+                    lease_generation=recovery.lease_generation,
+                    fencing_token=recovery.fencing_token,
+                )
+                updated_state = self._runtime._advance_state(
+                    state,
+                    now,
+                )
+                runtime_db._append_runtime_event(
+                    self._conn,
+                    event_id=block_key,
+                    project_id=recovery.project_id,
+                    kind="turn.recovery_blocked",
+                    turn_id=recovery.turn_id,
+                    payload_json=canonical_json_object(
+                        {
+                            "attempt_id": recovery.attempt_id,
+                            "fencing_token": recovery.fencing_token,
+                            "lease_generation": (
+                                recovery.lease_generation
+                            ),
+                            "source_status": recovery.source_status,
+                            "turn_id": recovery.turn_id,
+                            "version": updated_state.version,
+                        }
+                    ),
+                    created_at=now,
+                )
+                if not runtime_db._set_recovery_block_key(
+                    self._conn,
+                    candidate=recovery,
+                    block_key=block_key,
+                ):
+                    raise RuntimeError(
+                        "approved operation recovery block changed"
+                    )
+                runtime_db._certify_project_operation(
+                    self._conn,
+                    project_id=operation.project_id,
+                    operation_id=operation.operation_id,
+                )
+            except Exception as exc:
+                raise ProjectOperationError(
+                    OperationErrorCode.OPERATION_STATE_CONFLICT,
+                    project_id=operation.project_id,
+                    turn_id=operation.turn_id,
+                    operation_id=operation.operation_id,
+                    current_version=state.version,
+                ) from exc
+            return True
+
+    def recover_pending_operations(
+        self,
+        readback: OperationReadbackPort | object,
+        approval_checkpoints: ApprovalCheckpointReadPort,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+        dispatcher_lease: DispatcherLease,
+        max_claims: int,
+        after: OperationRecoveryCursor | None,
+        through_membership_sequence: int,
+        limit: int,
+    ) -> OperationRecoveryScanResult:
+        """Classify one certified raw page and issue bounded starts."""
+        direct_readback = (
+            readback
+            if callable(getattr(readback, "read_operation", None))
+            else None
+        )
+        capability_getter = (
+            getattr(readback, "get", None)
+            if direct_readback is None
+            else None
+        )
+        if not (
+            (
+                direct_readback is not None
+                or callable(capability_getter)
+            )
+            and callable(
+                getattr(
+                    approval_checkpoints,
+                    "publication_state",
+                    None,
+                )
+            )
+            and type(worker_id) is str
+            and worker_id
+            and type(lease_seconds) is int
+            and lease_seconds > 0
+            and type(limit) is int
+            and 1 <= limit <= 100
+            and type(max_claims) is int
+            and 0 <= max_claims <= limit
+            and not self._conn.in_transaction
+        ):
+            raise ProjectOperationError(
+                OperationErrorCode.INVALID_OPERATION_ARGUMENT
+            )
+        dispatcher_lease = _require_dispatcher_lease(
+            dispatcher_lease
+        )
+        if after is not None:
+            after = _require_operation_recovery_cursor(after)
+        through_membership_sequence = (
+            _require_operation_membership_sequence(
+                through_membership_sequence
+            )
+        )
+        if (
+            after is not None
+            and after.recovery_membership_sequence
+            > through_membership_sequence
+        ):
+            raise ProjectOperationError(
+                OperationErrorCode.INVALID_OPERATION_ARGUMENT
+            )
+
+        page = self.scan_operation_recovery_members(
+            after=after,
+            through_membership_sequence=(
+                through_membership_sequence
+            ),
+            limit=limit,
+        )
+        starts: list[WorkerStart] = []
+        for member in page.members:
+            if member.status == "approved":
+                try:
+                    candidate = runtime_db._project_operation_for_id(
+                        self._conn,
+                        project_id=member.project_id,
+                        operation_id=member.operation_id,
+                    )
+                except runtime_db.LegacyOperationUnmanagedError:
+                    continue
+            else:
+                candidate = runtime_db._operation_pending_for_turn(
+                    self._conn,
+                    project_id=member.project_id,
+                    turn_id=member.turn_id,
+                )
+            if not (
+                candidate is not None
+                and candidate.project_id == member.project_id
+                and candidate.operation_id == member.operation_id
+                and candidate.turn_id == member.turn_id
+                and candidate.status == member.status
+                and candidate.recovery_membership_sequence
+                == member.recovery_membership_sequence
+            ):
+                continue
+
+            if candidate.status != "approved":
+                recovery = (
+                    runtime_db._recovery_candidate_for_attempt(
+                        self._conn,
+                        project_id=candidate.project_id,
+                        turn_id=candidate.turn_id,
+                        attempt_id=candidate.attempt_id,
+                        lease_generation=(
+                            candidate.lease_generation
+                        ),
+                        fencing_token=candidate.fencing_token,
+                    )
+                )
+                if recovery is None:
+                    continue
+                parked_receipt = (
+                    self._receipt_from_record(candidate)
+                    if candidate.receipt_id is not None
+                    else None
+                )
+                request = self._readback_request(
+                    candidate,
+                    parked_receipt,
+                )
+                recovery_readback = direct_readback
+                if recovery_readback is None:
+                    assert callable(capability_getter)
+                    fingerprint = (
+                        candidate.canonical_action,
+                        candidate.command_revision,
+                        candidate.readback_kind,
+                        candidate.remote_idempotency_supported,
+                    )
+                    adapter = capability_getter(fingerprint, None)
+                    if adapter is None:
+                        continue
+                    declared = getattr(adapter, "fingerprint", None)
+                    if not (
+                        (
+                            declared is None
+                            or (
+                                isinstance(declared, tuple)
+                                and tuple(declared) == fingerprint
+                            )
+                        )
+                        and callable(
+                            getattr(adapter, "read_operation", None)
+                        )
+                    ):
+                        continue
+                    recovery_readback = adapter
+                try:
+                    result = recovery_readback.read_operation(request)
+                except Exception:
+                    continue
+                claim = TurnClaim(
+                    turn_id=recovery.turn_id,
+                    project_id=recovery.project_id,
+                    sequence=recovery.sequence,
+                    worker_id=recovery.worker_id,
+                    attempt_id=recovery.attempt_id,
+                    lease_generation=(
+                        recovery.lease_generation
+                    ),
+                    fencing_token=recovery.fencing_token,
+                    lease_expires_at=recovery.lease_expires_at,
+                    canonical_session_id=(
+                        recovery.canonical_session_id
+                    ),
+                )
+                try:
+                    operation = self.reconcile(
+                        claim,
+                        candidate.operation_id,
+                        _FixedOperationReadback(result),
+                    )
+                except ProjectOperationError as exc:
+                    if (
+                        exc.code
+                        is OperationErrorCode.OPERATION_STATE_CONFLICT
+                    ):
+                        continue
+                    raise
+                except ProjectRuntimeError as exc:
+                    if exc.code is RuntimeErrorCode.STALE_TURN_CLAIM:
+                        continue
+                    raise
+                if operation.status != "approved":
+                    continue
+                candidate = (
+                    runtime_db._operation_pending_for_turn(
+                        self._conn,
+                        project_id=member.project_id,
+                        turn_id=member.turn_id,
+                    )
+                )
+                if not (
+                    candidate is not None
+                    and candidate.operation_id
+                    == member.operation_id
+                    and candidate.status == "approved"
+                ):
+                    continue
+
+            expected_checkpoint = None
+            checkpoint_outcome = None
+            if candidate.approval_checkpoint_id is not None:
+                try:
+                    expected_checkpoint = (
+                        self._checkpoint_event_identity(
+                            candidate,
+                            certify_current=True,
+                        )
+                    )
+                except Exception:
+                    continue
+                try:
+                    checkpoint_outcome = (
+                        approval_checkpoints.publication_state(
+                            expected_checkpoint
+                        )
+                    )
+                except Exception:
+                    continue
+                if checkpoint_outcome == "waiting":
+                    continue
+                if checkpoint_outcome != "published":
+                    try:
+                        self._block_approved_operation_recovery(
+                            candidate,
+                            expected_checkpoint=expected_checkpoint,
+                            dispatcher_lease=dispatcher_lease,
+                            blocked_reason=(
+                                "approval_checkpoint_conflict"
+                            ),
+                        )
+                    except ProjectOperationError as exc:
+                        if (
+                            exc.code
+                            is OperationErrorCode.OPERATION_STATE_CONFLICT
+                        ):
+                            continue
+                        raise
+                    except ProjectRuntimeError as exc:
+                        if (
+                            exc.code
+                            is RuntimeErrorCode.STALE_DISPATCHER_LEASE
+                        ):
+                            break
+                        raise
+                    continue
+            elif candidate.approval_id is not None:
+                try:
+                    self._block_approved_operation_recovery(
+                        candidate,
+                        expected_checkpoint=None,
+                        dispatcher_lease=dispatcher_lease,
+                        blocked_reason=(
+                            "approval_checkpoint_missing"
+                        ),
+                    )
+                except ProjectOperationError as exc:
+                    if (
+                        exc.code
+                        is OperationErrorCode.OPERATION_STATE_CONFLICT
+                    ):
+                        continue
+                    raise
+                except ProjectRuntimeError as exc:
+                    if (
+                        exc.code
+                        is RuntimeErrorCode.STALE_DISPATCHER_LEASE
+                    ):
+                        break
+                    raise
+                continue
+
+            if capability_getter is not None:
+                try:
+                    self._require_current_operation_policy(candidate)
+                except PermissionError:
+                    try:
+                        self._block_approved_operation_recovery(
+                            candidate,
+                            expected_checkpoint=expected_checkpoint,
+                            dispatcher_lease=dispatcher_lease,
+                            blocked_reason="operation_policy_stale",
+                        )
+                    except ProjectOperationError as exc:
+                        if (
+                            exc.code
+                            is OperationErrorCode.OPERATION_STATE_CONFLICT
+                        ):
+                            continue
+                        raise
+                    except ProjectRuntimeError as exc:
+                        if (
+                            exc.code
+                            is RuntimeErrorCode.STALE_DISPATCHER_LEASE
+                        ):
+                            break
+                        raise
+                    continue
+
+                fingerprint = (
+                    candidate.canonical_action,
+                    candidate.command_revision,
+                    candidate.readback_kind,
+                    candidate.remote_idempotency_supported,
+                )
+                adapter = capability_getter(fingerprint, None)
+                declared = (
+                    getattr(adapter, "fingerprint", None)
+                    if adapter is not None
+                    else None
+                )
+                capability_available = (
+                    adapter is not None
+                    and (
+                        declared is None
+                        or (
+                            isinstance(declared, tuple)
+                            and tuple(declared) == fingerprint
+                        )
+                    )
+                    and callable(getattr(adapter, "execute", None))
+                    and (
+                        callable(
+                            getattr(adapter, "read_operation", None)
+                        )
+                        or callable(getattr(adapter, "readback", None))
+                    )
+                )
+                if not capability_available:
+                    try:
+                        self._block_approved_operation_recovery(
+                            candidate,
+                            expected_checkpoint=expected_checkpoint,
+                            dispatcher_lease=dispatcher_lease,
+                            blocked_reason=(
+                                "operation_executor_unavailable"
+                            ),
+                        )
+                    except ProjectOperationError as exc:
+                        if (
+                            exc.code
+                            is OperationErrorCode.OPERATION_STATE_CONFLICT
+                        ):
+                            continue
+                        raise
+                    except ProjectRuntimeError as exc:
+                        if (
+                            exc.code
+                            is RuntimeErrorCode.STALE_DISPATCHER_LEASE
+                        ):
+                            break
+                        raise
+                    continue
+
+            if len(starts) >= max_claims:
+                continue
+            try:
+                if expected_checkpoint is not None:
+                    rehydrated = (
+                        self._rehydrate_approved_operation_start(
+                            candidate.project_id,
+                            candidate.operation_id,
+                            worker_id=worker_id,
+                            lease_seconds=lease_seconds,
+                            dispatcher_lease=dispatcher_lease,
+                            expected_checkpoint=expected_checkpoint,
+                        )
+                    )
+                    start = (
+                        WorkerStart(
+                            "approved_operation",
+                            rehydrated[0],
+                            rehydrated[1],
+                            dispatcher_lease,
+                        )
+                        if rehydrated is not None
+                        else None
+                    )
+                else:
+                    start = self.rehydrate_approved_operation_for_dispatcher(
+                        candidate.project_id,
+                        candidate.operation_id,
+                        worker_id=worker_id,
+                        lease_seconds=lease_seconds,
+                        dispatcher_lease=dispatcher_lease,
+                    )
+            except ProjectOperationError as exc:
+                if (
+                    exc.code
+                    is OperationErrorCode.OPERATION_STATE_CONFLICT
+                ):
+                    continue
+                raise
+            except ProjectRuntimeError as exc:
+                if (
+                    exc.code
+                    is RuntimeErrorCode.STALE_DISPATCHER_LEASE
+                ):
+                    break
+                raise
+            if start is not None:
+                starts.append(start)
+
+        return OperationRecoveryScanResult(
+            tuple(starts),
+            page.scanned_through,
+            page.reached_epoch_end,
+        )
 
     @staticmethod
     def _error(
@@ -431,6 +2031,13 @@ class ProjectOperationGuard:
         approval_id: str | None,
         approval_fingerprint_json: str | None,
         remote_idempotency_supported: bool,
+        approval_checkpoint_id: str | None,
+        operation_authority_json: str | None = None,
+        operation_authority_sha256: str | None = None,
+        effect_scope_json: str | None = None,
+        effect_scope_sha256: str | None = None,
+        policy_authority_json: str | None = None,
+        policy_authority_sha256: str | None = None,
     ) -> runtime_db.ProjectOperationRecord | None:
         try:
             by_id = runtime_db._project_operation_for_id(
@@ -511,6 +2118,16 @@ class ProjectOperationGuard:
             is not remote_idempotency_supported
             or existing.approval_fingerprint_json
             != approval_fingerprint_json
+            or existing.approval_checkpoint_id != approval_checkpoint_id
+            or existing.operation_authority_json
+            != operation_authority_json
+            or existing.operation_authority_sha256
+            != operation_authority_sha256
+            or existing.effect_scope_json != effect_scope_json
+            or existing.effect_scope_sha256 != effect_scope_sha256
+            or existing.policy_authority_json != policy_authority_json
+            or existing.policy_authority_sha256
+            != policy_authority_sha256
             or existing.attempt_id != claim.attempt_id
             or existing.lease_generation != claim.lease_generation
             or existing.fencing_token != claim.fencing_token
@@ -528,7 +2145,7 @@ class ProjectOperationGuard:
     ) -> ProjectOperation:
         targets = json.loads(record.targets_json)
         batch_items = json.loads(record.batch_items_json)
-        return ProjectOperation(
+        operation = ProjectOperation(
             operation_id=record.operation_id,
             project_id=record.project_id,
             turn_id=record.turn_id,
@@ -547,7 +2164,218 @@ class ProjectOperationGuard:
             fencing_token=record.fencing_token,
             created_at=record.created_at,
             updated_at=record.updated_at,
+            policy_authority_sha256=record.policy_authority_sha256,
         )
+        object.__setattr__(
+            operation,
+            "_approval_checkpoint_id",
+            record.approval_checkpoint_id,
+        )
+        return operation
+
+    def _checkpoint_event_identity(
+        self,
+        operation: runtime_db.ProjectOperationRecord,
+        *,
+        certify_current: bool = False,
+    ) -> ApprovalCheckpointIdentity:
+        approval = runtime_db._operation_approval_certification_row(
+            self._conn,
+            operation,
+        )
+        authority = runtime_db._checkpoint_intent_authority(
+            self._conn,
+            operation,
+            approval,
+        )
+        if authority is None:
+            raise ValueError("missing checkpoint authority")
+        if certify_current:
+            runtime_db._certify_checkpoint_current_authority(
+                self._conn,
+                operation,
+                authority,
+            )
+        return ApprovalCheckpointIdentity(
+            authority.checkpoint_id,
+            TurnAttemptIdentity(
+                authority.project_id,
+                authority.turn_id,
+                authority.sequence,
+                authority.worker_id,
+                authority.attempt_id,
+                authority.lease_generation,
+                authority.fencing_token,
+                authority.canonical_session_id,
+                authority.lease_expires_at,
+            ),
+            authority.operation_id,
+            authority.approval_id,
+        )
+
+    @staticmethod
+    def _valid_checkpoint_identity(
+        checkpoint: object,
+    ) -> bool:
+        if not (
+            type(checkpoint) is ApprovalCheckpointIdentity
+            and type(checkpoint.attempt) is TurnAttemptIdentity
+            and all(
+                type(value) is str and bool(value)
+                for value in (
+                    checkpoint.checkpoint_id,
+                    checkpoint.operation_id,
+                    checkpoint.approval_id,
+                    checkpoint.attempt.project_id,
+                    checkpoint.attempt.turn_id,
+                    checkpoint.attempt.worker_id,
+                    checkpoint.attempt.attempt_id,
+                    checkpoint.attempt.canonical_session_id,
+                )
+            )
+            and all(
+                type(value) is int
+                and 1 <= value <= SQLITE_INT_MAX
+                for value in (
+                    checkpoint.attempt.sequence,
+                    checkpoint.attempt.lease_generation,
+                    checkpoint.attempt.fencing_token,
+                )
+            )
+            and type(checkpoint.attempt.lease_expires_at) is int
+            and 0
+            <= checkpoint.attempt.lease_expires_at
+            <= SQLITE_INT_MAX
+        ):
+            return False
+        try:
+            parsed = uuid.UUID(checkpoint.checkpoint_id)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return (
+            parsed.version == 4
+            and parsed.variant == uuid.RFC_4122
+            and str(parsed) == checkpoint.checkpoint_id
+        )
+
+    def _resolve_approval_checkpoint_authority(
+        self,
+        checkpoint: ApprovalCheckpointIdentity,
+    ) -> tuple[
+        ApprovalCheckpointDecision,
+        Literal[
+            "stop_requested",
+            "cancelled",
+            "superseded_attempt",
+            "superseded_terminal",
+            "recovery_blocked",
+        ]
+        | None,
+    ]:
+        try:
+            if not self._valid_checkpoint_identity(checkpoint):
+                raise ValueError("invalid checkpoint identity")
+            if self._conn.in_transaction:
+                raise ValueError(
+                    "checkpoint resolution requires an idle connection"
+                )
+            self._conn.execute("BEGIN")
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM project_operations
+                    WHERE project_id = ? AND operation_id = ?
+                    """,
+                    (
+                        checkpoint.attempt.project_id,
+                        checkpoint.operation_id,
+                    ),
+                ).fetchone()
+                if row is None:
+                    bound_checkpoint = self._conn.execute(
+                        """
+                        SELECT 1 FROM project_operations
+                        WHERE project_id = ?
+                          AND approval_checkpoint_id = ?
+                        """,
+                        (
+                            checkpoint.attempt.project_id,
+                            checkpoint.checkpoint_id,
+                        ),
+                    ).fetchone()
+                    if bound_checkpoint is not None:
+                        raise ValueError(
+                            "checkpoint operation mismatch"
+                        )
+                    resolved, discard_authority = (
+                        self._runtime
+                        ._resolve_prepared_approval_checkpoint_authority_in_snapshot(
+                            checkpoint.attempt,
+                            operation_id=checkpoint.operation_id,
+                            approval_id=checkpoint.approval_id,
+                        )
+                    )
+                    decision = (
+                        ApprovalCheckpointDecision(resolved.action),
+                        discard_authority,
+                    )
+                else:
+                    operation = runtime_db.project_operation_from_row(
+                        row
+                    )
+                    stored = self._checkpoint_event_identity(operation)
+                    if not (
+                        stored.checkpoint_id
+                        == checkpoint.checkpoint_id
+                        and stored.operation_id
+                        == checkpoint.operation_id
+                        and stored.approval_id
+                        == checkpoint.approval_id
+                        and stored.attempt.project_id
+                        == checkpoint.attempt.project_id
+                        and stored.attempt.turn_id
+                        == checkpoint.attempt.turn_id
+                        and stored.attempt.sequence
+                        == checkpoint.attempt.sequence
+                        and stored.attempt.worker_id
+                        == checkpoint.attempt.worker_id
+                        and stored.attempt.attempt_id
+                        == checkpoint.attempt.attempt_id
+                        and stored.attempt.lease_generation
+                        == checkpoint.attempt.lease_generation
+                        and stored.attempt.fencing_token
+                        == checkpoint.attempt.fencing_token
+                        and stored.attempt.canonical_session_id
+                        == checkpoint.attempt.canonical_session_id
+                        and checkpoint.attempt.lease_expires_at
+                        <= stored.attempt.lease_expires_at
+                    ):
+                        raise ValueError(
+                            "checkpoint identity mismatch"
+                        )
+                    decision = (
+                        ApprovalCheckpointDecision("publish"),
+                        None,
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+        except Exception as exc:
+            raise ProjectRuntimeError(
+                RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+            ) from exc
+        return decision
+
+    def resolve_approval_checkpoint(
+        self,
+        checkpoint: ApprovalCheckpointIdentity,
+    ) -> ApprovalCheckpointDecision:
+        decision, _ = self._resolve_approval_checkpoint_authority(
+            checkpoint
+        )
+        return decision
 
     def prepare(
         self,
@@ -556,6 +2384,9 @@ class ProjectOperationGuard:
         *,
         policy: PolicyDecision,
         approval: OperationApprovalSpec | None,
+        approval_checkpoint_id: str | None = None,
+        authority: object | None = None,
+        policy_authority: object | None = None,
     ) -> ProjectOperation:
         try:
             (
@@ -590,6 +2421,38 @@ class ProjectOperationGuard:
                 OperationErrorCode.INVALID_OPERATION_ARGUMENT,
                 intent=intent,
             ) from exc
+        has_policy_authority = (
+            authority is not None or policy_authority is not None
+        )
+        if has_policy_authority:
+            try:
+                authority_storage = self._authority_storage(
+                    intent,
+                    authority,
+                    policy,
+                    policy_authority,
+                )
+            except (
+                ProjectOperationError,
+                PermissionError,
+                TypeError,
+                ValueError,
+            ):
+                raise
+            except Exception as exc:
+                raise PermissionError(
+                    "invalid project operation authority"
+                ) from exc
+        else:
+            authority_storage = (None,) * 6
+        (
+            operation_authority_json,
+            operation_authority_sha256,
+            effect_scope_json,
+            effect_scope_sha256,
+            policy_authority_json,
+            policy_authority_sha256,
+        ) = authority_storage
         capability_supported = (
             intent.remote_idempotency_supported
             and intent.readback_kind is not None
@@ -600,6 +2463,30 @@ class ProjectOperationGuard:
             and capability_supported
             else None
         )
+        if approval_checkpoint_id is not None:
+            try:
+                parsed_checkpoint = uuid.UUID(approval_checkpoint_id)
+                valid_checkpoint = (
+                    str(parsed_checkpoint) == approval_checkpoint_id
+                    and parsed_checkpoint.version == 4
+                )
+            except (TypeError, ValueError, AttributeError):
+                valid_checkpoint = False
+            if not (
+                valid_checkpoint
+                and capability_supported
+                and decision is Decision.REQUIRE_APPROVAL
+                and approval_id is not None
+            ):
+                raise self._error(
+                    OperationErrorCode.INVALID_OPERATION_ARGUMENT,
+                    intent=intent,
+                )
+            if self._conn.in_transaction:
+                raise self._error(
+                    OperationErrorCode.INVALID_OPERATION_ARGUMENT,
+                    intent=intent,
+                )
         existing = self._existing_operation(
             claim=claim,
             intent=intent,
@@ -611,17 +2498,89 @@ class ProjectOperationGuard:
             remote_idempotency_supported=(
                 intent.remote_idempotency_supported
             ),
+            approval_checkpoint_id=approval_checkpoint_id,
+            operation_authority_json=operation_authority_json,
+            operation_authority_sha256=operation_authority_sha256,
+            effect_scope_json=effect_scope_json,
+            effect_scope_sha256=effect_scope_sha256,
+            policy_authority_json=policy_authority_json,
+            policy_authority_sha256=policy_authority_sha256,
         )
         if existing is not None:
             return self._public_operation(existing)
 
-        now = self._runtime._now()
-        with runtime_db.write_transaction(self._conn):
+        intent_event_id = None
+        transaction = (
+            runtime_db.task7_outer_write_transaction(self._conn)
+            if approval_checkpoint_id is not None
+            else runtime_db.write_transaction(self._conn)
+        )
+        with transaction:
+            if approval_checkpoint_id is not None:
+                existing = self._existing_operation(
+                    claim=claim,
+                    intent=intent,
+                    targets_json=targets_json,
+                    batch_items_json=batch_items_json,
+                    payload_json=payload_json,
+                    approval_id=approval_id,
+                    approval_fingerprint_json=(
+                        approval_fingerprint_json
+                    ),
+                    remote_idempotency_supported=(
+                        intent.remote_idempotency_supported
+                    ),
+                    approval_checkpoint_id=(
+                        approval_checkpoint_id
+                    ),
+                    operation_authority_json=(
+                        operation_authority_json
+                    ),
+                    operation_authority_sha256=(
+                        operation_authority_sha256
+                    ),
+                    effect_scope_json=effect_scope_json,
+                    effect_scope_sha256=effect_scope_sha256,
+                    policy_authority_json=policy_authority_json,
+                    policy_authority_sha256=(
+                        policy_authority_sha256
+                    ),
+                )
+                if existing is not None:
+                    return self._public_operation(existing)
+            now = self._runtime._now()
+            if approval_checkpoint_id is not None:
+                runtime_db._bind_task7_outer_timestamp(
+                    self._conn,
+                    now,
+                )
+            if approval_checkpoint_id is not None:
+                intent_event_id = self._runtime._id_factory(
+                    "event"
+                )
+                if not (
+                    type(intent_event_id) is str
+                    and intent_event_id
+                ):
+                    raise self._error(
+                        OperationErrorCode.INVALID_OPERATION_ARGUMENT,
+                        intent=intent,
+                    )
             state, _, control, _ = (
                 self._runtime._require_live_operation_claim(
                     claim, now=now
                 )
             )
+            if has_policy_authority:
+                self._require_prepare_policy_authority(
+                    claim=claim,
+                    intent=intent,
+                    authority=authority,
+                    policy=policy,
+                    policy_authority=policy_authority,
+                    state=state,
+                    control=control,
+                )
             if (
                 intent.project_id != claim.project_id
                 or intent.turn_id != claim.turn_id
@@ -674,7 +2633,19 @@ class ProjectOperationGuard:
                 approval_fingerprint_json=(
                     approval_fingerprint_json
                 ),
+                operation_authority_json=(
+                    operation_authority_json
+                ),
+                operation_authority_sha256=(
+                    operation_authority_sha256
+                ),
+                effect_scope_json=effect_scope_json,
+                effect_scope_sha256=effect_scope_sha256,
+                policy_authority_json=policy_authority_json,
+                policy_authority_sha256=policy_authority_sha256,
                 now=now,
+                approval_checkpoint_id=approval_checkpoint_id,
+                intent_event_id=intent_event_id,
             )
             if not inserted:
                 raced = self._existing_operation(
@@ -689,6 +2660,19 @@ class ProjectOperationGuard:
                     ),
                     remote_idempotency_supported=(
                         intent.remote_idempotency_supported
+                    ),
+                    approval_checkpoint_id=approval_checkpoint_id,
+                    operation_authority_json=(
+                        operation_authority_json
+                    ),
+                    operation_authority_sha256=(
+                        operation_authority_sha256
+                    ),
+                    effect_scope_json=effect_scope_json,
+                    effect_scope_sha256=effect_scope_sha256,
+                    policy_authority_json=policy_authority_json,
+                    policy_authority_sha256=(
+                        policy_authority_sha256
                     ),
                 )
                 if raced is None:
@@ -738,17 +2722,24 @@ class ProjectOperationGuard:
                         OperationErrorCode.OPERATION_APPROVAL_CONFLICT,
                         intent=intent,
                     ) from exc
-                if not runtime_db._link_project_operation_approval(
-                    self._conn,
-                    project_id=intent.project_id,
-                    turn_id=intent.turn_id,
-                    operation_id=intent.operation_id,
-                    approval_id=approval_spec.approval_id,
-                    attempt_id=claim.attempt_id,
-                    lease_generation=claim.lease_generation,
-                    fencing_token=claim.fencing_token,
-                    now=now,
-                ):
+                try:
+                    linked = runtime_db._link_project_operation_approval(
+                        self._conn,
+                        project_id=intent.project_id,
+                        turn_id=intent.turn_id,
+                        operation_id=intent.operation_id,
+                        approval_id=approval_spec.approval_id,
+                        attempt_id=claim.attempt_id,
+                        lease_generation=claim.lease_generation,
+                        fencing_token=claim.fencing_token,
+                        now=now,
+                    )
+                except Exception as exc:
+                    raise self._error(
+                        OperationErrorCode.OPERATION_APPROVAL_CONFLICT,
+                        intent=intent,
+                    ) from exc
+                if not linked:
                     raise self._error(
                         OperationErrorCode.OPERATION_APPROVAL_CONFLICT,
                         intent=intent,
@@ -764,18 +2755,71 @@ class ProjectOperationGuard:
             else:
                 updated_state = self._runtime._advance_state(state, now)
                 event_status = initial_status
-            self._runtime._event(
-                intent.project_id,
-                "operation.intent_recorded",
-                intent.turn_id,
-                {
-                    "operation_id": intent.operation_id,
-                    "status": event_status,
-                    "turn_id": intent.turn_id,
-                    "version": updated_state.version,
-                },
-                now,
-            )
+            event_payload: dict[str, object] = {
+                "operation_id": intent.operation_id,
+                "status": event_status,
+                "turn_id": intent.turn_id,
+                "version": updated_state.version,
+            }
+            if approval_checkpoint_id is not None:
+                event_payload.update(
+                    {
+                        "approval_checkpoint_id": approval_checkpoint_id,
+                        "approval_id": approval_id,
+                        "attempt": {
+                            "project_id": claim.project_id,
+                            "turn_id": claim.turn_id,
+                            "sequence": claim.sequence,
+                            "worker_id": claim.worker_id,
+                            "attempt_id": claim.attempt_id,
+                            "lease_generation": claim.lease_generation,
+                            "fencing_token": claim.fencing_token,
+                            "canonical_session_id": claim.canonical_session_id,
+                            "lease_expires_at": claim.lease_expires_at,
+                        },
+                    }
+                )
+            try:
+                self._runtime._event(
+                    intent.project_id,
+                    "operation.intent_recorded",
+                    intent.turn_id,
+                    event_payload,
+                    now,
+                    event_id=intent_event_id,
+                )
+            except Exception as exc:
+                raise self._operation_state_conflict(
+                    claim, intent.operation_id, updated_state.version
+                ) from exc
+            if approval_checkpoint_id is not None:
+                try:
+                    staging = self._conn.execute(
+                        """
+                        SELECT * FROM project_operations
+                        WHERE project_id = ? AND operation_id = ?
+                        """,
+                        (intent.project_id, intent.operation_id),
+                    ).fetchone()
+                    if staging is None:
+                        raise RuntimeError("checkpoint operation disappeared")
+                    staged_operation = runtime_db._project_operation_from_row(
+                        staging, expected_guard_validated=0
+                    )
+                    staged_identity = self._checkpoint_event_identity(
+                        staged_operation
+                    )
+                    if staged_identity.attempt != TurnAttemptIdentity(
+                        claim.project_id, claim.turn_id, claim.sequence,
+                        claim.worker_id, claim.attempt_id,
+                        claim.lease_generation, claim.fencing_token,
+                        claim.canonical_session_id, claim.lease_expires_at,
+                    ):
+                        raise RuntimeError("checkpoint attempt mismatch")
+                except Exception as exc:
+                    raise self._operation_state_conflict(
+                        claim, intent.operation_id, updated_state.version
+                    ) from exc
             try:
                 stored = runtime_db._certify_project_operation(
                     self._conn,
@@ -1350,6 +3394,55 @@ class ProjectOperationGuard:
         worker_id: str,
         lease_seconds: int,
     ) -> TurnClaim | None:
+        result = self._rehydrate_approved_operation_start(
+            project_id,
+            operation_id,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+            dispatcher_lease=None,
+        )
+        return result[0] if result is not None else None
+
+    def rehydrate_approved_operation_for_dispatcher(
+        self,
+        project_id: str,
+        operation_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+        dispatcher_lease: DispatcherLease,
+    ) -> WorkerStart | None:
+        """Issue one approved-operation start under exact Core authority."""
+        dispatcher_lease = _require_dispatcher_lease(
+            dispatcher_lease
+        )
+        result = self._rehydrate_approved_operation_start(
+            project_id,
+            operation_id,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+            dispatcher_lease=dispatcher_lease,
+        )
+        if result is None:
+            return None
+        claim, operation = result
+        return WorkerStart(
+            "approved_operation",
+            claim,
+            operation,
+            dispatcher_lease,
+        )
+
+    def _rehydrate_approved_operation_start(
+        self,
+        project_id: str,
+        operation_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+        dispatcher_lease: DispatcherLease | None,
+        expected_checkpoint: ApprovalCheckpointIdentity | None = None,
+    ) -> tuple[TurnClaim, ProjectOperation] | None:
         if not (
             type(project_id) is str
             and project_id
@@ -1371,14 +3464,34 @@ class ProjectOperationGuard:
                     else None
                 ),
             )
-        now = self._runtime._now()
-        if now > SQLITE_INT_MAX - lease_seconds:
+        now = (
+            self._runtime._now()
+            if dispatcher_lease is None
+            else None
+        )
+        if (
+            now is not None
+            and now > SQLITE_INT_MAX - lease_seconds
+        ):
             raise ProjectOperationError(
                 OperationErrorCode.INVALID_OPERATION_ARGUMENT,
                 project_id=project_id,
                 operation_id=operation_id,
             )
         with runtime_db.write_transaction(self._conn):
+            if dispatcher_lease is not None:
+                now = self._runtime._now()
+                if now > SQLITE_INT_MAX - lease_seconds:
+                    raise ProjectOperationError(
+                        OperationErrorCode.INVALID_OPERATION_ARGUMENT,
+                        project_id=project_id,
+                        operation_id=operation_id,
+                    )
+                self._runtime._require_dispatcher_start_authority(
+                    dispatcher_lease,
+                    now,
+                )
+            assert now is not None
             state = runtime_db.runtime_state_for_project(
                 self._conn, project_id
             )
@@ -1391,6 +3504,11 @@ class ProjectOperationGuard:
                         state.version if state is not None else None
                     ),
                 )
+            if dispatcher_lease is not None and (
+                state.transcript_pending_batch_id is not None
+                or state.transcript_dispatch_block_key is not None
+            ):
+                return None
             try:
                 operation = runtime_db._project_operation_for_id(
                     self._conn,
@@ -1403,12 +3521,41 @@ class ProjectOperationGuard:
                     project_id=project_id,
                     operation_id=operation_id,
                 ) from exc
+            except RuntimeError as exc:
+                raise ProjectOperationError(
+                    OperationErrorCode.OPERATION_STATE_CONFLICT,
+                    project_id=project_id,
+                    operation_id=operation_id,
+                    current_version=state.version,
+                ) from exc
             if operation is None:
                 raise ProjectOperationError(
                     OperationErrorCode.OPERATION_NOT_FOUND,
                     project_id=project_id,
                     operation_id=operation_id,
                 )
+            checkpoint_identity = None
+            if operation.approval_checkpoint_id is not None:
+                try:
+                    checkpoint_identity = (
+                        self._checkpoint_event_identity(operation)
+                    )
+                except Exception as exc:
+                    raise ProjectOperationError(
+                        OperationErrorCode.OPERATION_STATE_CONFLICT,
+                        project_id=project_id,
+                        turn_id=operation.turn_id,
+                        operation_id=operation_id,
+                        current_version=state.version,
+                    ) from exc
+            if expected_checkpoint is not None:
+                if (
+                    not self._valid_checkpoint_identity(
+                        expected_checkpoint
+                    )
+                    or checkpoint_identity != expected_checkpoint
+                ):
+                    return None
             if operation.status != "approved":
                 return None
             turn = runtime_db._runtime_turn_for_project(
@@ -1435,8 +3582,7 @@ class ProjectOperationGuard:
                     current_version=state.version,
                 )
             if turn.status not in {
-                "awaiting_approval",
-                "reconciling",
+                "awaiting_approval", "claimed", "reconciling"
             }:
                 return None
             oldest = self._conn.execute(
@@ -1468,6 +3614,41 @@ class ProjectOperationGuard:
                 == state.conversation_tip_id
                 and turn.recovery_block_key is None
             )
+            if checkpoint_identity is not None:
+                checkpoint_attempt = checkpoint_identity.attempt
+                current_pair = (
+                    current_pair
+                    and runtime_db._checkpoint_current_authority_relation(
+                        checkpoint_attempt_id=(
+                            checkpoint_attempt.attempt_id
+                        ),
+                        checkpoint_worker_id=checkpoint_attempt.worker_id,
+                        checkpoint_canonical_session_id=(
+                            checkpoint_attempt.canonical_session_id
+                        ),
+                        checkpoint_lease_generation=(
+                            checkpoint_attempt.lease_generation
+                        ),
+                        checkpoint_fencing_token=(
+                            checkpoint_attempt.fencing_token
+                        ),
+                        checkpoint_lease_expires_at=(
+                            checkpoint_attempt.lease_expires_at
+                        ),
+                        current_attempt_id=operation.attempt_id,
+                        current_worker_id=control.claim_worker_id,
+                        current_canonical_session_id=(
+                            control.claim_canonical_session_id
+                        ),
+                        current_lease_generation=(
+                            operation.lease_generation
+                        ),
+                        current_fencing_token=operation.fencing_token,
+                        current_lease_expires_at=(
+                            control.claim_lease_expires_at
+                        ),
+                    )
+                )
             if not current_pair:
                 raise ProjectOperationError(
                     OperationErrorCode.OPERATION_STATE_CONFLICT,
@@ -1476,7 +3657,13 @@ class ProjectOperationGuard:
                     operation_id=operation_id,
                     current_version=state.version,
                 )
-            if turn.status == "awaiting_approval":
+            if (
+                dispatcher_lease is not None
+                and expected_checkpoint is None
+                and checkpoint_identity is not None
+            ):
+                return None
+            if turn.status in {"awaiting_approval", "claimed"}:
                 if not (
                     lease is not None
                     and lease.lease_id == turn.attempt_id
@@ -1548,6 +3735,23 @@ class ProjectOperationGuard:
                 raise RuntimeError(
                     "operation attempt factory returned invalid identity"
                 )
+            if dispatcher_lease is not None:
+                current_state = runtime_db.runtime_state_for_project(
+                    self._conn,
+                    project_id,
+                )
+                if not (
+                    current_state is not None
+                    and current_state.lifecycle == "active"
+                    and current_state.version == state.version
+                    and current_state.conversation_tip_id
+                        == state.conversation_tip_id
+                    and current_state.transcript_pending_batch_id
+                        is None
+                    and current_state.transcript_dispatch_block_key
+                        is None
+                ):
+                    return None
             generation = turn.lease_generation + 1
             fence = turn.fencing_token + 1
             expires_at = now + lease_seconds
@@ -1581,6 +3785,9 @@ class ProjectOperationGuard:
                         new_lease_expires_at=expires_at,
                         canonical_session_id=state.conversation_tip_id,
                         now=now,
+                        require_task7_terminal_gate_clear=(
+                            dispatcher_lease is not None
+                        ),
                     )
                 )
             except Exception as exc:
@@ -1592,6 +3799,7 @@ class ProjectOperationGuard:
                     current_version=state.version,
                 ) from exc
             updated = self._runtime._advance_state(state, now)
+            rehydrated_event_id = self._runtime._id_factory("event")
             self._runtime._event(
                 project_id,
                 "operation.rehydrated",
@@ -1605,7 +3813,17 @@ class ProjectOperationGuard:
                     "version": updated.version,
                 },
                 now,
+                event_id=rehydrated_event_id,
             )
+            claimed_event_id = self._runtime._id_factory("event")
+            if claimed_event_id == rehydrated_event_id:
+                raise ProjectOperationError(
+                    OperationErrorCode.OPERATION_STATE_CONFLICT,
+                    project_id=project_id,
+                    turn_id=operation.turn_id,
+                    operation_id=operation_id,
+                    current_version=updated.version,
+                )
             self._runtime._event(
                 project_id,
                 "turn.claimed",
@@ -1619,9 +3837,10 @@ class ProjectOperationGuard:
                     "version": updated.version,
                 },
                 now,
+                event_id=claimed_event_id,
             )
             try:
-                runtime_db._certify_project_operation(
+                certified = runtime_db._certify_project_operation(
                     self._conn,
                     project_id=project_id,
                     operation_id=operation_id,
@@ -1634,7 +3853,7 @@ class ProjectOperationGuard:
                     operation_id=operation_id,
                     current_version=updated.version,
                 ) from exc
-            return TurnClaim(
+            claim = TurnClaim(
                 turn_id=operation.turn_id,
                 project_id=project_id,
                 sequence=stored_turn.sequence,
@@ -1645,6 +3864,7 @@ class ProjectOperationGuard:
                 lease_expires_at=stored_lease.expires_at,
                 canonical_session_id=state.conversation_tip_id,
             )
+            return claim, self._public_operation(certified)
 
     def _recover_pending_operations(
         self,
@@ -2129,13 +4349,118 @@ class ProjectOperationGuard:
         self,
         claim: TurnClaim,
         operation_id: str,
+        *,
+        approval_checkpoints: ApprovalCheckpointReadPort | None = None,
     ) -> ProjectOperation:
         self._validate_operation_id(operation_id)
+        operation = self._operation_for_claim(claim, operation_id)
+        if operation.status == "effect_started":
+            now = self._runtime._now()
+            with runtime_db.write_transaction(self._conn):
+                operation = self._operation_for_claim(
+                    claim, operation_id
+                )
+                state, _, _, _ = (
+                    self._runtime._require_live_operation_claim(
+                        claim, now=now
+                    )
+                )
+                if operation.status != "effect_started":
+                    raise self._operation_state_conflict(
+                        claim, operation_id, state.version
+                    )
+                return self._public_operation(operation)
+        expected_checkpoint = None
+        if operation.approval_checkpoint_id is not None:
+            try:
+                expected_checkpoint = self._checkpoint_event_identity(
+                    operation,
+                    certify_current=True,
+                )
+            except Exception as exc:
+                state = runtime_db.runtime_state_for_project(
+                    self._conn,
+                    claim.project_id,
+                )
+                raise self._operation_state_conflict(
+                    claim,
+                    operation_id,
+                    state.version if state is not None else 0,
+                ) from exc
+            publication_state = getattr(
+                approval_checkpoints,
+                "publication_state",
+                None,
+            )
+            if not callable(publication_state):
+                state = runtime_db.runtime_state_for_project(
+                    self._conn,
+                    claim.project_id,
+                )
+                raise self._operation_state_conflict(
+                    claim,
+                    operation_id,
+                    state.version if state is not None else 0,
+                )
+            try:
+                checkpoint_state = publication_state(
+                    expected_checkpoint
+                )
+            except Exception as exc:
+                state = runtime_db.runtime_state_for_project(
+                    self._conn,
+                    claim.project_id,
+                )
+                raise self._operation_state_conflict(
+                    claim,
+                    operation_id,
+                    state.version if state is not None else 0,
+                ) from exc
+            if checkpoint_state != "published":
+                state = runtime_db.runtime_state_for_project(
+                    self._conn,
+                    claim.project_id,
+                )
+                raise self._operation_state_conflict(
+                    claim,
+                    operation_id,
+                    state.version if state is not None else 0,
+                )
+
         now = self._runtime._now()
         with runtime_db.write_transaction(self._conn):
             operation = self._operation_for_claim(
                 claim, operation_id
             )
+            try:
+                fresh_checkpoint = (
+                    self._checkpoint_event_identity(
+                        operation,
+                        certify_current=True,
+                    )
+                    if operation.approval_checkpoint_id is not None
+                    else None
+                )
+            except Exception as exc:
+                state = runtime_db.runtime_state_for_project(
+                    self._conn,
+                    claim.project_id,
+                )
+                raise self._operation_state_conflict(
+                    claim,
+                    operation_id,
+                    state.version if state is not None else 0,
+                ) from exc
+            if fresh_checkpoint != expected_checkpoint:
+                state = runtime_db.runtime_state_for_project(
+                    self._conn,
+                    claim.project_id,
+                )
+                raise self._operation_state_conflict(
+                    claim,
+                    operation_id,
+                    state.version if state is not None else 0,
+                )
             if (
                 operation.status == "approved"
                 and operation.readback_json is not None
@@ -2153,6 +4478,7 @@ class ProjectOperationGuard:
                     claim, now=now
                 )
             )
+            self._require_current_operation_policy(operation)
             if operation.status == "effect_started":
                 return self._public_operation(operation)
             if operation.status != "approved":
@@ -2610,3 +4936,14 @@ class ProjectOperationGuard:
         }:
             return "blocked"
         return internal
+
+
+ProjectOperationGuard.prepare.__signature__ = inspect.Signature(
+    parameters=tuple(
+        parameter
+        for parameter in inspect.signature(
+            ProjectOperationGuard.prepare
+        ).parameters.values()
+        if parameter.name not in {"authority", "policy_authority"}
+    )
+)

@@ -1,5 +1,6 @@
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { ZoomableImage } from '@/components/chat/zoomable-image'
@@ -26,6 +27,16 @@ import { normalize } from '@/lib/text'
 import { fmtDayTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
+import {
+  $activeGatewayProfile,
+  ensureGatewayProfile,
+  gatewayProfileAuthorityGeneration,
+  gatewayProfileAuthorityTarget,
+  normalizeProfileKey
+} from '@/store/profile'
+import { $projectRuntimes, projectRuntimeScope } from '@/store/project-runtime'
+import { $projectCatalogAuthority, $projects } from '@/store/projects'
+import type { SessionInfo } from '@/types/hermes'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
@@ -38,7 +49,11 @@ import {
   type ArtifactFilter,
   artifactImageSrc,
   type ArtifactRecord,
-  collectArtifactsForSession
+  artifactSessionIdentity,
+  artifactsForCurrentAuthority,
+  collectArtifactsForProjectRuntimes,
+  collectArtifactsForSession,
+  legacyArtifactSessions
 } from './artifact-utils'
 
 function formatArtifactTime(timestamp: number): string {
@@ -84,7 +99,7 @@ function paginationItems(page: number, pageCount: number): Array<number | 'ellip
 
 type CellCtx = {
   onOpen: (href: string) => void | Promise<void>
-  onOpenChat: (sessionId: string) => void
+  onOpenChat: (artifact: ArtifactRecord) => void | Promise<void>
 }
 
 interface ArtifactColumn {
@@ -106,7 +121,13 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   const { t } = useI18n()
   const a = t.artifacts
   const navigate = useNavigate()
+  const activeProfile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const projectRuntimes = useStore($projectRuntimes)
+  const projectsAuthority = useStore($projectCatalogAuthority)
+  const projects = useStore($projects)
   const [artifacts, setArtifacts] = useState<ArtifactRecord[] | null>(null)
+  const [artifactSessions, setArtifactSessions] = useState<SessionInfo[]>([])
+  const [loadedScope, setLoadedScope] = useState<null | string>(null)
   const [query, setQuery] = useState('')
 
   const [kindFilter, setKindFilter] = useRouteEnumParam('tab', ARTIFACT_FILTERS, 'all')
@@ -116,32 +137,111 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   const [filePage, setFilePage] = useState(1)
 
   const [refreshing, setRefreshing] = useState(false)
+  const refreshGeneration = useRef(0)
+  const openChatGeneration = useRef(0)
 
   const refreshArtifacts = useCallback(async () => {
+    const generation = ++refreshGeneration.current
+    const requestedScope = activeProfile
+    const projectsAuthorityAtRequest = projectsAuthority
+
+    const projectsAtRequest =
+      projectsAuthorityAtRequest.profile !== null &&
+      normalizeProfileKey(projectsAuthorityAtRequest.profile) === requestedScope &&
+      projectsAuthorityAtRequest.catalogGeneration !== null &&
+      projectsAuthorityAtRequest.catalogGeneration === projectsAuthorityAtRequest.contextGeneration
+        ? projects
+        : []
+
+    const runtimesAtRequest = normalizeProfileKey(projectRuntimeScope()) === requestedScope ? projectRuntimes : {}
+
     setRefreshing(true)
 
     try {
       const sessions = (await listAllProfileSessions(30, 1)).sessions
-      const results = await Promise.allSettled(sessions.map(session => getSessionMessages(session.id, session.profile)))
-      const nextArtifacts: ArtifactRecord[] = []
+
+      const legacySessions = legacyArtifactSessions(
+        sessions,
+        runtimesAtRequest,
+        projectsAtRequest,
+        requestedScope,
+        [],
+        projectsAuthorityAtRequest.profile,
+        projectsAuthorityAtRequest.catalogGeneration,
+        projectsAuthorityAtRequest.contextGeneration
+      )
+
+      const results = await Promise.allSettled(
+        legacySessions.map(session => getSessionMessages(session.id, session.profile))
+      )
+
+      if (
+        generation !== refreshGeneration.current ||
+        requestedScope !== normalizeProfileKey($activeGatewayProfile.get())
+      ) {
+        return
+      }
+
+      const currentRuntimeScope = projectRuntimeScope()
+
+      const currentRuntimes =
+        currentRuntimeScope !== null && normalizeProfileKey(currentRuntimeScope) === requestedScope
+          ? $projectRuntimes.get()
+          : {}
+
+      const currentProjects = $projects.get()
+      const currentProjectsAuthority = $projectCatalogAuthority.get()
+
+      const currentLegacySessionIdentities = new Set(
+        legacyArtifactSessions(
+          sessions,
+          currentRuntimes,
+          currentProjects,
+          requestedScope,
+          [],
+          currentProjectsAuthority.profile,
+          currentProjectsAuthority.catalogGeneration,
+          currentProjectsAuthority.contextGeneration
+        ).map(session => artifactSessionIdentity(session.profile, session.id))
+      )
+
+      const nextArtifacts =
+        currentRuntimeScope !== null && normalizeProfileKey(currentRuntimeScope) === requestedScope
+          ? collectArtifactsForProjectRuntimes(currentRuntimes, sessions, requestedScope)
+          : []
 
       results.forEach((result, index) => {
-        if (result.status !== 'fulfilled') {
+        const session = legacySessions[index]
+
+        if (
+          result.status !== 'fulfilled' ||
+          !currentLegacySessionIdentities.has(artifactSessionIdentity(session.profile, session.id))
+        ) {
           return
         }
 
-        const session = sessions[index]
         nextArtifacts.push(...collectArtifactsForSession(session, result.value.messages))
       })
 
+      setArtifactSessions(sessions)
+      setLoadedScope(requestedScope)
       setArtifacts(nextArtifacts.sort((left, right) => right.timestamp - left.timestamp))
     } catch (err) {
-      notifyError(err, a.failedLoad)
-      setArtifacts([])
+      if (
+        generation === refreshGeneration.current &&
+        requestedScope === normalizeProfileKey($activeGatewayProfile.get())
+      ) {
+        notifyError(err, a.failedLoad)
+        setArtifactSessions([])
+        setLoadedScope(requestedScope)
+        setArtifacts([])
+      }
     } finally {
-      setRefreshing(false)
+      if (generation === refreshGeneration.current) {
+        setRefreshing(false)
+      }
     }
-  }, [a])
+  }, [a, activeProfile, projectRuntimes, projects, projectsAuthority])
 
   useRefreshHotkey(refreshArtifacts)
 
@@ -149,19 +249,66 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     void refreshArtifacts()
   }, [refreshArtifacts])
 
+  const authoritativeArtifacts = useMemo(() => {
+    if (artifacts === null) {
+      return null
+    }
+
+    return artifactsForCurrentAuthority(artifacts, {
+      currentScope: activeProfile,
+      loadedScope,
+      projects,
+      projectsContextGeneration: projectsAuthority.contextGeneration,
+      projectsGeneration: projectsAuthority.catalogGeneration,
+      projectsScope: projectsAuthority.profile,
+      runtimeScope: projectRuntimeScope(),
+      runtimes: projectRuntimes,
+      sessions: artifactSessions
+    })
+  }, [activeProfile, artifactSessions, artifacts, loadedScope, projectRuntimes, projects, projectsAuthority])
+
+  useEffect(() => {
+    const isCurrent =
+      artifacts?.length === authoritativeArtifacts?.length &&
+      artifacts?.every((artifact, index) => {
+        const authoritative = authoritativeArtifacts?.[index]
+
+        return (
+          authoritative !== undefined &&
+          artifact.href === authoritative.href &&
+          artifact.id === authoritative.id &&
+          artifact.kind === authoritative.kind &&
+          artifact.label === authoritative.label &&
+          artifact.profile === authoritative.profile &&
+          artifact.projectId === authoritative.projectId &&
+          artifact.sessionId === authoritative.sessionId &&
+          artifact.sessionTitle === authoritative.sessionTitle &&
+          artifact.sha256 === authoritative.sha256 &&
+          artifact.sizeBytes === authoritative.sizeBytes &&
+          artifact.source === authoritative.source &&
+          artifact.timestamp === authoritative.timestamp &&
+          artifact.value === authoritative.value
+        )
+      })
+
+    if (artifacts && authoritativeArtifacts && !isCurrent) {
+      setArtifacts(authoritativeArtifacts)
+    }
+  }, [artifacts, authoritativeArtifacts])
+
   useEffect(() => {
     setImagePage(1)
     setFilePage(1)
-  }, [artifacts, kindFilter, query])
+  }, [authoritativeArtifacts, kindFilter, query])
 
   const visibleArtifacts = useMemo(() => {
-    if (!artifacts) {
+    if (!authoritativeArtifacts) {
       return []
     }
 
     const q = normalize(query)
 
-    return artifacts.filter(artifact => {
+    return authoritativeArtifacts.filter(artifact => {
       if (kindFilter !== 'all' && artifact.kind !== kindFilter) {
         return false
       }
@@ -176,7 +323,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
         artifact.sessionTitle.toLowerCase().includes(q)
       )
     })
-  }, [artifacts, kindFilter, query])
+  }, [authoritativeArtifacts, kindFilter, query])
 
   const visibleImageArtifacts = useMemo(
     () => visibleArtifacts.filter(artifact => artifact.kind === 'image'),
@@ -206,15 +353,20 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   // Rotating placeholder nudges from real data — search matches file paths and
   // session titles, not just labels; show it.
   const searchHints = useMemo(() => {
-    if (!artifacts?.length) {
+    if (!authoritativeArtifacts?.length) {
       return undefined
     }
 
     const extensions = [
-      ...new Set(artifacts.map(artifact => /\.(\w{2,4})$/.exec(artifact.value)?.[1]?.toLowerCase()).filter(Boolean))
+      ...new Set(
+        authoritativeArtifacts.map(artifact => /\.(\w{2,4})$/.exec(artifact.value)?.[1]?.toLowerCase()).filter(Boolean)
+      )
     ].slice(0, 3) as string[]
 
-    const titles = [...new Set(artifacts.map(artifact => artifact.sessionTitle).filter(Boolean))].slice(0, 2)
+    const titles = [...new Set(authoritativeArtifacts.map(artifact => artifact.sessionTitle).filter(Boolean))].slice(
+      0,
+      2
+    )
 
     const hints = [
       ...extensions.map(ext => t.common.tryHint(`.${ext}`)),
@@ -222,10 +374,10 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     ]
 
     return hints.length > 0 ? hints : undefined
-  }, [artifacts, t])
+  }, [authoritativeArtifacts, t])
 
   const counts = useMemo(() => {
-    const all = artifacts || []
+    const all = authoritativeArtifacts || []
 
     return {
       all: all.length,
@@ -233,7 +385,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
       file: all.filter(artifact => artifact.kind === 'file').length,
       link: all.filter(artifact => artifact.kind === 'link').length
     }
-  }, [artifacts])
+  }, [authoritativeArtifacts])
 
   const openArtifact = useCallback(
     async (href: string) => {
@@ -270,9 +422,47 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     })
   }, [])
 
+  const openArtifactChat = useCallback(
+    async (artifact: ArtifactRecord) => {
+      const generation = ++openChatGeneration.current
+      const activation = ensureGatewayProfile(artifact.profile)
+      const profileGeneration = gatewayProfileAuthorityGeneration()
+
+      try {
+        await activation
+
+        if (
+          generation !== openChatGeneration.current ||
+          profileGeneration !== gatewayProfileAuthorityGeneration() ||
+          normalizeProfileKey($activeGatewayProfile.get()) !== normalizeProfileKey(artifact.profile)
+        ) {
+          return
+        }
+
+        navigate(sessionRoute(artifact.sessionId))
+      } catch (err) {
+        if (
+          generation === openChatGeneration.current &&
+          profileGeneration === gatewayProfileAuthorityGeneration() &&
+          normalizeProfileKey(artifact.profile) === gatewayProfileAuthorityTarget()
+        ) {
+          notifyError(err, a.openFailed)
+        }
+      }
+    },
+    [a.openFailed, navigate]
+  )
+
+  useEffect(
+    () => () => {
+      openChatGeneration.current += 1
+    },
+    []
+  )
+
   const cellCtx: CellCtx = {
     onOpen: openArtifact,
-    onOpenChat: sessionId => navigate(sessionRoute(sessionId))
+    onOpenChat: openArtifactChat
   }
 
   return (
@@ -300,13 +490,13 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
       }
       searchValue={query}
       tabs={[
-        { id: 'all', label: a.tabAll, meta: artifacts ? counts.all : null },
-        { id: 'image', label: a.tabImages, meta: artifacts ? counts.image : null },
-        { id: 'file', label: a.tabFiles, meta: artifacts ? counts.file : null },
-        { id: 'link', label: a.tabLinks, meta: artifacts ? counts.link : null }
+        { id: 'all', label: a.tabAll, meta: authoritativeArtifacts ? counts.all : null },
+        { id: 'image', label: a.tabImages, meta: authoritativeArtifacts ? counts.image : null },
+        { id: 'file', label: a.tabFiles, meta: authoritativeArtifacts ? counts.file : null },
+        { id: 'link', label: a.tabLinks, meta: authoritativeArtifacts ? counts.link : null }
       ]}
     >
-      {!artifacts ? (
+      {!authoritativeArtifacts ? (
         <PageLoader label={a.indexing} />
       ) : visibleArtifacts.length === 0 ? (
         <div className="grid h-full place-items-center px-6 text-center">
@@ -337,7 +527,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
                       failedImage={failedImageIds.has(artifact.id)}
                       key={artifact.id}
                       onImageError={markImageFailed}
-                      onOpenChat={sessionId => navigate(sessionRoute(sessionId))}
+                      onOpenChat={openArtifactChat}
                     />
                   ))}
                 </div>
@@ -425,7 +615,7 @@ interface ArtifactImageCardProps {
   artifact: ArtifactRecord
   failedImage: boolean
   onImageError: (id: string) => void
-  onOpenChat: (sessionId: string) => void
+  onOpenChat: (artifact: ArtifactRecord) => void | Promise<void>
 }
 
 function ArtifactImageCard({ artifact, failedImage, onImageError, onOpenChat }: ArtifactImageCardProps) {
@@ -438,6 +628,13 @@ function ArtifactImageCard({ artifact, failedImage, onImageError, onOpenChat }: 
     let active = true
 
     setSrc('')
+
+    if (!artifact.href) {
+      return () => {
+        active = false
+      }
+    }
+
     void artifactImageSrc(artifact.value, artifact.href)
       .then(nextSrc => {
         if (active) {
@@ -486,15 +683,21 @@ function ArtifactImageCard({ artifact, failedImage, onImageError, onOpenChat }: 
           <div className="truncate text-[length:var(--conversation-caption-font-size)] font-medium">
             {artifact.label}
           </div>
-          <div className="mt-0.5 truncate text-[0.625rem] text-(--ui-text-tertiary)">{artifact.value}</div>
+          {artifact.value && (
+            <div className="mt-0.5 truncate text-[0.625rem] text-(--ui-text-tertiary)">{artifact.value}</div>
+          )}
         </div>
+
+        {artifact.source === 'canonical' && (
+          <ArtifactPresentationDetails artifact={artifact} className="text-[0.625rem]" />
+        )}
 
         <div className="truncate text-[0.625rem] text-(--ui-text-tertiary)">
           {artifact.sessionTitle} · {formatArtifactTime(artifact.timestamp)}
         </div>
 
         <div className="flex flex-wrap gap-1.5">
-          <Button onClick={() => onOpenChat(artifact.sessionId)} size="xs" type="button" variant="textStrong">
+          <Button onClick={() => void onOpenChat(artifact)} size="xs" type="button" variant="textStrong">
             <FolderOpen className="size-3" />
             {a.chat}
           </Button>
@@ -509,16 +712,18 @@ function ArtifactImageCard({ artifact, failedImage, onImageError, onOpenChat }: 
 // the entire cell area is hoverable and clickable in both branches.
 function ArtifactCellAction({
   children,
+  disabled = false,
   href,
   onClick,
   title
 }: {
   children: React.ReactNode
+  disabled?: boolean
   href?: string
   onClick?: () => void
   title?: string
 }) {
-  if (href) {
+  if (href && !disabled) {
     return (
       <ExternalLink
         className="flex h-full w-full min-w-0 items-center gap-2 px-2.5 py-1.5 text-left text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) font-normal text-(--ui-text-secondary) no-underline underline-offset-4 decoration-current/20 transition-colors hover:text-foreground hover:underline"
@@ -534,6 +739,7 @@ function ArtifactCellAction({
   return (
     <RowButton
       className="flex h-full w-full min-w-0 items-center gap-2 px-2.5 py-1.5 text-left text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) font-normal text-(--ui-text-secondary) no-underline underline-offset-4 decoration-current/20 transition-colors hover:text-foreground hover:underline"
+      disabled={disabled}
       onClick={onClick}
     >
       {children}
@@ -542,15 +748,19 @@ function ArtifactCellAction({
 }
 
 function PrimaryCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx }) {
-  const isLink = artifact.kind === 'link'
+  const href = artifact.href
+  const linkHref = artifact.kind === 'link' ? href : null
+  const isLink = linkHref !== null
   const Icon = isLink ? Link2 : FileText
-  const fetchedTitle = useLinkTitle(isLink ? artifact.href : null)
-  const label = isLink ? fetchedTitle || urlSlugTitleLabel(artifact.href) : artifact.label
+  const fetchedTitle = useLinkTitle(linkHref)
+  const label = linkHref ? fetchedTitle || urlSlugTitleLabel(linkHref) : artifact.label
+  const canOpen = artifact.source === 'legacy' || href !== null
 
   return (
     <ArtifactCellAction
-      href={isLink ? artifact.href : undefined}
-      onClick={isLink ? undefined : () => void ctx.onOpen(artifact.href)}
+      disabled={!canOpen}
+      href={linkHref ?? undefined}
+      onClick={linkHref || !href ? undefined : () => void ctx.onOpen(href)}
       title={label}
     >
       <span className="mt-0.5 grid size-6 shrink-0 place-items-center self-start rounded-md bg-(--ui-bg-tertiary) text-(--ui-text-tertiary)">
@@ -566,38 +776,65 @@ function PrimaryCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx
 
 function LocationCell({ artifact }: { artifact: ArtifactRecord; ctx: CellCtx }) {
   const { t } = useI18n()
-  const isLink = artifact.kind === 'link'
+  const isLink = artifact.kind === 'link' && artifact.href !== null
   const value = isLink ? hostPathLabel(artifact.value) : artifact.value
   const copyLabel = isLink ? t.artifacts.copyUrl : t.artifacts.copyPath
 
+  if (!value) {
+    return (
+      <div className="min-w-0 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+        â€”
+        <ArtifactPresentationDetails artifact={artifact} className="mt-0.5" />
+      </div>
+    )
+  }
+
   return (
-    <div className="group/location flex min-w-0 items-center gap-1.5">
-      <Tip label={artifact.value}>
-        <div
-          className={cn(
-            'min-w-0 flex-1 truncate text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
-            isLink ? 'font-normal' : 'font-mono'
-          )}
-        >
-          {value}
-        </div>
-      </Tip>
-      <CopyButton
-        appearance="icon"
-        buttonSize="icon-xs"
-        className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/location:opacity-100"
-        iconClassName="size-3.5"
-        label={copyLabel}
-        text={artifact.value}
-        title={copyLabel}
-      />
+    <div className="min-w-0">
+      <div className="group/location flex min-w-0 items-center gap-1.5">
+        <Tip label={artifact.value}>
+          <div
+            className={cn(
+              'min-w-0 flex-1 truncate text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
+              isLink ? 'font-normal' : 'font-mono'
+            )}
+          >
+            {value}
+          </div>
+        </Tip>
+        <CopyButton
+          appearance="icon"
+          buttonSize="icon-xs"
+          className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/location:opacity-100"
+          iconClassName="size-3.5"
+          label={copyLabel}
+          text={artifact.value}
+          title={copyLabel}
+        />
+      </div>
+      <ArtifactPresentationDetails artifact={artifact} className="mt-0.5" />
+    </div>
+  )
+}
+
+function ArtifactPresentationDetails({ artifact, className }: { artifact: ArtifactRecord; className?: string }) {
+  if (artifact.source !== 'canonical') {
+    return null
+  }
+
+  return (
+    <div className={cn('min-w-0 text-(--ui-text-tertiary)', className)}>
+      <div>{artifact.sizeBytes === null ? 'Size: â€”' : `Size: ${artifact.sizeBytes} bytes`}</div>
+      <div className="wrap-anywhere" title={artifact.sha256 || undefined}>
+        {artifact.sha256 ? `SHA-256: ${artifact.sha256}` : 'SHA-256: â€”'}
+      </div>
     </div>
   )
 }
 
 function SessionCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx }) {
   return (
-    <ArtifactCellAction onClick={() => ctx.onOpenChat(artifact.sessionId)} title={artifact.sessionTitle}>
+    <ArtifactCellAction onClick={() => void ctx.onOpenChat(artifact)} title={artifact.sessionTitle}>
       <span className="flex min-w-0 flex-col">
         <span className="truncate">{artifact.sessionTitle}</span>
         <span className="truncate text-[0.6875rem] font-normal text-(--ui-text-tertiary)">

@@ -28,8 +28,17 @@ import { requestDesktopOnboarding, requestDesktopOnboardingForCredentialWarning 
 import { revealDesktopPane } from '@/store/pane-focus'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { managedProjectApprovalForSurface } from '@/store/project-approval'
+import { syncProjectRuntime } from '@/store/project-runtime'
+import { resolveCurrentManagedProjectSurface } from '@/store/project-surface-authority-store'
 import { followActiveSessionCwd } from '@/store/projects'
-import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
+import {
+  clearAllPrompts,
+  clearApprovalRequest,
+  setApprovalRequest,
+  setSecretRequest,
+  setSudoRequest
+} from '@/store/prompts'
 import {
   $currentCwd,
   $currentModel,
@@ -62,6 +71,51 @@ import { hasSessionInfoStatePatch, sessionInfoStatePatch, SUBAGENT_EVENT_TYPES, 
 
 function firstBillingLine(text: string): string {
   return (text || '').split('\n')[0]?.trim() ?? ''
+}
+
+/** A project event frame is deliberately only a wake-up hint. Canonical
+ * project state is read through the runtime RPC; accepting an event body here
+ * would let an unpersisted transport frame mutate the desktop. */
+export function handleProjectRuntimeGatewayEvent(
+  event: Pick<RpcEvent, 'payload' | 'profile' | 'type'>,
+  activeGatewayProfile?: string
+): boolean {
+  if (event.type !== 'project.event') {
+    return false
+  }
+
+  if (
+    event.profile &&
+    activeGatewayProfile &&
+    normalizeProfileKey(event.profile) !== normalizeProfileKey(activeGatewayProfile)
+  ) {
+    return false
+  }
+
+  const rawPayload = event.payload
+
+  if (!rawPayload || typeof rawPayload !== 'object' || Array.isArray(rawPayload)) {
+    return false
+  }
+
+  const payload = rawPayload as Record<string, unknown>
+
+  if (
+    Object.keys(payload).length !== 2 ||
+    !Object.hasOwn(payload, 'project_id') ||
+    !Object.hasOwn(payload, 'highest_sequence') ||
+    typeof payload.project_id !== 'string' ||
+    !payload.project_id ||
+    typeof payload.highest_sequence !== 'number' ||
+    !Number.isSafeInteger(payload.highest_sequence) ||
+    payload.highest_sequence < 0
+  ) {
+    return false
+  }
+
+  void syncProjectRuntime(payload.project_id).catch(() => undefined)
+
+  return true
 }
 
 /**
@@ -119,6 +173,33 @@ const COMPACTION_RESUME_EVENT_TYPES = new Set([
   'tool.generating',
   'tool.complete'
 ])
+
+function resolveBlockingInputSurface(runtimeSessionId: null | string, storedSessionId: null | string | undefined) {
+  const resolution = resolveCurrentManagedProjectSurface(runtimeSessionId, storedSessionId)
+
+  // Gateway blocking events carry only an ephemeral process id. Without the
+  // explicit runtime→stored cache pairing, neither active-project state nor an
+  // empty catalog may authorize a legacy response.
+  return storedSessionId || resolution.status === 'managed' || resolution.status === 'ambiguous'
+    ? resolution
+    : { projectId: null, status: 'unavailable' as const }
+}
+
+function blockingEventProfileIsCurrent(
+  eventProfile: string | undefined,
+  handlerProfile: string,
+  conclusivelyLegacy: boolean
+): boolean {
+  const currentProfile = normalizeProfileKey($activeGatewayProfile.get())
+  const capturedProfile = normalizeProfileKey(handlerProfile)
+  const stampedProfile = eventProfile?.trim()
+
+  if (!stampedProfile) {
+    return conclusivelyLegacy && capturedProfile === currentProfile
+  }
+
+  return normalizeProfileKey(stampedProfile) === currentProfile && capturedProfile === currentProfile
+}
 
 interface GatewayEventDeps {
   activeGatewayProfile: string
@@ -215,6 +296,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
   return useCallback(
     (event: RpcEvent) => {
+      if (handleProjectRuntimeGatewayEvent(event, activeGatewayProfile)) {
+        return
+      }
+
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
 
@@ -233,6 +318,29 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       const sessionId = route.sessionId
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
+      const isBlockingInputEvent = event.type === 'approval.request' || event.type === 'clarify.request'
+
+      const blockingStoredSessionId =
+        isBlockingInputEvent && sessionId ? sessionStateByRuntimeIdRef.current.get(sessionId)?.storedSessionId : null
+
+      const blockingInputSurface = isBlockingInputEvent
+        ? resolveBlockingInputSurface(sessionId, blockingStoredSessionId)
+        : null
+
+      if (
+        isBlockingInputEvent &&
+        blockingInputSurface &&
+        !blockingEventProfileIsCurrent(
+          event.profile,
+          activeGatewayProfile,
+          blockingInputSurface.status === 'conclusively-legacy'
+        )
+      ) {
+        // This event is not proven to belong to the active profile. Its only
+        // correlation key is the reusable runtime session id, so even clearing
+        // by session could erase a newer prompt from the replacement profile.
+        return
+      }
 
       // Mid-turn compaction does not emit another message.start. The first
       // model output or tool event proves summarization has finished and the
@@ -734,6 +842,22 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           )
         }
       } else if (event.type === 'clarify.request') {
+        const surface = blockingInputSurface!
+
+        if (surface.status !== 'conclusively-legacy') {
+          clearClarifyRequest(undefined, sessionId)
+
+          if (sessionId) {
+            updateSessionState(sessionId, state => {
+              const needsInput = surface.status === 'managed' && surface.snapshot.pending_approval !== null
+
+              return state.needsInput === needsInput ? state : { ...state, needsInput }
+            })
+          }
+
+          return
+        }
+
         // Surface the clarify tool's overlay. The Python side is blocked on
         // `clarify.respond`, so without this handler the agent would hang
         // forever (see tools/clarify_tool.py + tui_gateway/server.py:_block).
@@ -787,6 +911,40 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           })
         }
       } else if (event.type === 'approval.request') {
+        const surface = blockingInputSurface!
+
+        if (surface.status !== 'conclusively-legacy') {
+          clearApprovalRequest(sessionId)
+
+          if (sessionId) {
+            updateSessionState(sessionId, state => {
+              const needsInput = surface.status === 'managed' && surface.snapshot.pending_approval !== null
+
+              return state.needsInput === needsInput ? state : { ...state, needsInput }
+            })
+          }
+
+          if (surface.status === 'managed' && surface.snapshot.pending_approval) {
+            const approval = managedProjectApprovalForSurface(sessionId, blockingStoredSessionId ?? null).get().approval
+
+            if (approval) {
+              dispatchNativeNotification({
+                actions: [
+                  { id: 'approve', text: translateNow('notifications.native.approveAction') },
+                  { id: 'reject', text: translateNow('notifications.native.rejectAction') }
+                ],
+                approvalSource: { approval, kind: 'managed' },
+                body: translateNow('notifications.native.inputBody'),
+                kind: 'approval',
+                sessionId,
+                title: translateNow('notifications.native.approvalTitle')
+              })
+            }
+          }
+
+          return
+        }
+
         // Dangerous-command / execute_code approval. The Python side is blocked
         // in _await_gateway_decision() until approval.respond lands; without
         // this the agent stalls until its 5-min timeout and the tool is BLOCKED.
@@ -796,7 +954,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const command = typeof payload?.command === 'string' ? payload.command : ''
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
 
-        setApprovalRequest({
+        const approvalRequest = {
           // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
           choices: Array.isArray(payload?.choices)
@@ -806,7 +964,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           description,
           sessionId: sessionId ?? null,
           smartDenied: payload?.smart_denied === true
-        })
+        }
+
+        setApprovalRequest(approvalRequest)
 
         if (sessionId) {
           updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
@@ -817,6 +977,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             { id: 'approve', text: translateNow('notifications.native.approveAction') },
             { id: 'reject', text: translateNow('notifications.native.rejectAction') }
           ],
+          approvalSource: { kind: 'legacy', request: approvalRequest },
           body: command || description,
           kind: 'approval',
           sessionId,

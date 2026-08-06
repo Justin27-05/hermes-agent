@@ -7,8 +7,10 @@ delivery, worker, and provider behavior belong to later service layers.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -30,6 +32,8 @@ from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 
 
 _SQLITE_INT_MAX = (1 << 63) - 1
+_TASK7_OUTER_TRANSACTIONS: set[int] = set()
+_TASK7_OUTER_TIMESTAMPS: dict[int, int] = {}
 
 TASK6_CRITICAL_ACTION_APPROVAL_CLASSES = (
     ("credentials", "credentials"),
@@ -78,6 +82,12 @@ _TASK6_CRITICAL_APPROVAL_CLASS_BY_ACTION = dict(
 )
 
 
+TASK7_DISPATCHER_LEASE_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_project_dispatcher_lease_expiry
+ON project_dispatcher_leases(expires_at, lease_name);
+"""
+
+
 RUNTIME_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS project_contracts (
     contract_id    TEXT PRIMARY KEY,
@@ -107,7 +117,19 @@ CREATE TABLE IF NOT EXISTS project_runtime_state (
     version                 INTEGER NOT NULL,
     conversation_root_id    TEXT,
     conversation_tip_id     TEXT,
-    updated_at              INTEGER NOT NULL
+    updated_at              INTEGER NOT NULL,
+    dispatch_membership_sequence INTEGER
+                            CHECK (
+                                dispatch_membership_sequence IS NULL
+                                OR (
+                                    typeof(
+                                        dispatch_membership_sequence
+                                    ) = 'integer'
+                                    AND dispatch_membership_sequence > 0
+                                )
+                            ),
+    transcript_pending_batch_id TEXT,
+    transcript_dispatch_block_key TEXT
 );
 
 CREATE TABLE IF NOT EXISTS project_conversations (
@@ -134,6 +156,20 @@ CREATE TABLE IF NOT EXISTS project_surface_bindings (
     created_at           INTEGER NOT NULL,
     UNIQUE (project_id, binding_id),
     UNIQUE (surface, external_binding_id)
+);
+
+CREATE TABLE IF NOT EXISTS project_surface_principals (
+    project_id    TEXT NOT NULL,
+    binding_id    TEXT NOT NULL,
+    principal_id  TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (project_id, binding_id),
+    FOREIGN KEY (project_id)
+        REFERENCES projects(id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, binding_id)
+        REFERENCES project_surface_bindings(project_id, binding_id)
+        ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS project_turns (
@@ -166,6 +202,7 @@ CREATE TABLE IF NOT EXISTS project_turns (
                       ),
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
+    transcript_applied_batch_id TEXT,
     UNIQUE (project_id, turn_id),
     UNIQUE (project_id, sequence),
     UNIQUE (project_id, idempotency_key),
@@ -213,8 +250,21 @@ CREATE TABLE IF NOT EXISTS project_deliveries (
                   REFERENCES projects(id) ON DELETE RESTRICT,
     binding_id    TEXT NOT NULL,
     event_id      TEXT NOT NULL,
-    status        TEXT NOT NULL,
+    status        TEXT NOT NULL
+                  CHECK (
+                      status IN (
+                          'pending',
+                          'in_flight',
+                          'delivered',
+                          'suppressed',
+                          'blocked'
+                      )
+                  ),
     cursor        INTEGER,
+    lease_expires_at INTEGER,
+    remote_message_ids_json TEXT,
+    next_attempt_at INTEGER,
+    last_error_code TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     updated_at    INTEGER NOT NULL,
     UNIQUE (project_id, delivery_id),
@@ -224,6 +274,80 @@ CREATE TABLE IF NOT EXISTS project_deliveries (
     FOREIGN KEY (project_id, event_id)
         REFERENCES project_events(project_id, event_id)
 );
+
+CREATE TABLE IF NOT EXISTS project_desktop_read_cursors (
+    project_id  TEXT NOT NULL,
+    binding_id  TEXT NOT NULL,
+    cursor      INTEGER NOT NULL
+                CHECK (
+                    typeof(cursor) = 'integer'
+                    AND cursor >= 0
+                ),
+    updated_at  INTEGER NOT NULL
+                CHECK (
+                    typeof(updated_at) = 'integer'
+                    AND updated_at >= 0
+                ),
+    PRIMARY KEY (project_id, binding_id),
+    FOREIGN KEY (project_id, binding_id)
+        REFERENCES project_surface_bindings(project_id, binding_id)
+        ON DELETE RESTRICT
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_desktop_read_cursor_insert_surface
+BEFORE INSERT ON project_desktop_read_cursors
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM project_surface_bindings AS binding
+        WHERE binding.project_id = NEW.project_id
+          AND binding.binding_id = NEW.binding_id
+          AND binding.surface = 'desktop'
+    ) THEN RAISE(ABORT, 'desktop read cursor requires desktop binding') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_desktop_read_cursor_insert_bounds
+BEFORE INSERT ON project_desktop_read_cursors
+WHEN NEW.cursor > COALESCE(
+    (
+        SELECT MAX(event.sequence)
+        FROM project_events AS event
+        WHERE event.project_id = NEW.project_id
+    ),
+    0
+)
+BEGIN
+    SELECT RAISE(ABORT, 'desktop read cursor exceeds latest event');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_desktop_read_cursor_update_identity
+BEFORE UPDATE OF project_id, binding_id ON project_desktop_read_cursors
+BEGIN
+    SELECT RAISE(ABORT, 'desktop read cursor identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_desktop_read_cursor_update_bounds
+BEFORE UPDATE OF cursor ON project_desktop_read_cursors
+WHEN (
+    NEW.cursor < OLD.cursor
+    OR NEW.cursor > COALESCE(
+        (
+            SELECT MAX(event.sequence)
+            FROM project_events AS event
+            WHERE event.project_id = NEW.project_id
+        ),
+        0
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'desktop read cursor must be monotone and bounded');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_desktop_read_cursor_no_delete
+BEFORE DELETE ON project_desktop_read_cursors
+BEGIN
+    SELECT RAISE(ABORT, 'desktop read cursor cannot be deleted');
+END;
 
 CREATE TABLE IF NOT EXISTS project_approvals (
     approval_id         TEXT PRIMARY KEY,
@@ -397,6 +521,24 @@ CREATE TABLE IF NOT EXISTS project_operations (
     blocked_reason   TEXT,
     remote_idempotency_supported INTEGER,
     approval_fingerprint_json TEXT,
+    operation_authority_json TEXT,
+    operation_authority_sha256 TEXT,
+    effect_scope_json TEXT,
+    effect_scope_sha256 TEXT,
+    policy_authority_json TEXT,
+    policy_authority_sha256 TEXT,
+    approval_checkpoint_id TEXT,
+    intent_event_id TEXT,
+    recovery_membership_sequence INTEGER
+                     CHECK (
+                         recovery_membership_sequence IS NULL
+                         OR (
+                             typeof(
+                                 recovery_membership_sequence
+                             ) = 'integer'
+                             AND recovery_membership_sequence > 0
+                         )
+                     ),
     UNIQUE (project_id, operation_id),
     UNIQUE (project_id, idempotency_key),
     FOREIGN KEY (project_id, turn_id)
@@ -421,6 +563,20 @@ CREATE TABLE IF NOT EXISTS project_worker_leases (
         REFERENCES project_turns(project_id, turn_id)
 );
 
+CREATE TABLE IF NOT EXISTS project_dispatcher_leases (
+    lease_name      TEXT PRIMARY KEY CHECK (lease_name = 'core'),
+    instance_id     TEXT,
+    generation      INTEGER NOT NULL CHECK (generation >= 0),
+    fencing_token   INTEGER NOT NULL CHECK (fencing_token >= 0),
+    expires_at      INTEGER NOT NULL CHECK (expires_at >= 0),
+    updated_at      INTEGER NOT NULL CHECK (updated_at >= 0),
+    CHECK (
+        (instance_id IS NULL AND expires_at = updated_at)
+        OR (instance_id IS NOT NULL AND length(instance_id) = 36)
+    )
+);
+
+""" + TASK7_DISPATCHER_LEASE_INDEX_SQL + """
 CREATE TABLE IF NOT EXISTS project_operation_maintenance (
     singleton           INTEGER PRIMARY KEY
                         CHECK (singleton = 1),
@@ -455,9 +611,339 @@ CREATE TABLE IF NOT EXISTS project_operation_maintenance (
                             ) = 'integer'
                             AND operation_validation_migration_complete
                                 IN (0, 1)
+                        ),
+    task7_operation_migration_complete
+                        INTEGER NOT NULL DEFAULT 0
+                        CHECK (
+                            typeof(
+                                task7_operation_migration_complete
+                            ) = 'integer'
+                            AND task7_operation_migration_complete
+                                IN (0, 1)
                         )
 );
 """
+
+TASK7_MEMBERSHIP_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS
+idx_project_runtime_dispatch_membership
+ON project_runtime_state(dispatch_membership_sequence)
+WHERE dispatch_membership_sequence IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_project_runtime_dispatch_scan
+ON project_runtime_state(dispatch_membership_sequence, project_id)
+WHERE lifecycle = 'active'
+  AND dispatch_membership_sequence IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+idx_project_operations_recovery_membership
+ON project_operations(recovery_membership_sequence)
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND recovery_membership_sequence IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_project_operations_task7_recovery_page
+ON project_operations(
+    recovery_membership_sequence, project_id, operation_id, turn_id, status
+)
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND recovery_membership_sequence IS NOT NULL
+  AND status IN (
+      'approved', 'effect_started', 'receipt_recorded', 'unknown'
+  );
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+idx_project_operations_approval_checkpoint
+ON project_operations(project_id, approval_checkpoint_id)
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND approval_checkpoint_id IS NOT NULL;
+"""
+
+TASK7_MEMBERSHIP_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS
+trg_project_runtime_dispatch_membership_insert
+BEFORE INSERT ON project_runtime_state
+WHEN NOT (
+    typeof(NEW.dispatch_membership_sequence) = 'integer'
+    AND NEW.dispatch_membership_sequence > 0
+)
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'runtime state requires positive dispatch membership sequence'
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+trg_project_runtime_dispatch_membership_update
+BEFORE UPDATE ON project_runtime_state
+WHEN NEW.dispatch_membership_sequence
+     IS NOT OLD.dispatch_membership_sequence
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'dispatch membership sequence is immutable'
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+trg_project_operations_task7_certification_insert
+BEFORE INSERT ON project_operations
+WHEN NEW.guard_revision = 1
+ AND NEW.guard_validated = 1
+ AND NOT (
+    typeof(NEW.recovery_membership_sequence) = 'integer'
+    AND NEW.recovery_membership_sequence > 0
+    AND (
+        (
+            NEW.approval_checkpoint_id IS NULL
+            AND NEW.intent_event_id IS NULL
+        )
+        OR (
+            typeof(NEW.approval_checkpoint_id) = 'text'
+            AND length(NEW.approval_checkpoint_id) > 0
+            AND typeof(NEW.intent_event_id) = 'text'
+            AND length(NEW.intent_event_id) > 0
+        )
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Task-7 operation certification');
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+trg_project_operations_task7_certification_update
+BEFORE UPDATE ON project_operations
+WHEN NEW.guard_revision = 1
+ AND NEW.guard_validated = 1
+ AND NOT (
+    typeof(NEW.recovery_membership_sequence) = 'integer'
+    AND NEW.recovery_membership_sequence > 0
+    AND (
+        (
+            NEW.approval_checkpoint_id IS NULL
+            AND NEW.intent_event_id IS NULL
+        )
+        OR (
+            typeof(NEW.approval_checkpoint_id) = 'text'
+            AND length(NEW.approval_checkpoint_id) > 0
+            AND typeof(NEW.intent_event_id) = 'text'
+            AND length(NEW.intent_event_id) > 0
+        )
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Task-7 operation certification');
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+trg_project_operations_recovery_membership_update
+BEFORE UPDATE ON project_operations
+WHEN OLD.recovery_membership_sequence IS NOT NULL
+ AND NEW.recovery_membership_sequence
+     IS NOT OLD.recovery_membership_sequence
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'recovery membership sequence is immutable'
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+trg_project_operations_task7_certified_update
+BEFORE UPDATE ON project_operations
+WHEN NEW.approval_checkpoint_id IS NOT OLD.approval_checkpoint_id
+  OR NEW.intent_event_id IS NOT OLD.intent_event_id
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'certified Task-7 operation requires marker-only transition'
+    );
+END;
+"""
+
+_TASK7_MEMBERSHIP_INDEX_NAMES = (
+    "idx_project_runtime_dispatch_membership",
+    "idx_project_runtime_dispatch_scan",
+    "idx_project_operations_recovery_membership",
+    "idx_project_operations_task7_recovery_page",
+    "idx_project_operations_approval_checkpoint",
+)
+
+_TASK7_MEMBERSHIP_TRIGGER_NAMES = (
+    "trg_project_runtime_dispatch_membership_insert",
+    "trg_project_runtime_dispatch_membership_update",
+    "trg_project_operations_task7_certification_insert",
+    "trg_project_operations_task7_certification_update",
+    "trg_project_operations_recovery_membership_update",
+    "trg_project_operations_task7_certified_update",
+)
+
+TASK7_TERMINAL_GATE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS
+trg_project_runtime_state_task7_terminal_gate_insert
+BEFORE INSERT ON project_runtime_state
+WHEN (
+       (
+           NEW.transcript_pending_batch_id IS NOT NULL
+           AND NOT (
+               typeof(NEW.transcript_pending_batch_id) = 'text'
+               AND length(NEW.transcript_pending_batch_id) = 36
+               AND NEW.transcript_pending_batch_id
+                   = lower(NEW.transcript_pending_batch_id)
+               AND substr(NEW.transcript_pending_batch_id, 9, 1) = '-'
+               AND substr(NEW.transcript_pending_batch_id, 14, 1) = '-'
+               AND substr(NEW.transcript_pending_batch_id, 15, 1) = '4'
+               AND substr(NEW.transcript_pending_batch_id, 19, 1) = '-'
+               AND substr(NEW.transcript_pending_batch_id, 20, 1)
+                   IN ('8', '9', 'a', 'b')
+               AND substr(NEW.transcript_pending_batch_id, 24, 1) = '-'
+               AND length(
+                   replace(NEW.transcript_pending_batch_id, '-', '')
+               ) = 32
+               AND replace(NEW.transcript_pending_batch_id, '-', '')
+                   NOT GLOB '*[^0-9a-f]*'
+           )
+       )
+       OR (
+           NEW.transcript_dispatch_block_key IS NOT NULL
+           AND NOT (
+               typeof(NEW.transcript_dispatch_block_key) = 'text'
+               AND length(NEW.transcript_dispatch_block_key) > 0
+           )
+       )
+       OR (
+           NEW.transcript_pending_batch_id IS NOT NULL
+           AND NEW.transcript_dispatch_block_key IS NOT NULL
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Task-7 terminal gate');
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+trg_project_runtime_state_task7_terminal_gate_update
+BEFORE UPDATE ON project_runtime_state
+WHEN (
+       (
+           NEW.transcript_pending_batch_id IS NOT NULL
+           AND NOT (
+               typeof(NEW.transcript_pending_batch_id) = 'text'
+               AND length(NEW.transcript_pending_batch_id) = 36
+               AND NEW.transcript_pending_batch_id
+                   = lower(NEW.transcript_pending_batch_id)
+               AND substr(NEW.transcript_pending_batch_id, 9, 1) = '-'
+               AND substr(NEW.transcript_pending_batch_id, 14, 1) = '-'
+               AND substr(NEW.transcript_pending_batch_id, 15, 1) = '4'
+               AND substr(NEW.transcript_pending_batch_id, 19, 1) = '-'
+               AND substr(NEW.transcript_pending_batch_id, 20, 1)
+                   IN ('8', '9', 'a', 'b')
+               AND substr(NEW.transcript_pending_batch_id, 24, 1) = '-'
+               AND length(
+                   replace(NEW.transcript_pending_batch_id, '-', '')
+               ) = 32
+               AND replace(NEW.transcript_pending_batch_id, '-', '')
+                   NOT GLOB '*[^0-9a-f]*'
+           )
+       )
+       OR (
+           NEW.transcript_dispatch_block_key IS NOT NULL
+           AND NOT (
+               typeof(NEW.transcript_dispatch_block_key) = 'text'
+               AND length(NEW.transcript_dispatch_block_key) > 0
+           )
+       )
+       OR (
+           NEW.transcript_pending_batch_id IS NOT NULL
+           AND NEW.transcript_dispatch_block_key IS NOT NULL
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Task-7 terminal gate');
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+trg_project_turns_task7_applied_batch_insert
+BEFORE INSERT ON project_turns
+WHEN (
+    NEW.transcript_applied_batch_id IS NOT NULL
+    AND NOT (
+        typeof(NEW.transcript_applied_batch_id) = 'text'
+        AND length(NEW.transcript_applied_batch_id) = 36
+        AND NEW.transcript_applied_batch_id
+            = lower(NEW.transcript_applied_batch_id)
+        AND substr(NEW.transcript_applied_batch_id, 9, 1) = '-'
+        AND substr(NEW.transcript_applied_batch_id, 14, 1) = '-'
+        AND substr(NEW.transcript_applied_batch_id, 15, 1) = '4'
+        AND substr(NEW.transcript_applied_batch_id, 19, 1) = '-'
+        AND substr(NEW.transcript_applied_batch_id, 20, 1)
+            IN ('8', '9', 'a', 'b')
+        AND substr(NEW.transcript_applied_batch_id, 24, 1) = '-'
+        AND length(
+            replace(NEW.transcript_applied_batch_id, '-', '')
+        ) = 32
+        AND replace(NEW.transcript_applied_batch_id, '-', '')
+            NOT GLOB '*[^0-9a-f]*'
+        AND NEW.status IN ('succeeded', 'failed')
+        AND typeof(NEW.terminal_result_id) = 'text'
+        AND NEW.terminal_result_id = NEW.transcript_applied_batch_id
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Task-7 applied transcript batch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+trg_project_turns_task7_applied_batch_update
+BEFORE UPDATE ON project_turns
+WHEN (
+       (
+           NEW.transcript_applied_batch_id IS NOT NULL
+           AND NOT (
+               typeof(NEW.transcript_applied_batch_id) = 'text'
+               AND length(NEW.transcript_applied_batch_id) = 36
+               AND NEW.transcript_applied_batch_id
+                   = lower(NEW.transcript_applied_batch_id)
+               AND substr(NEW.transcript_applied_batch_id, 9, 1) = '-'
+               AND substr(NEW.transcript_applied_batch_id, 14, 1) = '-'
+               AND substr(NEW.transcript_applied_batch_id, 15, 1) = '4'
+               AND substr(NEW.transcript_applied_batch_id, 19, 1) = '-'
+               AND substr(NEW.transcript_applied_batch_id, 20, 1)
+                   IN ('8', '9', 'a', 'b')
+               AND substr(NEW.transcript_applied_batch_id, 24, 1) = '-'
+               AND length(
+                   replace(NEW.transcript_applied_batch_id, '-', '')
+               ) = 32
+               AND replace(NEW.transcript_applied_batch_id, '-', '')
+                   NOT GLOB '*[^0-9a-f]*'
+               AND NEW.status IN ('succeeded', 'failed')
+               AND typeof(NEW.terminal_result_id) = 'text'
+               AND NEW.terminal_result_id
+                   = NEW.transcript_applied_batch_id
+           )
+       )
+       OR (
+           OLD.transcript_applied_batch_id IS NOT NULL
+           AND (
+               NEW.transcript_applied_batch_id
+                   IS NOT OLD.transcript_applied_batch_id
+               OR NEW.terminal_result_id IS NOT OLD.terminal_result_id
+           )
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Task-7 applied transcript batch');
+END;
+"""
+
+_TASK7_TERMINAL_GATE_TRIGGER_NAMES = (
+    "trg_project_runtime_state_task7_terminal_gate_insert",
+    "trg_project_runtime_state_task7_terminal_gate_update",
+    "trg_project_turns_task7_applied_batch_insert",
+    "trg_project_turns_task7_applied_batch_update",
+)
 
 LINEAGE_INDEX_SQL = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_conversations_one_root
@@ -1144,6 +1630,19 @@ ORDER BY lease.expires_at, lease.project_id, lease.turn_id
 LIMIT ?
 """
 
+_RECOVERY_EXPIRED_STOP_LEASES_SQL = """
+SELECT turn.project_id, turn.turn_id, turn.sequence
+FROM project_worker_leases AS lease
+     INDEXED BY idx_project_worker_leases_expiry
+JOIN project_turns AS turn
+  ON turn.project_id = lease.project_id
+ AND turn.turn_id = lease.turn_id
+WHERE lease.expires_at <= ?
+  AND turn.status = 'stop_requested'
+ORDER BY lease.expires_at, lease.project_id, lease.turn_id
+LIMIT ?
+"""
+
 _RECOVERY_RECONCILING_SQL = """
 SELECT turn.project_id, turn.turn_id, turn.sequence,
        EXISTS (
@@ -1164,6 +1663,20 @@ FROM project_turns AS turn
      INDEXED BY idx_project_turns_actionable_recovery
 WHERE turn.status = 'reconciling'
   AND turn.recovery_block_key IS NULL
+ORDER BY turn.project_id, turn.sequence, turn.turn_id
+LIMIT ?
+"""
+
+_RECOVERY_RECONCILING_STOP_SQL = """
+SELECT turn.project_id, turn.turn_id, turn.sequence
+FROM project_turns AS turn
+     INDEXED BY idx_project_turns_actionable_recovery
+JOIN project_run_controls AS control
+  ON control.project_id = turn.project_id
+ AND control.turn_id = turn.turn_id
+WHERE turn.status = 'reconciling'
+  AND turn.recovery_block_key IS NULL
+  AND control.control_state = 'stop_requested'
 ORDER BY turn.project_id, turn.sequence, turn.turn_id
 LIMIT ?
 """
@@ -1306,6 +1819,123 @@ WHERE event_id = ? AND project_id = ? AND turn_id = ?
 LIMIT 1
 """
 
+_RUNNABLE_MEMBERSHIP_UPPER_SQL = """
+SELECT dispatch_membership_sequence, project_id
+FROM project_runtime_state
+     INDEXED BY idx_project_runtime_dispatch_membership
+WHERE dispatch_membership_sequence IS NOT NULL
+ORDER BY dispatch_membership_sequence DESC, project_id DESC
+LIMIT 1
+"""
+
+_RUNNABLE_MEMBERSHIP_PAGE_START_SQL = """
+SELECT dispatch_membership_sequence, project_id
+FROM project_runtime_state
+     INDEXED BY idx_project_runtime_dispatch_membership
+WHERE dispatch_membership_sequence IS NOT NULL
+  AND dispatch_membership_sequence <= ?
+ORDER BY dispatch_membership_sequence, project_id
+LIMIT ?
+"""
+
+_RUNNABLE_MEMBERSHIP_PAGE_AFTER_SQL = """
+SELECT dispatch_membership_sequence, project_id
+FROM project_runtime_state
+     INDEXED BY idx_project_runtime_dispatch_membership
+WHERE dispatch_membership_sequence IS NOT NULL
+  AND (dispatch_membership_sequence, project_id) > (?, ?)
+  AND dispatch_membership_sequence <= ?
+ORDER BY dispatch_membership_sequence, project_id
+LIMIT ?
+"""
+
+_RUNNABLE_MEMBERSHIP_REMAINING_SQL = """
+SELECT 1
+FROM project_runtime_state
+     INDEXED BY idx_project_runtime_dispatch_membership
+WHERE dispatch_membership_sequence IS NOT NULL
+  AND (dispatch_membership_sequence, project_id) > (?, ?)
+  AND dispatch_membership_sequence <= ?
+LIMIT 1
+"""
+
+_RUNNABLE_PROJECT_HEAD_SQL = """
+SELECT *
+FROM project_turns INDEXED BY idx_project_turns_project_sequence
+WHERE project_id = ?
+  AND status NOT IN ('succeeded', 'failed', 'cancelled')
+ORDER BY sequence, turn_id
+LIMIT 1
+"""
+
+_OPERATION_RECOVERY_MEMBERSHIP_UPPER_SQL = """
+SELECT recovery_membership_sequence, project_id, operation_id, turn_id,
+       status
+FROM project_operations
+     INDEXED BY idx_project_operations_task7_recovery_page
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND recovery_membership_sequence IS NOT NULL
+  AND status IN (
+      'approved', 'effect_started', 'receipt_recorded', 'unknown'
+  )
+ORDER BY recovery_membership_sequence DESC, project_id DESC,
+         operation_id DESC, turn_id DESC
+LIMIT 1
+"""
+
+_OPERATION_RECOVERY_MEMBERSHIP_PAGE_START_SQL = """
+SELECT recovery_membership_sequence, project_id, operation_id, turn_id,
+       status
+FROM project_operations
+     INDEXED BY idx_project_operations_task7_recovery_page
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND recovery_membership_sequence IS NOT NULL
+  AND status IN (
+      'approved', 'effect_started', 'receipt_recorded', 'unknown'
+  )
+  AND recovery_membership_sequence <= ?
+ORDER BY recovery_membership_sequence, project_id, operation_id, turn_id
+LIMIT ?
+"""
+
+_OPERATION_RECOVERY_MEMBERSHIP_PAGE_AFTER_SQL = """
+SELECT recovery_membership_sequence, project_id, operation_id, turn_id,
+       status
+FROM project_operations
+     INDEXED BY idx_project_operations_task7_recovery_page
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND recovery_membership_sequence IS NOT NULL
+  AND status IN (
+      'approved', 'effect_started', 'receipt_recorded', 'unknown'
+  )
+  AND (
+      recovery_membership_sequence, project_id, operation_id, turn_id
+  ) > (?, ?, ?, ?)
+  AND recovery_membership_sequence <= ?
+ORDER BY recovery_membership_sequence, project_id, operation_id, turn_id
+LIMIT ?
+"""
+
+_OPERATION_RECOVERY_MEMBERSHIP_REMAINING_SQL = """
+SELECT 1
+FROM project_operations
+     INDEXED BY idx_project_operations_task7_recovery_page
+WHERE guard_revision = 1
+  AND guard_validated = 1
+  AND recovery_membership_sequence IS NOT NULL
+  AND status IN (
+      'approved', 'effect_started', 'receipt_recorded', 'unknown'
+  )
+  AND (
+      recovery_membership_sequence, project_id, operation_id, turn_id
+  ) > (?, ?, ?, ?)
+  AND recovery_membership_sequence <= ?
+LIMIT 1
+"""
+
 
 Lifecycle = Literal["active", "awaiting_acceptance", "completed"]
 ApprovalStatus = Literal["pending", "approved", "denied", "expired"]
@@ -1320,6 +1950,24 @@ class RuntimeState:
     conversation_root_id: Optional[str]
     conversation_tip_id: Optional[str]
     updated_at: int
+    dispatch_membership_sequence: int
+    transcript_pending_batch_id: str | None
+    transcript_dispatch_block_key: str | None
+
+
+@dataclass(frozen=True)
+class RunnableMembershipRecord:
+    dispatch_membership_sequence: int
+    project_id: str
+
+
+@dataclass(frozen=True)
+class OperationRecoveryMemberRecord:
+    recovery_membership_sequence: int
+    project_id: str
+    operation_id: str
+    turn_id: str
+    status: str
 
 
 @dataclass(frozen=True)
@@ -1341,6 +1989,7 @@ class RuntimeTurnRecord:
     recovery_block_key: str | None
     created_at: int
     updated_at: int
+    transcript_applied_batch_id: str | None
 
 
 @dataclass(frozen=True)
@@ -1418,6 +2067,34 @@ class ProjectOperationRecord:
     blocked_reason: str | None
     remote_idempotency_supported: bool
     approval_fingerprint_json: str | None
+    operation_authority_json: str | None
+    operation_authority_sha256: str | None
+    effect_scope_json: str | None
+    effect_scope_sha256: str | None
+    policy_authority_json: str | None
+    policy_authority_sha256: str | None
+    approval_checkpoint_id: str | None
+    intent_event_id: str | None
+    recovery_membership_sequence: int | None
+
+
+@dataclass(frozen=True)
+class CheckpointIntentAuthority:
+    """One immutable Task-7 publication checkpoint recorded at prepare."""
+
+    checkpoint_id: str
+    operation_id: str
+    approval_id: str
+    project_id: str
+    turn_id: str
+    sequence: int
+    worker_id: str
+    attempt_id: str
+    lease_generation: int
+    fencing_token: int
+    canonical_session_id: str
+    lease_expires_at: int
+    version: int
 
 
 @dataclass(frozen=True)
@@ -1456,6 +2133,17 @@ class OperationMigrationError(RuntimeError):
     """Task-6 cannot safely add uniqueness to malformed legacy links."""
 
 
+class Task7MembershipMigrationError(RuntimeError):
+    """Task-7 membership cannot be added without losing authority."""
+
+
+class MembershipSequenceExhaustedError(RuntimeError):
+    """One durable membership lane reached SQLite's INTEGER maximum."""
+
+    def __init__(self) -> None:
+        super().__init__("MEMBERSHIP_SEQUENCE_EXHAUSTED")
+
+
 class _InvalidOperationCertification(RuntimeError):
     """One row-local canonical/inverse-pair certification failure."""
 
@@ -1472,12 +2160,45 @@ class BindingConflictError(ValueError):
     """A binding identity collides with a different immutable tuple."""
 
 
+class DesktopReadCursorUnavailableError(RuntimeError):
+    """The canonical transcript is not ready for an ackable Desktop cut."""
+
+
 class _StaleConversationTip(RuntimeError):
     """Internal rollback sentinel for a failed child-tip compare-and-swap."""
 
 
 def runtime_state_from_row(row: sqlite3.Row) -> RuntimeState:
     """Map a runtime-state SQLite row to its immutable representation."""
+    dispatch_membership_sequence = row[
+        "dispatch_membership_sequence"
+    ]
+    transcript_pending_batch_id = row[
+        "transcript_pending_batch_id"
+    ]
+    transcript_dispatch_block_key = row[
+        "transcript_dispatch_block_key"
+    ]
+    if not _stored_int(
+        dispatch_membership_sequence,
+        minimum=1,
+    ) or not (
+        (
+            transcript_pending_batch_id is None
+            or _task7_canonical_uuid4(
+                transcript_pending_batch_id
+            )
+        )
+        and _stored_text(
+            transcript_dispatch_block_key,
+            optional=True,
+        )
+        and not (
+            transcript_pending_batch_id is not None
+            and transcript_dispatch_block_key is not None
+        )
+    ):
+        raise RuntimeError("malformed runtime membership sequence")
     return RuntimeState(
         project_id=row["project_id"],
         lifecycle=row["lifecycle"],
@@ -1486,6 +2207,13 @@ def runtime_state_from_row(row: sqlite3.Row) -> RuntimeState:
         conversation_root_id=row["conversation_root_id"],
         conversation_tip_id=row["conversation_tip_id"],
         updated_at=row["updated_at"],
+        dispatch_membership_sequence=(
+            dispatch_membership_sequence
+        ),
+        transcript_pending_batch_id=transcript_pending_batch_id,
+        transcript_dispatch_block_key=(
+            transcript_dispatch_block_key
+        ),
     )
 
 
@@ -1579,6 +2307,7 @@ def _project_operation_from_row(
     row: sqlite3.Row | dict[str, object],
     *,
     expected_guard_validated: int,
+    require_task7_membership: bool | None = None,
 ) -> ProjectOperationRecord:
     """Map one operation at one explicit durable-certification boundary."""
     try:
@@ -1605,6 +2334,100 @@ def _project_operation_from_row(
         approval_fingerprint_json = row[
             "approval_fingerprint_json"
         ]
+        row_keys = set(row.keys())
+        authority_columns = {
+            "operation_authority_json",
+            "operation_authority_sha256",
+            "effect_scope_json",
+            "effect_scope_sha256",
+            "policy_authority_json",
+            "policy_authority_sha256",
+        }
+        if row_keys.isdisjoint(authority_columns):
+            authority_values = (None,) * 6
+        elif authority_columns <= row_keys:
+            authority_values = tuple(
+                row[column]
+                for column in (
+                    "operation_authority_json",
+                    "operation_authority_sha256",
+                    "effect_scope_json",
+                    "effect_scope_sha256",
+                    "policy_authority_json",
+                    "policy_authority_sha256",
+                )
+            )
+        else:
+            raise ValueError("partial C14 operation authority schema")
+        (
+            operation_authority_json,
+            operation_authority_sha256,
+            effect_scope_json,
+            effect_scope_sha256,
+            policy_authority_json,
+            policy_authority_sha256,
+        ) = authority_values
+        authority_absent = all(
+            value is None for value in authority_values
+        )
+        authority_present = all(
+            type(value) is str and bool(value)
+            for value in authority_values
+        )
+        authority_valid = authority_absent
+        if authority_present:
+            _decode_operation_json(
+                operation_authority_json,
+                require_object=True,
+            )
+            _decode_operation_json(
+                effect_scope_json,
+                require_object=True,
+            )
+            _decode_operation_json(
+                policy_authority_json,
+                require_object=True,
+            )
+            authority_valid = (
+                len(operation_authority_sha256) == 64
+                and len(effect_scope_sha256) == 64
+                and len(policy_authority_sha256) == 64
+                and hashlib.sha256(
+                    operation_authority_json.encode("utf-8")
+                ).hexdigest()
+                == operation_authority_sha256
+                and hashlib.sha256(
+                    effect_scope_json.encode("utf-8")
+                ).hexdigest()
+                == effect_scope_sha256
+                and hashlib.sha256(
+                    policy_authority_json.encode("utf-8")
+                ).hexdigest()
+                == policy_authority_sha256
+            )
+        task7_columns = {
+            "approval_checkpoint_id",
+            "intent_event_id",
+            "recovery_membership_sequence",
+        }
+        if row_keys.isdisjoint(task7_columns):
+            has_task7_columns = False
+            approval_checkpoint_id = None
+            intent_event_id = None
+            recovery_membership_sequence = None
+        elif task7_columns <= row_keys:
+            has_task7_columns = True
+            approval_checkpoint_id = row[
+                "approval_checkpoint_id"
+            ]
+            intent_event_id = row["intent_event_id"]
+            recovery_membership_sequence = row[
+                "recovery_membership_sequence"
+            ]
+        else:
+            raise ValueError("partial Task-7 operation schema")
+        if require_task7_membership is None:
+            require_task7_membership = has_task7_columns
         if receipt_json is not None:
             _decode_operation_json(receipt_json, require_object=True)
         decoded_readback = None
@@ -1717,6 +2540,24 @@ def _project_operation_from_row(
             and _stored_text(blocked_reason, optional=True)
             and type(remote_idempotency_supported) is int
             and remote_idempotency_supported in {0, 1}
+            and authority_valid
+            and (
+                not require_task7_membership
+                or _stored_int(
+                    recovery_membership_sequence,
+                    minimum=1,
+                )
+            )
+            and (
+                (
+                    approval_checkpoint_id is None
+                    and intent_event_id is None
+                )
+                or (
+                    _stored_text(approval_checkpoint_id)
+                    and _stored_text(intent_event_id)
+                )
+            )
             and (
                 (
                     capability_missing
@@ -1851,6 +2692,17 @@ def _project_operation_from_row(
             remote_idempotency_supported
         ),
         approval_fingerprint_json=approval_fingerprint_json,
+        operation_authority_json=operation_authority_json,
+        operation_authority_sha256=operation_authority_sha256,
+        effect_scope_json=effect_scope_json,
+        effect_scope_sha256=effect_scope_sha256,
+        policy_authority_json=policy_authority_json,
+        policy_authority_sha256=policy_authority_sha256,
+        approval_checkpoint_id=approval_checkpoint_id,
+        intent_event_id=intent_event_id,
+        recovery_membership_sequence=(
+            recovery_membership_sequence
+        ),
     )
 
 
@@ -1893,6 +2745,20 @@ def _stored_int(
 ) -> bool:
     return (optional and value is None) or (
         type(value) is int and value >= minimum
+    )
+
+
+def _task7_canonical_uuid4(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        parsed.version == 4
+        and parsed.variant == uuid.RFC_4122
+        and str(parsed) == value
     )
 
 
@@ -2029,10 +2895,9 @@ def _valid_task5_turn_metadata(
     )
 
 
-def execute_schema_statements(
-    conn: sqlite3.Connection, schema_sql: str
-) -> None:
-    """Execute a SQL schema without committing a caller-owned transaction."""
+def _schema_statements(schema_sql: str) -> tuple[str, ...]:
+    """Split one schema script at SQLite-complete statement boundaries."""
+    statements: list[str] = []
     statement_chars: list[str] = []
     for char in schema_sql:
         statement_chars.append(char)
@@ -2042,26 +2907,56 @@ def execute_schema_statements(
         if not sqlite3.complete_statement(statement):
             continue
         if statement.strip():
-            conn.execute(statement)
+            statements.append(statement)
         statement_chars.clear()
 
     remainder = "".join(statement_chars)
-    if not remainder.strip():
-        return
-    try:
-        # Valid SQL need not end in a semicolon. SQLite also accepts
-        # whitespace/comment-only input as a no-op.
-        conn.execute(remainder)
-    except sqlite3.OperationalError as exc:
-        if "incomplete input" in str(exc).lower():
-            raise ValueError("incomplete schema SQL") from exc
-        raise
+    if remainder.strip():
+        statements.append(remainder)
+    return tuple(statements)
+
+
+def execute_schema_statements(
+    conn: sqlite3.Connection, schema_sql: str
+) -> None:
+    """Execute a SQL schema without committing a caller-owned transaction."""
+    for statement in _schema_statements(schema_sql):
+        try:
+            # Valid SQL need not end in a semicolon. SQLite also accepts
+            # whitespace/comment-only input as a no-op.
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "incomplete input" in str(exc).lower():
+                raise ValueError("incomplete schema SQL") from exc
+            raise
 
 
 def _normalized_schema_sql(value: object) -> str | None:
     if type(value) is not str:
         return None
     return " ".join(value.strip().rstrip(";").split())
+
+
+_SCHEMA_IDEMPOTENCY_CLAUSE = re.compile(
+    r"^(CREATE(?: UNIQUE)? INDEX|CREATE TRIGGER) IF NOT EXISTS "
+)
+
+
+def _normalized_named_schema_sql(value: object) -> str | None:
+    normalized = _normalized_schema_sql(value)
+    if normalized is None:
+        return None
+    return _SCHEMA_IDEMPOTENCY_CLAUSE.sub(r"\1 ", normalized)
+
+
+def _canonical_named_schema_sql(
+    schema_sql: str,
+    names: tuple[str, ...],
+) -> dict[str, str]:
+    statements = _schema_statements(schema_sql)
+    if len(statements) != len(names):
+        raise RuntimeError("invalid canonical schema object inventory")
+    return dict(zip(names, statements, strict=True))
 
 
 def _operation_unsafe_index_is_canonical(
@@ -2166,11 +3061,21 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create all additive ProjectRuntime tables without adopting projects."""
     conn.execute("PRAGMA foreign_keys=ON")
     execute_schema_statements(conn, RUNTIME_SCHEMA_SQL)
+    # The surface ledger deliberately has foreign keys to both the catalog and
+    # canonical events, so install it only after both parent schemas exist.
+    from hermes_cli.project_surface_operations import (
+        init_schema as init_surface_operation_schema,
+    )
+
+    init_surface_operation_schema(conn)
     _ensure_runtime_state_columns(conn)
     _ensure_approval_columns(conn)
     _ensure_run_control_columns(conn)
+    _ensure_delivery_columns(conn)
     _ensure_turn_columns(conn)
+    _ensure_task7_terminal_gate_schema(conn)
     _ensure_operation_columns(conn)
+    _ensure_task7_membership_schema(conn)
     _validate_existing_lineage(conn)
     try:
         execute_schema_statements(conn, LINEAGE_INDEX_SQL)
@@ -2179,6 +3084,511 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     except sqlite3.IntegrityError as exc:
         raise LineageMigrationError(
             "multiple conversation roots exist for one project"
+        ) from exc
+
+
+def _allocate_membership_sequence(
+    conn: sqlite3.Connection,
+    *,
+    lane: Literal["dispatch", "operation_recovery"],
+) -> int:
+    """Advance one exact durable lane counter."""
+    rows = conn.execute(
+        """
+        SELECT lane, last_sequence
+        FROM project_runtime_membership_counters
+        WHERE lane = ?
+        """,
+        (lane,),
+    ).fetchall()
+    if len(rows) != 1 or not (
+        rows[0]["lane"] == lane
+        and _stored_int(rows[0]["last_sequence"])
+        and rows[0]["last_sequence"] <= _SQLITE_INT_MAX
+    ):
+        raise RuntimeError("invalid membership sequence counter")
+    current = rows[0]["last_sequence"]
+    if current >= _SQLITE_INT_MAX:
+        raise MembershipSequenceExhaustedError
+    assigned = current + 1
+    if conn.execute(
+        """
+        UPDATE project_runtime_membership_counters
+        SET last_sequence = ?
+        WHERE lane = ? AND last_sequence IS ?
+        """,
+        (assigned, lane, current),
+    ).rowcount != 1:
+        raise RuntimeError("membership sequence counter changed")
+    return assigned
+
+
+def _task7_decertify_migration_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> None:
+    """Marker-only CAS one legacy certified row before its Task-7 fields."""
+    operation = _project_operation_from_row(
+        row,
+        expected_guard_validated=1,
+        require_task7_membership=False,
+    )
+    _operation_approval_certification_row(conn, operation)
+    columns = _operation_certification_columns(row)
+    predicate = " AND ".join(
+        f"{column} IS ?" for column in columns
+    )
+    if conn.execute(
+        f"""
+        UPDATE project_operations
+        SET guard_validated = 0
+        WHERE project_id = ? AND operation_id = ?
+          AND guard_validated = 1
+          AND {predicate}
+        """,
+        (
+            operation.project_id,
+            operation.operation_id,
+            *(row[column] for column in columns),
+        ),
+    ).rowcount != 1:
+        raise RuntimeError(
+            "project operation changed during Task-7 decertification"
+        )
+
+
+def _drop_stale_task7_membership_indexes(
+    conn: sqlite3.Connection,
+) -> None:
+    canonical = _canonical_named_schema_sql(
+        TASK7_MEMBERSHIP_INDEX_SQL,
+        _TASK7_MEMBERSHIP_INDEX_NAMES,
+    )
+    for name, expected_sql in canonical.items():
+        row = conn.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'index' AND name = ?
+            """,
+            (name,),
+        ).fetchone()
+        if row is None:
+            continue
+        if _normalized_named_schema_sql(
+            row["sql"]
+        ) != _normalized_named_schema_sql(expected_sql):
+            conn.execute(f"DROP INDEX {name}")
+
+
+def _ensure_task7_dispatcher_lease_index(
+    conn: sqlite3.Connection,
+) -> None:
+    name = "idx_project_dispatcher_lease_expiry"
+    expected_sql = _canonical_named_schema_sql(
+        TASK7_DISPATCHER_LEASE_INDEX_SQL,
+        (name,),
+    )[name]
+    row = conn.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'index' AND name = ?
+        """,
+        (name,),
+    ).fetchone()
+    if row is not None and _normalized_named_schema_sql(
+        row["sql"]
+    ) != _normalized_named_schema_sql(expected_sql):
+        conn.execute(f"DROP INDEX {name}")
+    execute_schema_statements(
+        conn,
+        TASK7_DISPATCHER_LEASE_INDEX_SQL,
+    )
+    installed = conn.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type = 'index' AND name = ?
+        """,
+        (name,),
+    ).fetchone()
+    if (
+        installed is None
+        or _normalized_named_schema_sql(installed["sql"])
+        != _normalized_named_schema_sql(expected_sql)
+    ):
+        raise RuntimeError(
+            "dispatcher lease expiry index did not converge"
+        )
+
+
+def _drop_stale_task7_membership_triggers(
+    conn: sqlite3.Connection,
+) -> None:
+    canonical = _canonical_named_schema_sql(
+        TASK7_MEMBERSHIP_TRIGGER_SQL,
+        _TASK7_MEMBERSHIP_TRIGGER_NAMES,
+    )
+    for name, expected_sql in canonical.items():
+        row = conn.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'trigger' AND name = ?
+            """,
+            (name,),
+        ).fetchone()
+        if row is None:
+            continue
+        if _normalized_named_schema_sql(
+            row["sql"]
+        ) != _normalized_named_schema_sql(expected_sql):
+            conn.execute(f"DROP TRIGGER {name}")
+
+
+def _ensure_task7_terminal_gate_schema(
+    conn: sqlite3.Connection,
+) -> None:
+    """Converge C7 terminal gate columns and strict row constraints."""
+    canonical = _canonical_named_schema_sql(
+        TASK7_TERMINAL_GATE_TRIGGER_SQL,
+        _TASK7_TERMINAL_GATE_TRIGGER_NAMES,
+    )
+    with write_transaction(conn):
+        for name, ddl in (
+            (
+                "transcript_pending_batch_id",
+                "transcript_pending_batch_id TEXT",
+            ),
+            (
+                "transcript_dispatch_block_key",
+                "transcript_dispatch_block_key TEXT",
+            ),
+        ):
+            add_column_if_missing(
+                conn,
+                "project_runtime_state",
+                name,
+                ddl,
+            )
+        add_column_if_missing(
+            conn,
+            "project_turns",
+            "transcript_applied_batch_id",
+            "transcript_applied_batch_id TEXT",
+        )
+        for name, expected_sql in canonical.items():
+            row = conn.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'trigger' AND name = ?
+                """,
+                (name,),
+            ).fetchone()
+            if row is not None and (
+                _normalized_named_schema_sql(row["sql"])
+                != _normalized_named_schema_sql(expected_sql)
+            ):
+                conn.execute(f"DROP TRIGGER {name}")
+        execute_schema_statements(
+            conn,
+            TASK7_TERMINAL_GATE_TRIGGER_SQL,
+        )
+        for name, expected_sql in canonical.items():
+            row = conn.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'trigger' AND name = ?
+                """,
+                (name,),
+            ).fetchone()
+            if (
+                row is None
+                or _normalized_named_schema_sql(row["sql"])
+                != _normalized_named_schema_sql(expected_sql)
+            ):
+                raise RuntimeError(
+                    "Task-7 terminal gate trigger did not converge"
+                )
+
+
+def _ensure_task7_membership_schema(
+    conn: sqlite3.Connection,
+) -> None:
+    """Install all Task-7 membership authority in one IMMEDIATE transaction."""
+    try:
+        with write_transaction(conn):
+            maintenance_rows = conn.execute(
+                """
+                SELECT singleton,
+                       operation_validation_migration_complete
+                FROM project_operation_maintenance
+                """
+            ).fetchall()
+            if len(maintenance_rows) != 1 or not (
+                maintenance_rows[0]["singleton"] == 1
+                and type(
+                    maintenance_rows[0][
+                        "operation_validation_migration_complete"
+                    ]
+                )
+                is int
+                and maintenance_rows[0][
+                    "operation_validation_migration_complete"
+                ]
+                == 1
+            ):
+                raise Task7MembershipMigrationError(
+                    "Task-6 operation certification is incomplete"
+                )
+
+            add_column_if_missing(
+                conn,
+                "project_runtime_state",
+                "dispatch_membership_sequence",
+                """
+                dispatch_membership_sequence INTEGER
+                    CHECK (
+                        dispatch_membership_sequence IS NULL
+                        OR (
+                            typeof(dispatch_membership_sequence)
+                                = 'integer'
+                            AND dispatch_membership_sequence > 0
+                        )
+                    )
+                """,
+            )
+            for name, ddl in (
+                (
+                    "approval_checkpoint_id",
+                    "approval_checkpoint_id TEXT",
+                ),
+                ("intent_event_id", "intent_event_id TEXT"),
+                (
+                    "recovery_membership_sequence",
+                    """
+                    recovery_membership_sequence INTEGER
+                        CHECK (
+                            recovery_membership_sequence IS NULL
+                            OR (
+                                typeof(
+                                    recovery_membership_sequence
+                                ) = 'integer'
+                                AND recovery_membership_sequence > 0
+                            )
+                        )
+                    """,
+                ),
+            ):
+                add_column_if_missing(
+                    conn,
+                    "project_operations",
+                    name,
+                    ddl,
+                )
+            add_column_if_missing(
+                conn,
+                "project_operation_maintenance",
+                "task7_operation_migration_complete",
+                """
+                task7_operation_migration_complete
+                    INTEGER NOT NULL DEFAULT 0
+                    CHECK (
+                        typeof(task7_operation_migration_complete)
+                            = 'integer'
+                        AND task7_operation_migration_complete IN (0, 1)
+                    )
+                """,
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS
+                project_runtime_membership_counters (
+                    lane TEXT PRIMARY KEY
+                         CHECK (
+                             lane IN (
+                                 'dispatch',
+                                 'operation_recovery'
+                             )
+                         ),
+                    last_sequence INTEGER NOT NULL
+                         CHECK (
+                             typeof(last_sequence) = 'integer'
+                             AND last_sequence >= 0
+                             AND last_sequence <= 9223372036854775807
+                         )
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO
+                project_runtime_membership_counters(
+                    lane, last_sequence
+                ) VALUES (?, 0)
+                """,
+                (("dispatch",), ("operation_recovery",)),
+            )
+            counters = conn.execute(
+                """
+                SELECT lane, last_sequence
+                FROM project_runtime_membership_counters
+                ORDER BY lane
+                """
+            ).fetchall()
+            if not (
+                len(counters) == 2
+                and tuple(row["lane"] for row in counters)
+                == ("dispatch", "operation_recovery")
+                and all(
+                    _stored_int(row["last_sequence"])
+                    and row["last_sequence"] <= _SQLITE_INT_MAX
+                    for row in counters
+                )
+            ):
+                raise Task7MembershipMigrationError(
+                    "invalid Task-7 membership counters"
+                )
+            completion = conn.execute(
+                """
+                SELECT task7_operation_migration_complete
+                FROM project_operation_maintenance
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            if completion is None or (
+                type(completion[0]) is not int
+                or completion[0] not in {0, 1}
+            ):
+                raise Task7MembershipMigrationError(
+                    "invalid Task-7 migration marker"
+                )
+
+            if completion[0] == 0:
+                if any(row["last_sequence"] != 0 for row in counters):
+                    raise Task7MembershipMigrationError(
+                        "incomplete migration has advanced counters"
+                    )
+                runtime_rows = conn.execute(
+                    """
+                    SELECT project_id, dispatch_membership_sequence
+                    FROM project_runtime_state
+                    ORDER BY project_id
+                    """
+                ).fetchall()
+                if any(
+                    not _stored_text(row["project_id"])
+                    or row["dispatch_membership_sequence"] is not None
+                    for row in runtime_rows
+                ):
+                    raise Task7MembershipMigrationError(
+                        "invalid unmigrated runtime membership"
+                    )
+                for row in runtime_rows:
+                    sequence = _allocate_membership_sequence(
+                        conn,
+                        lane="dispatch",
+                    )
+                    if conn.execute(
+                        """
+                        UPDATE project_runtime_state
+                        SET dispatch_membership_sequence = ?
+                        WHERE project_id = ?
+                          AND dispatch_membership_sequence IS NULL
+                        """,
+                        (sequence, row["project_id"]),
+                    ).rowcount != 1:
+                        raise RuntimeError(
+                            "runtime membership changed during migration"
+                        )
+
+                operation_rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM project_operations
+                    WHERE guard_revision = 1
+                      AND guard_validated = 1
+                    ORDER BY project_id, operation_id, turn_id
+                    """
+                ).fetchall()
+                if any(
+                    row["recovery_membership_sequence"] is not None
+                    for row in operation_rows
+                ):
+                    raise Task7MembershipMigrationError(
+                        "invalid unmigrated operation membership"
+                    )
+                for row in operation_rows:
+                    _task7_decertify_migration_row(conn, row)
+                    sequence = _allocate_membership_sequence(
+                        conn,
+                        lane="operation_recovery",
+                    )
+                    if conn.execute(
+                        """
+                        UPDATE project_operations
+                        SET recovery_membership_sequence = ?
+                        WHERE project_id = ?
+                          AND operation_id = ?
+                          AND guard_revision = 1
+                          AND guard_validated = 0
+                          AND recovery_membership_sequence IS NULL
+                        """,
+                        (
+                            sequence,
+                            row["project_id"],
+                            row["operation_id"],
+                        ),
+                    ).rowcount != 1:
+                        raise RuntimeError(
+                            "operation membership changed during migration"
+                        )
+                    migrated = conn.execute(
+                        """
+                        SELECT *
+                        FROM project_operations
+                        WHERE project_id = ? AND operation_id = ?
+                          AND guard_revision = 1
+                          AND guard_validated = 0
+                        """,
+                        (
+                            row["project_id"],
+                            row["operation_id"],
+                        ),
+                    ).fetchone()
+                    if migrated is None:
+                        raise RuntimeError(
+                            "operation disappeared during migration"
+                        )
+                    _certify_project_operation_row(conn, migrated)
+                if conn.execute(
+                    """
+                    UPDATE project_operation_maintenance
+                    SET task7_operation_migration_complete = 1
+                    WHERE singleton = 1
+                      AND task7_operation_migration_complete = 0
+                    """
+                ).rowcount != 1:
+                    raise RuntimeError(
+                        "Task-7 migration marker changed"
+                    )
+
+            _ensure_task7_dispatcher_lease_index(conn)
+            _drop_stale_task7_membership_indexes(conn)
+            _drop_stale_task7_membership_triggers(conn)
+            execute_schema_statements(
+                conn,
+                TASK7_MEMBERSHIP_INDEX_SQL,
+            )
+            execute_schema_statements(
+                conn,
+                TASK7_MEMBERSHIP_TRIGGER_SQL,
+            )
+    except (
+        MembershipSequenceExhaustedError,
+        Task7MembershipMigrationError,
+    ):
+        raise
+    except (RuntimeError, sqlite3.Error) as exc:
+        raise Task7MembershipMigrationError(
+            "Task-7 membership migration failed"
         ) from exc
 
 
@@ -2229,6 +3639,21 @@ def _ensure_operation_columns(conn: sqlite3.Connection) -> None:
             (
                 "approval_fingerprint_json",
                 "approval_fingerprint_json TEXT",
+            ),
+            (
+                "operation_authority_json",
+                "operation_authority_json TEXT",
+            ),
+            (
+                "operation_authority_sha256",
+                "operation_authority_sha256 TEXT",
+            ),
+            ("effect_scope_json", "effect_scope_json TEXT"),
+            ("effect_scope_sha256", "effect_scope_sha256 TEXT"),
+            ("policy_authority_json", "policy_authority_json TEXT"),
+            (
+                "policy_authority_sha256",
+                "policy_authority_sha256 TEXT",
             ),
         ):
             add_column_if_missing(conn, "project_operations", name, ddl)
@@ -2862,6 +4287,45 @@ def _ensure_run_control_columns(conn: sqlite3.Connection) -> None:
         add_column_if_missing(conn, "project_run_controls", name, ddl)
 
 
+def _ensure_delivery_columns(conn: sqlite3.Connection) -> None:
+    """Separate legacy delivery leases from terminal sequence cursors."""
+    with write_transaction(conn):
+        for name, ddl in (
+            (
+                "lease_expires_at",
+                "lease_expires_at INTEGER",
+            ),
+            (
+                "remote_message_ids_json",
+                "remote_message_ids_json TEXT",
+            ),
+            (
+                "next_attempt_at",
+                "next_attempt_at INTEGER",
+            ),
+            (
+                "last_error_code",
+                "last_error_code TEXT",
+            ),
+        ):
+            add_column_if_missing(
+                conn,
+                "project_deliveries",
+                name,
+                ddl,
+            )
+        conn.execute(
+            """
+            UPDATE project_deliveries
+            SET lease_expires_at = cursor,
+                cursor = NULL
+            WHERE status = 'in_flight'
+              AND lease_expires_at IS NULL
+              AND typeof(cursor) = 'integer'
+            """
+        )
+
+
 def _ensure_turn_columns(conn: sqlite3.Connection) -> None:
     """Add Task-5 evidence and migrate its exact block projection."""
     with write_transaction(conn):
@@ -2978,6 +4442,9 @@ def write_transaction(
     conn: sqlite3.Connection,
 ) -> Iterator[sqlite3.Connection]:
     """Use IMMEDIATE ownership or a rollback-isolating nested savepoint."""
+    if conn.in_transaction and id(conn) in _TASK7_OUTER_TRANSACTIONS:
+        yield conn
+        return
     if conn.in_transaction:
         savepoint = "project_runtime_nested"
         conn.execute(f"SAVEPOINT {savepoint}")
@@ -2994,6 +4461,56 @@ def write_transaction(
         return
     with write_txn(conn):
         yield conn
+
+
+@contextlib.contextmanager
+def task7_outer_write_transaction(
+    conn: sqlite3.Connection,
+) -> Iterator[sqlite3.Connection]:
+    """One C6 prepare boundary: nested helpers share its rollback."""
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Task-7 outer transaction requires an idle connection"
+        )
+    with write_txn(conn):
+        _TASK7_OUTER_TRANSACTIONS.add(id(conn))
+        try:
+            yield conn
+        finally:
+            _TASK7_OUTER_TIMESTAMPS.pop(id(conn), None)
+            _TASK7_OUTER_TRANSACTIONS.discard(id(conn))
+
+
+def _bind_task7_outer_timestamp(
+    conn: sqlite3.Connection,
+    now: int,
+) -> None:
+    """Bind one clock sample to the active C6 prepare transaction."""
+    connection_id = id(conn)
+    if not (
+        connection_id in _TASK7_OUTER_TRANSACTIONS
+        and conn.in_transaction
+        and type(now) is int
+        and 0 <= now <= _SQLITE_INT_MAX
+    ):
+        raise RuntimeError("invalid Task-7 outer transaction timestamp")
+    existing = _TASK7_OUTER_TIMESTAMPS.get(connection_id)
+    if existing is not None and existing != now:
+        raise RuntimeError("Task-7 outer transaction timestamp changed")
+    _TASK7_OUTER_TIMESTAMPS[connection_id] = now
+
+
+def _task7_outer_timestamp(
+    conn: sqlite3.Connection,
+) -> int | None:
+    """Return the active C6 transaction clock sample, if one is bound."""
+    connection_id = id(conn)
+    if not (
+        connection_id in _TASK7_OUTER_TRANSACTIONS
+        and conn.in_transaction
+    ):
+        return None
+    return _TASK7_OUTER_TIMESTAMPS.get(connection_id)
 
 
 def _runtime_state_for_project(
@@ -3013,8 +4530,188 @@ def runtime_state_for_project(
     return _runtime_state_for_project(conn, project_id)
 
 
+def _runnable_membership_from_row(
+    row: sqlite3.Row,
+) -> RunnableMembershipRecord:
+    sequence = row["dispatch_membership_sequence"]
+    project_id = row["project_id"]
+    if not (
+        _stored_int(sequence, minimum=1)
+        and sequence <= _SQLITE_INT_MAX
+        and _stored_text(project_id)
+    ):
+        raise RuntimeError("malformed runnable membership")
+    return RunnableMembershipRecord(sequence, project_id)
+
+
+def _runnable_membership_upper(
+    conn: sqlite3.Connection,
+) -> RunnableMembershipRecord | None:
+    row = conn.execute(_RUNNABLE_MEMBERSHIP_UPPER_SQL).fetchone()
+    return (
+        _runnable_membership_from_row(row)
+        if row is not None
+        else None
+    )
+
+
+def _runnable_membership_page(
+    conn: sqlite3.Connection,
+    *,
+    after: tuple[int, str] | None,
+    through_membership_sequence: int,
+    limit: int,
+) -> tuple[RunnableMembershipRecord, ...]:
+    if after is None:
+        rows = conn.execute(
+            _RUNNABLE_MEMBERSHIP_PAGE_START_SQL,
+            (through_membership_sequence, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            _RUNNABLE_MEMBERSHIP_PAGE_AFTER_SQL,
+            (
+                after[0],
+                after[1],
+                through_membership_sequence,
+                limit,
+            ),
+        ).fetchall()
+    return tuple(_runnable_membership_from_row(row) for row in rows)
+
+
+def _runnable_membership_remaining(
+    conn: sqlite3.Connection,
+    *,
+    after: tuple[int, str],
+    through_membership_sequence: int,
+) -> bool:
+    return (
+        conn.execute(
+            _RUNNABLE_MEMBERSHIP_REMAINING_SQL,
+            (
+                after[0],
+                after[1],
+                through_membership_sequence,
+            ),
+        ).fetchone()
+        is not None
+    )
+
+
+def _runnable_project_head(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+) -> RuntimeTurnRecord | None:
+    row = conn.execute(
+        _RUNNABLE_PROJECT_HEAD_SQL,
+        (project_id,),
+    ).fetchone()
+    return runtime_turn_from_row(row) if row is not None else None
+
+
+def _operation_recovery_member_from_row(
+    row: sqlite3.Row,
+) -> OperationRecoveryMemberRecord:
+    sequence = row["recovery_membership_sequence"]
+    project_id = row["project_id"]
+    operation_id = row["operation_id"]
+    turn_id = row["turn_id"]
+    status = row["status"]
+    if not (
+        _stored_int(sequence, minimum=1)
+        and sequence <= _SQLITE_INT_MAX
+        and _stored_text(project_id)
+        and _stored_text(operation_id)
+        and _stored_text(turn_id)
+        and type(status) is str
+        and status
+        in {
+            "approved",
+            "effect_started",
+            "receipt_recorded",
+            "unknown",
+        }
+    ):
+        raise RuntimeError("malformed operation recovery membership")
+    return OperationRecoveryMemberRecord(
+        sequence,
+        project_id,
+        operation_id,
+        turn_id,
+        status,
+    )
+
+
+def _operation_recovery_membership_upper(
+    conn: sqlite3.Connection,
+) -> OperationRecoveryMemberRecord | None:
+    row = conn.execute(
+        _OPERATION_RECOVERY_MEMBERSHIP_UPPER_SQL
+    ).fetchone()
+    return (
+        _operation_recovery_member_from_row(row)
+        if row is not None
+        else None
+    )
+
+
+def _operation_recovery_membership_page(
+    conn: sqlite3.Connection,
+    *,
+    after: tuple[int, str, str, str] | None,
+    through_membership_sequence: int,
+    limit: int,
+) -> tuple[OperationRecoveryMemberRecord, ...]:
+    if after is None:
+        rows = conn.execute(
+            _OPERATION_RECOVERY_MEMBERSHIP_PAGE_START_SQL,
+            (through_membership_sequence, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            _OPERATION_RECOVERY_MEMBERSHIP_PAGE_AFTER_SQL,
+            (
+                after[0],
+                after[1],
+                after[2],
+                after[3],
+                through_membership_sequence,
+                limit,
+            ),
+        ).fetchall()
+    return tuple(
+        _operation_recovery_member_from_row(row) for row in rows
+    )
+
+
+def _operation_recovery_membership_remaining(
+    conn: sqlite3.Connection,
+    *,
+    after: tuple[int, str, str, str],
+    through_membership_sequence: int,
+) -> bool:
+    return (
+        conn.execute(
+            _OPERATION_RECOVERY_MEMBERSHIP_REMAINING_SQL,
+            (
+                after[0],
+                after[1],
+                after[2],
+                after[3],
+                through_membership_sequence,
+            ),
+        ).fetchone()
+        is not None
+    )
+
+
 def runtime_turn_from_row(row: sqlite3.Row) -> RuntimeTurnRecord:
     """Map a turn row without interpreting its caller payload."""
+    transcript_applied_batch_id = row[
+        "transcript_applied_batch_id"
+    ]
     if not (
         _stored_text(row["turn_id"])
         and _stored_text(row["project_id"])
@@ -3036,6 +4733,17 @@ def runtime_turn_from_row(row: sqlite3.Row) -> RuntimeTurnRecord:
         )
         and _stored_text(row["terminal_result_id"], optional=True)
         and _stored_text(row["recovery_block_key"], optional=True)
+        and (
+            transcript_applied_batch_id is None
+            or (
+                _task7_canonical_uuid4(
+                    transcript_applied_batch_id
+                )
+                and row["status"] in {"succeeded", "failed"}
+                and row["terminal_result_id"]
+                    == transcript_applied_batch_id
+            )
+        )
         and _stored_int(row["created_at"])
         and _stored_int(row["updated_at"])
         and _valid_task5_turn_metadata(
@@ -3084,6 +4792,9 @@ def runtime_turn_from_row(row: sqlite3.Row) -> RuntimeTurnRecord:
         recovery_block_key=row["recovery_block_key"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        transcript_applied_batch_id=(
+            transcript_applied_batch_id
+        ),
     )
 
 
@@ -3192,7 +4903,34 @@ _OPERATION_CERTIFICATION_COLUMNS = (
     "blocked_reason",
     "remote_idempotency_supported",
     "approval_fingerprint_json",
+    "operation_authority_json",
+    "operation_authority_sha256",
+    "effect_scope_json",
+    "effect_scope_sha256",
+    "policy_authority_json",
+    "policy_authority_sha256",
 )
+
+_TASK7_OPERATION_CERTIFICATION_COLUMNS = (
+    "approval_checkpoint_id",
+    "intent_event_id",
+    "recovery_membership_sequence",
+)
+
+
+def _operation_certification_columns(
+    row: sqlite3.Row,
+) -> tuple[str, ...]:
+    keys = set(row.keys())
+    task7 = set(_TASK7_OPERATION_CERTIFICATION_COLUMNS)
+    if keys.isdisjoint(task7):
+        return _OPERATION_CERTIFICATION_COLUMNS
+    if not task7 <= keys:
+        raise RuntimeError("partial Task-7 operation schema")
+    return (
+        _OPERATION_CERTIFICATION_COLUMNS
+        + _TASK7_OPERATION_CERTIFICATION_COLUMNS
+    )
 
 _APPROVAL_CERTIFICATION_COLUMNS = (
     "approval_id",
@@ -3458,17 +5196,439 @@ def _operation_approval_certification_row(
     return row
 
 
+def _task7_exact_int(
+    value: object,
+    *,
+    minimum: int,
+) -> bool:
+    return (
+        type(value) is int
+        and minimum <= value <= _SQLITE_INT_MAX
+    )
+
+
+def _task7_canonical_checkpoint_id(value: object) -> bool:
+    return _task7_canonical_uuid4(value)
+
+
+def _checkpoint_current_authority_relation(
+    *,
+    checkpoint_attempt_id: object,
+    checkpoint_worker_id: object,
+    checkpoint_canonical_session_id: object,
+    checkpoint_lease_generation: object,
+    checkpoint_fencing_token: object,
+    checkpoint_lease_expires_at: object,
+    current_attempt_id: object,
+    current_worker_id: object,
+    current_canonical_session_id: object,
+    current_lease_generation: object,
+    current_fencing_token: object,
+    current_lease_expires_at: object,
+) -> bool:
+    """Relate immutable checkpoint authority A to the current attempt."""
+    if not (
+        _stored_text(checkpoint_attempt_id)
+        and _stored_text(checkpoint_worker_id)
+        and _stored_text(checkpoint_canonical_session_id)
+        and _task7_exact_int(checkpoint_lease_generation, minimum=1)
+        and _task7_exact_int(checkpoint_fencing_token, minimum=1)
+        and _task7_exact_int(checkpoint_lease_expires_at, minimum=0)
+        and _stored_text(current_attempt_id)
+        and _stored_text(current_worker_id)
+        and _stored_text(current_canonical_session_id)
+        and _task7_exact_int(current_lease_generation, minimum=1)
+        and _task7_exact_int(current_fencing_token, minimum=1)
+        and _task7_exact_int(current_lease_expires_at, minimum=0)
+    ):
+        return False
+    same_epoch = (
+        checkpoint_lease_generation == current_lease_generation
+        and checkpoint_fencing_token == current_fencing_token
+    )
+    if same_epoch:
+        return (
+            checkpoint_attempt_id == current_attempt_id
+            and checkpoint_worker_id == current_worker_id
+            and checkpoint_canonical_session_id
+            == current_canonical_session_id
+            and checkpoint_lease_expires_at <= current_lease_expires_at
+        )
+    return (
+        checkpoint_attempt_id != current_attempt_id
+        and current_lease_generation > checkpoint_lease_generation
+        and current_fencing_token > checkpoint_fencing_token
+    )
+
+
+def _checkpoint_intent_authority(
+    conn: sqlite3.Connection,
+    operation: ProjectOperationRecord,
+    approval: sqlite3.Row | None,
+) -> CheckpointIntentAuthority | None:
+    """Certify and decode one exact immutable checkpoint intent event."""
+    checkpoint_id = operation.approval_checkpoint_id
+    intent_event_id = operation.intent_event_id
+    if checkpoint_id is None and intent_event_id is None:
+        return None
+    if not (
+        _task7_canonical_checkpoint_id(checkpoint_id)
+        and _stored_text(intent_event_id)
+        and _stored_text(operation.approval_id)
+        and approval is not None
+    ):
+        raise RuntimeError("malformed checkpoint intent authority")
+
+    event = conn.execute(
+        "SELECT * FROM project_events WHERE event_id = ?",
+        (intent_event_id,),
+    ).fetchone()
+    if event is None:
+        raise RuntimeError("checkpoint intent event is missing")
+    try:
+        payload = _decode_operation_json(
+            event["payload_json"],
+            require_object=True,
+        )
+        if type(payload) is not dict or set(payload) != {
+            "approval_checkpoint_id",
+            "approval_id",
+            "attempt",
+            "operation_id",
+            "status",
+            "turn_id",
+            "version",
+        }:
+            raise ValueError("invalid checkpoint intent payload")
+        attempt = payload["attempt"]
+        if type(attempt) is not dict or set(attempt) != {
+            "project_id",
+            "turn_id",
+            "sequence",
+            "worker_id",
+            "attempt_id",
+            "lease_generation",
+            "fencing_token",
+            "canonical_session_id",
+            "lease_expires_at",
+        }:
+            raise ValueError("invalid checkpoint intent attempt")
+
+        turn = _runtime_turn_for_project(
+            conn,
+            project_id=operation.project_id,
+            turn_id=operation.turn_id,
+        )
+        if turn is None:
+            raise ValueError("checkpoint turn is missing")
+        expected_version = approval["expected_runtime_version"]
+        effective_version = approval["effective_runtime_version"]
+        valid = (
+            _stored_text(event["event_id"])
+            and event["event_id"] == intent_event_id
+            and event["project_id"] == operation.project_id
+            and event["turn_id"] == operation.turn_id
+            and event["kind"] == "operation.intent_recorded"
+            and _task7_exact_int(event["sequence"], minimum=1)
+            and _task7_exact_int(event["created_at"], minimum=0)
+            and event["created_at"] == operation.created_at
+            and event["created_at"] == approval["created_at"]
+            and payload["approval_checkpoint_id"] == checkpoint_id
+            and _task7_canonical_checkpoint_id(
+                payload["approval_checkpoint_id"]
+            )
+            and payload["approval_id"] == operation.approval_id
+            and _stored_text(payload["approval_id"])
+            and payload["operation_id"] == operation.operation_id
+            and _stored_text(payload["operation_id"])
+            and payload["status"] == "awaiting_approval"
+            and payload["turn_id"] == operation.turn_id
+            and _stored_text(payload["turn_id"])
+            and attempt["project_id"] == operation.project_id
+            and _stored_text(attempt["project_id"])
+            and attempt["turn_id"] == operation.turn_id
+            and _stored_text(attempt["turn_id"])
+            and attempt["sequence"] == turn.sequence
+            and _task7_exact_int(
+                attempt["sequence"],
+                minimum=1,
+            )
+            and _stored_text(attempt["worker_id"])
+            and _stored_text(attempt["attempt_id"])
+            and _task7_exact_int(
+                attempt["lease_generation"],
+                minimum=1,
+            )
+            and _task7_exact_int(
+                attempt["fencing_token"],
+                minimum=1,
+            )
+            and _stored_text(attempt["canonical_session_id"])
+            and _task7_exact_int(
+                attempt["lease_expires_at"],
+                minimum=0,
+            )
+            and _task7_exact_int(expected_version, minimum=0)
+            and expected_version < _SQLITE_INT_MAX
+            and _task7_exact_int(effective_version, minimum=1)
+            and effective_version == expected_version + 1
+            and payload["version"] == effective_version
+            and _task7_exact_int(payload["version"], minimum=1)
+        )
+    except (
+        IndexError,
+        KeyError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise RuntimeError(
+            "malformed checkpoint intent authority"
+        ) from exc
+    if not valid:
+        raise RuntimeError("checkpoint intent authority mismatch")
+    return CheckpointIntentAuthority(
+        checkpoint_id=checkpoint_id,
+        operation_id=operation.operation_id,
+        approval_id=operation.approval_id,
+        project_id=operation.project_id,
+        turn_id=operation.turn_id,
+        sequence=attempt["sequence"],
+        worker_id=attempt["worker_id"],
+        attempt_id=attempt["attempt_id"],
+        lease_generation=attempt["lease_generation"],
+        fencing_token=attempt["fencing_token"],
+        canonical_session_id=attempt["canonical_session_id"],
+        lease_expires_at=attempt["lease_expires_at"],
+        version=payload["version"],
+    )
+
+
+def _certify_checkpoint_current_authority(
+    conn: sqlite3.Connection,
+    operation: ProjectOperationRecord,
+    checkpoint: CheckpointIntentAuthority | None,
+) -> None:
+    """Prove current operation authority independently from immutable A."""
+    if checkpoint is None:
+        return
+    state = _runtime_state_for_project(conn, operation.project_id)
+    turn = _runtime_turn_for_project(
+        conn,
+        project_id=operation.project_id,
+        turn_id=operation.turn_id,
+    )
+    control = _runtime_control_for_turn(
+        conn,
+        project_id=operation.project_id,
+        turn_id=operation.turn_id,
+    )
+    lease = _current_worker_lease_for_turn(
+        conn,
+        project_id=operation.project_id,
+        turn_id=operation.turn_id,
+    )
+    checkpoint_relation_valid = (
+        turn is not None
+        and control is not None
+        and _checkpoint_current_authority_relation(
+            checkpoint_attempt_id=checkpoint.attempt_id,
+            checkpoint_worker_id=checkpoint.worker_id,
+            checkpoint_canonical_session_id=(
+                checkpoint.canonical_session_id
+            ),
+            checkpoint_lease_generation=checkpoint.lease_generation,
+            checkpoint_fencing_token=checkpoint.fencing_token,
+            checkpoint_lease_expires_at=checkpoint.lease_expires_at,
+            current_attempt_id=turn.attempt_id,
+            current_worker_id=control.claim_worker_id,
+            current_canonical_session_id=(
+                control.claim_canonical_session_id
+            ),
+            current_lease_generation=turn.lease_generation,
+            current_fencing_token=turn.fencing_token,
+            current_lease_expires_at=control.claim_lease_expires_at,
+        )
+    )
+    common_authority_valid = (
+        state is not None
+        and _stored_text(state.conversation_tip_id)
+        and turn is not None
+        and control is not None
+        and checkpoint.project_id == operation.project_id
+        and checkpoint.turn_id == operation.turn_id
+        and checkpoint.sequence == turn.sequence
+        and operation.attempt_id == turn.attempt_id
+        and operation.lease_generation == turn.lease_generation
+        and operation.fencing_token == turn.fencing_token
+        and control.attempt_id == turn.attempt_id
+        and _stored_text(control.claim_worker_id)
+        and _task7_exact_int(
+            control.claim_lease_expires_at,
+            minimum=0,
+        )
+        and control.claim_canonical_session_id
+        == state.conversation_tip_id
+        and checkpoint_relation_valid
+    )
+    live_authority_valid = (
+        turn is not None
+        and control is not None
+        and lease is not None
+        and turn.status in {"awaiting_approval", "claimed"}
+        and control.control_state == "running"
+        and lease.lease_id == turn.attempt_id
+        and lease.worker_id == control.claim_worker_id
+        and lease.lease_generation == turn.lease_generation
+        and lease.fencing_token == turn.fencing_token
+        and lease.expires_at == control.claim_lease_expires_at
+    )
+    reconciling_authority_valid = (
+        turn is not None
+        and control is not None
+        and turn.status == "reconciling"
+        and control.control_state == "running"
+        and lease is None
+    )
+    failed_approval_authority_valid = (
+        turn is not None
+        and control is not None
+        and turn.status == "failed"
+        and operation.status == "blocked"
+        and operation.blocked_reason
+        in {
+            "approval_denied",
+            "approval_time_expired",
+            "approval_stale_boundary",
+        }
+        and control.control_state == "terminal"
+        and lease is None
+    )
+    valid = common_authority_valid and (
+        live_authority_valid
+        or reconciling_authority_valid
+        or failed_approval_authority_valid
+    )
+    if not valid:
+        raise RuntimeError("current checkpoint authority mismatch")
+
+
 def _certify_project_operation_row(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
+    *,
+    require_task7_membership: bool | None = None,
 ) -> ProjectOperationRecord:
     """Certify one marker-zero snapshot with one marker-only tuple CAS."""
+    if (
+        require_task7_membership is None
+        and set(_TASK7_OPERATION_CERTIFICATION_COLUMNS) <= set(row.keys())
+    ):
+        task7_migration = conn.execute(
+            """
+            SELECT task7_operation_migration_complete
+            FROM project_operation_maintenance
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        require_task7_membership = bool(
+            task7_migration is not None
+            and task7_migration["task7_operation_migration_complete"]
+            == 1
+        )
+    if (
+        require_task7_membership
+        and row["recovery_membership_sequence"] is None
+    ):
+        try:
+            provisional = _project_operation_from_row(
+                row,
+                expected_guard_validated=0,
+                require_task7_membership=False,
+            )
+            provisional_approval = (
+                _operation_approval_certification_row(
+                    conn, provisional
+                )
+            )
+            provisional_checkpoint = _checkpoint_intent_authority(
+                conn,
+                provisional,
+                provisional_approval,
+            )
+            _certify_checkpoint_current_authority(
+                conn,
+                provisional,
+                provisional_checkpoint,
+            )
+        except (
+            LegacyOperationUnmanagedError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise _InvalidOperationCertification(
+                "operation is not canonically certifiable"
+            ) from exc
+        certification_columns = _operation_certification_columns(row)
+        operation_predicate = " AND ".join(
+            f"{column} IS ?" for column in certification_columns
+        )
+        recovery_membership_sequence = _allocate_membership_sequence(
+            conn,
+            lane="operation_recovery",
+        )
+        if conn.execute(
+            f"""
+            UPDATE project_operations
+            SET recovery_membership_sequence = ?
+            WHERE project_id = ? AND operation_id = ?
+              AND guard_validated = 0
+              AND {operation_predicate}
+            """,
+            (
+                recovery_membership_sequence,
+                provisional.project_id,
+                provisional.operation_id,
+                *(row[column] for column in certification_columns),
+            ),
+        ).rowcount != 1:
+            raise RuntimeError(
+                "project operation changed during membership assignment"
+            )
+        refreshed = conn.execute(
+            """
+            SELECT *
+            FROM project_operations
+            WHERE project_id = ? AND operation_id = ?
+              AND guard_validated = 0
+            """,
+            (provisional.project_id, provisional.operation_id),
+        ).fetchone()
+        if refreshed is None:
+            raise RuntimeError(
+                "project operation disappeared during membership assignment"
+            )
+        row = refreshed
     try:
         operation = _project_operation_from_row(
-            row, expected_guard_validated=0
+            row,
+            expected_guard_validated=0,
+            require_task7_membership=require_task7_membership,
         )
         approval = _operation_approval_certification_row(
             conn, operation
+        )
+        checkpoint = _checkpoint_intent_authority(
+            conn,
+            operation,
+            approval,
+        )
+        _certify_checkpoint_current_authority(
+            conn,
+            operation,
+            checkpoint,
         )
     except (
         LegacyOperationUnmanagedError,
@@ -3479,13 +5639,14 @@ def _certify_project_operation_row(
         raise _InvalidOperationCertification(
             "operation is not canonically certifiable"
         ) from exc
+    certification_columns = _operation_certification_columns(row)
     operation_predicate = " AND ".join(
-        f"{column} IS ?" for column in _OPERATION_CERTIFICATION_COLUMNS
+        f"{column} IS ?" for column in certification_columns
     )
     parameters: list[object] = [
         operation.project_id,
         operation.operation_id,
-        *(row[column] for column in _OPERATION_CERTIFICATION_COLUMNS),
+        *(row[column] for column in certification_columns),
     ]
     if approval is None:
         approval_predicate = """
@@ -3542,7 +5703,11 @@ def _certify_project_operation_row(
         raise RuntimeError(
             "project operation disappeared during certification"
         )
-    result = project_operation_from_row(certified)
+    result = _project_operation_from_row(
+        certified,
+        expected_guard_validated=1,
+        require_task7_membership=require_task7_membership,
+    )
     _operation_approval_certification_row(conn, result)
     return result
 
@@ -3589,8 +5754,9 @@ def _decertify_project_operation(
         raise RuntimeError(
             "project operation changed before decertification"
         )
+    certification_columns = _operation_certification_columns(row)
     operation_predicate = " AND ".join(
-        f"{column} IS ?" for column in _OPERATION_CERTIFICATION_COLUMNS
+        f"{column} IS ?" for column in certification_columns
     )
     cursor = conn.execute(
         f"""
@@ -3605,7 +5771,7 @@ def _decertify_project_operation(
             operation.operation_id,
             *(
                 row[column]
-                for column in _OPERATION_CERTIFICATION_COLUMNS
+                for column in certification_columns
             ),
         ),
     )
@@ -4009,7 +6175,31 @@ def _insert_project_operation(
     remote_idempotency_supported: bool,
     approval_fingerprint_json: str | None,
     now: int,
+    operation_authority_json: str | None = None,
+    operation_authority_sha256: str | None = None,
+    effect_scope_json: str | None = None,
+    effect_scope_sha256: str | None = None,
+    policy_authority_json: str | None = None,
+    policy_authority_sha256: str | None = None,
+    approval_checkpoint_id: str | None = None,
+    intent_event_id: str | None = None,
 ) -> bool:
+    collision = conn.execute(
+        """
+        SELECT 1
+        FROM project_operations
+        WHERE operation_id = ?
+           OR (project_id = ? AND idempotency_key = ?)
+        LIMIT 1
+        """,
+        (operation_id, project_id, idempotency_key),
+    ).fetchone()
+    if collision is not None:
+        return False
+    recovery_membership_sequence = _allocate_membership_sequence(
+        conn,
+        lane="operation_recovery",
+    )
     cursor = conn.execute(
         """
         INSERT INTO project_operations (
@@ -4019,10 +6209,14 @@ def _insert_project_operation(
             batch_items_json, readback_kind, attempt_id, lease_generation,
             fencing_token, receipt_id, readback_json, blocked_reason,
             remote_idempotency_supported, approval_fingerprint_json,
-            guard_validated
+            operation_authority_json, operation_authority_sha256,
+            effect_scope_json, effect_scope_sha256,
+            policy_authority_json, policy_authority_sha256,
+            guard_validated, approval_checkpoint_id, intent_event_id,
+            recovery_membership_sequence
         ) VALUES (
             ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?,
-            NULL, NULL, ?, ?, ?, 0
+            NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?
         )
         ON CONFLICT DO NOTHING
         """,
@@ -4046,6 +6240,15 @@ def _insert_project_operation(
             blocked_reason,
             int(remote_idempotency_supported),
             approval_fingerprint_json,
+            operation_authority_json,
+            operation_authority_sha256,
+            effect_scope_json,
+            effect_scope_sha256,
+            policy_authority_json,
+            policy_authority_sha256,
+            approval_checkpoint_id,
+            intent_event_id,
+            recovery_membership_sequence,
         ),
     )
     return cursor.rowcount == 1
@@ -4409,7 +6612,9 @@ def _rehydrate_project_operation_claim(
     project_id: str,
     operation_id: str,
     turn_id: str,
-    source_turn_status: Literal["awaiting_approval", "reconciling"],
+    source_turn_status: Literal[
+        "awaiting_approval", "claimed", "reconciling"
+    ],
     old_attempt_id: str,
     old_lease_generation: int,
     old_fencing_token: int,
@@ -4425,6 +6630,7 @@ def _rehydrate_project_operation_claim(
     new_lease_expires_at: int,
     canonical_session_id: str,
     now: int,
+    require_task7_terminal_gate_clear: bool = False,
 ) -> tuple[RuntimeTurnRecord, WorkerLeaseRecord]:
     """Rotate one safe approved operation onto a fresh Task-5 fence."""
     if old_lease_present:
@@ -4441,8 +6647,21 @@ def _rehydrate_project_operation_claim(
             raise RuntimeError(
                 "operation rehydration lost its old lease"
             )
-    turn = conn.execute(
+    task7_gate_predicate = (
         """
+          AND EXISTS (
+              SELECT 1
+              FROM project_runtime_state AS state
+              WHERE state.project_id = project_turns.project_id
+                AND state.transcript_pending_batch_id IS NULL
+                AND state.transcript_dispatch_block_key IS NULL
+          )
+        """
+        if require_task7_terminal_gate_clear
+        else ""
+    )
+    turn = conn.execute(
+        f"""
         UPDATE project_turns
         SET status = 'claimed', attempt_id = ?, lease_generation = ?,
             fencing_token = ?, execution_state = 'not_started',
@@ -4455,6 +6674,7 @@ def _rehydrate_project_operation_claim(
                 status != 'reconciling'
                 OR recovery_block_key IS NULL
           )
+          {task7_gate_predicate}
         """,
         (
             new_attempt_id,
@@ -4795,8 +7015,13 @@ def _append_runtime_event(
     turn_id: str | None,
     payload_json: str,
     created_at: int,
+    deliveries: bool = True,
 ) -> int:
-    """Append one canonical event under the caller's existing write boundary."""
+    """Append one canonical event under the caller's existing write boundary.
+
+    Internal authority events (e.g. turn.transcript_conflicted) can opt out of
+    surface delivery obligations with deliveries=False.
+    """
     sequence = _allocate_project_sequence(conn, table="events", project_id=project_id)
     conn.execute(
         """
@@ -4807,6 +7032,39 @@ def _append_runtime_event(
         """,
         (event_id, project_id, sequence, kind, turn_id, payload_json, created_at),
     )
+    if deliveries:
+        bindings = conn.execute(
+            """
+            SELECT binding_id
+            FROM project_surface_bindings
+            WHERE project_id = ?
+            ORDER BY created_at, binding_id
+            """,
+            (project_id,),
+        ).fetchall()
+        for binding in bindings:
+            binding_id = binding["binding_id"]
+            delivery_id = (
+                "delivery-"
+                + hashlib.sha256(
+                    f"{project_id}\0{binding_id}\0{event_id}".encode("utf-8")
+                ).hexdigest()
+            )
+            conn.execute(
+                """
+                INSERT INTO project_deliveries (
+                    delivery_id, project_id, binding_id, event_id,
+                    status, cursor, attempt_count, updated_at
+                ) VALUES (?, ?, ?, ?, 'pending', NULL, 0, ?)
+                """,
+                (
+                    delivery_id,
+                    project_id,
+                    binding_id,
+                    event_id,
+                    created_at,
+                ),
+            )
     return sequence
 
 
@@ -4825,6 +7083,36 @@ def _advance_runtime_version(
         WHERE project_id = ? AND version = ?
         """,
         (updated_at, project_id, expected_version),
+    )
+    if cursor.rowcount != 1:
+        return None
+    return _runtime_state_for_project(conn, project_id)
+
+
+def _advance_runtime_version_with_task7_pending_batch(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    expected_version: int,
+    transcript_batch_id: str,
+    updated_at: int,
+) -> RuntimeState | None:
+    """Advance one project and install its C7 pending gate atomically."""
+    cursor = conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET version = version + 1, updated_at = ?,
+            transcript_pending_batch_id = ?
+        WHERE project_id = ? AND version = ?
+          AND transcript_pending_batch_id IS NULL
+          AND transcript_dispatch_block_key IS NULL
+        """,
+        (
+            updated_at,
+            transcript_batch_id,
+            project_id,
+            expected_version,
+        ),
     )
     if cursor.rowcount != 1:
         return None
@@ -4990,6 +7278,7 @@ def _claim_oldest_queued_runtime_turn(
     canonical_session_id: str,
     now: int,
     lease_seconds: int,
+    require_task7_terminal_gate_clear: bool = False,
 ) -> RuntimeTurnRecord | None:
     """Validate history set-wise, then claim the exact nonterminal FIFO head."""
     row = conn.execute(
@@ -5041,8 +7330,17 @@ def _claim_oldest_queued_runtime_turn(
                 AND (
                     (
                         turn.attempt_id IS NULL
-                        AND turn.lease_generation = 0
-                        AND turn.fencing_token = 0
+                        AND (
+                            (
+                                turn.lease_generation = 0
+                                AND turn.fencing_token = 0
+                            )
+                            OR (
+                                turn.status = 'cancelled'
+                                AND turn.lease_generation > 0
+                                AND turn.fencing_token > 0
+                            )
+                        )
                     )
                     OR (
                         turn.attempt_id IS NOT NULL
@@ -5172,8 +7470,21 @@ def _claim_oldest_queued_runtime_turn(
     generation = turn.lease_generation + 1
     fence = turn.fencing_token + 1
     lease_expires_at = now + lease_seconds
-    if conn.execute(
+    task7_gate_predicate = (
         """
+          AND EXISTS (
+              SELECT 1
+              FROM project_runtime_state AS state
+              WHERE state.project_id = project_turns.project_id
+                AND state.transcript_pending_batch_id IS NULL
+                AND state.transcript_dispatch_block_key IS NULL
+          )
+        """
+        if require_task7_terminal_gate_clear
+        else ""
+    )
+    if conn.execute(
+        f"""
         UPDATE project_turns
         SET status = 'claimed', attempt_id = ?, lease_generation = ?,
             fencing_token = ?, execution_state = 'not_started',
@@ -5185,6 +7496,7 @@ def _claim_oldest_queued_runtime_turn(
                 (attempt_id IS NULL AND ? IS NULL)
                 OR attempt_id = ?
           )
+          {task7_gate_predicate}
         """,
         (
             attempt_id,
@@ -5616,6 +7928,107 @@ def _commit_runtime_turn(
     return result
 
 
+def _commit_runtime_turn_with_task7_batch(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    turn_id: str,
+    sequence: int,
+    terminal_status: str,
+    terminal_result_id: str,
+    attempt_id: str,
+    worker_id: str,
+    lease_generation: int,
+    fencing_token: int,
+    canonical_session_id: str,
+    expires_at: int,
+    expected_control_version: int,
+    now: int,
+) -> RuntimeTurnRecord | None:
+    """Terminalize one live attempt while rechecking every C7 gate."""
+    turn_cursor = conn.execute(
+        """
+        UPDATE project_turns
+        SET status = ?, terminal_result_id = ?,
+            updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
+        WHERE project_id = ? AND turn_id = ? AND sequence = ?
+          AND status = 'claimed' AND attempt_id = ?
+          AND lease_generation = ? AND fencing_token = ?
+          AND execution_state = 'started' AND terminal_result_id IS NULL
+          AND transcript_applied_batch_id IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM project_runtime_state AS state
+              WHERE state.project_id = project_turns.project_id
+                AND state.transcript_pending_batch_id IS NULL
+                AND state.transcript_dispatch_block_key IS NULL
+          )
+        """,
+        (
+            terminal_status,
+            terminal_result_id,
+            now,
+            now,
+            project_id,
+            turn_id,
+            sequence,
+            attempt_id,
+            lease_generation,
+            fencing_token,
+        ),
+    )
+    if turn_cursor.rowcount != 1:
+        return None
+    control_cursor = conn.execute(
+        """
+        UPDATE project_run_controls
+        SET control_state = 'terminal',
+            control_version = control_version + 1,
+            updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
+        WHERE project_id = ? AND turn_id = ?
+          AND control_state = 'running'
+          AND control_version = ? AND attempt_id = ?
+          AND claim_worker_id = ? AND claim_lease_expires_at = ?
+          AND claim_canonical_session_id = ?
+        """,
+        (
+            now,
+            now,
+            project_id,
+            turn_id,
+            expected_control_version,
+            attempt_id,
+            worker_id,
+            expires_at,
+            canonical_session_id,
+        ),
+    )
+    if control_cursor.rowcount != 1:
+        raise RuntimeError(
+            "runtime control changed during Task-7 terminal commit"
+        )
+    if not _delete_current_worker_lease(
+        conn,
+        project_id=project_id,
+        turn_id=turn_id,
+        attempt_id=attempt_id,
+        worker_id=worker_id,
+        lease_generation=lease_generation,
+        fencing_token=fencing_token,
+        lease_expires_at=expires_at,
+    ):
+        raise RuntimeError(
+            "runtime lease changed during Task-7 terminal commit"
+        )
+    result = _runtime_turn_for_project(
+        conn,
+        project_id=project_id,
+        turn_id=turn_id,
+    )
+    assert result is not None
+    return result
+
+
 def _recovery_block_event_key(
     conn: sqlite3.Connection,
     *,
@@ -5792,14 +8205,33 @@ def _recovery_candidates(
     *,
     now: int,
     limit: int,
+    stop_first: bool = False,
 ) -> tuple[RecoveryCandidateRecord, ...]:
     """Select a bounded deterministic batch of expired or parked attempts."""
-    branch_rows = (
-        conn.execute(
-            _RECOVERY_EXPIRED_LEASES_SQL, (now, limit)
-        ).fetchall(),
-        conn.execute(_RECOVERY_RECONCILING_SQL, (limit,)).fetchall(),
-    )
+    if stop_first:
+        branch_rows = (
+            conn.execute(
+                _RECOVERY_EXPIRED_STOP_LEASES_SQL,
+                (now, limit),
+            ).fetchall(),
+            conn.execute(
+                _RECOVERY_RECONCILING_STOP_SQL,
+                (limit,),
+            ).fetchall(),
+        )
+    else:
+        branch_rows = ((), ())
+    if not any(branch_rows):
+        branch_rows = (
+            conn.execute(
+                _RECOVERY_EXPIRED_LEASES_SQL,
+                (now, limit),
+            ).fetchall(),
+            conn.execute(
+                _RECOVERY_RECONCILING_SQL,
+                (limit,),
+            ).fetchall(),
+        )
     unique_rows: dict[tuple[str, str], sqlite3.Row] = {}
     for rows in branch_rows:
         for row in rows:
@@ -6237,6 +8669,102 @@ def _apply_recovery_outcome(
     )
 
 
+def _apply_task7_terminal_recovery(
+    conn: sqlite3.Connection,
+    *,
+    candidate: RecoveryCandidateRecord,
+    terminal_status: Literal["succeeded", "failed"],
+    terminal_result_id: str,
+    now: int,
+) -> RuntimeTurnRecord | None:
+    """Finalize one parked attempt while rechecking all C7 authority."""
+    expected_control_state = {
+        "claimed": "running",
+        "stop_requested": "stop_requested",
+    }.get(candidate.source_status)
+    if expected_control_state is None or terminal_status not in {
+        "succeeded",
+        "failed",
+    }:
+        raise ValueError("unsupported Task-7 recovery transition")
+    turn_cursor = conn.execute(
+        """
+        UPDATE project_turns
+        SET status = ?, terminal_result_id = ?,
+            updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
+        WHERE project_id = ? AND turn_id = ? AND sequence = ?
+          AND status = 'reconciling' AND attempt_id = ?
+          AND lease_generation = ? AND fencing_token = ?
+          AND terminal_result_id IS NULL
+          AND recovery_block_key IS NULL
+          AND transcript_applied_batch_id IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM project_runtime_state AS state
+              WHERE state.project_id = project_turns.project_id
+                AND state.transcript_pending_batch_id IS NULL
+                AND state.transcript_dispatch_block_key IS NULL
+          )
+        """,
+        (
+            terminal_status,
+            terminal_result_id,
+            now,
+            now,
+            candidate.project_id,
+            candidate.turn_id,
+            candidate.sequence,
+            candidate.attempt_id,
+            candidate.lease_generation,
+            candidate.fencing_token,
+        ),
+    )
+    if turn_cursor.rowcount != 1:
+        return None
+    control_cursor = conn.execute(
+        """
+        UPDATE project_run_controls
+        SET control_state = 'terminal',
+            control_version = control_version + 1,
+            updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END
+        WHERE project_id = ? AND turn_id = ?
+          AND control_state = ? AND control_version = ?
+          AND attempt_id = ? AND claim_worker_id = ?
+          AND claim_lease_expires_at = ?
+          AND claim_canonical_session_id = ?
+        """,
+        (
+            now,
+            now,
+            candidate.project_id,
+            candidate.turn_id,
+            expected_control_state,
+            candidate.control_version,
+            candidate.attempt_id,
+            candidate.worker_id,
+            candidate.lease_expires_at,
+            candidate.canonical_session_id,
+        ),
+    )
+    if control_cursor.rowcount != 1:
+        raise RuntimeError(
+            "runtime control changed during Task-7 recovery"
+        )
+    if _current_worker_lease_for_turn(
+        conn,
+        project_id=candidate.project_id,
+        turn_id=candidate.turn_id,
+    ) is not None:
+        raise RuntimeError(
+            "runtime lease reappeared during Task-7 recovery"
+        )
+    return _runtime_turn_for_project(
+        conn,
+        project_id=candidate.project_id,
+        turn_id=candidate.turn_id,
+    )
+
+
 def _link_approval_to_claimed_turn(
     conn: sqlite3.Connection,
     *,
@@ -6344,6 +8872,12 @@ def create_project_conversation(
             (project_id,),
         ).fetchone() is not None:
             raise LineageConflictError("project conversation lineage already exists")
+        dispatch_membership_sequence = (
+            _allocate_membership_sequence(
+                conn,
+                lane="dispatch",
+            )
+        )
         conn.execute(
             """
             INSERT INTO project_conversations (
@@ -6362,8 +8896,9 @@ def create_project_conversation(
             """
             INSERT INTO project_runtime_state (
                 project_id, lifecycle, current_phase, version,
-                conversation_root_id, conversation_tip_id, updated_at
-            ) VALUES (?, 'active', ?, 0, ?, ?, ?)
+                conversation_root_id, conversation_tip_id, updated_at,
+                dispatch_membership_sequence
+            ) VALUES (?, 'active', ?, 0, ?, ?, ?, ?)
             """,
             (
                 root.project_id,
@@ -6371,6 +8906,7 @@ def create_project_conversation(
                 root.conversation_id,
                 root.conversation_id,
                 now,
+                dispatch_membership_sequence,
             ),
         )
     return root
@@ -6575,6 +9111,55 @@ def binding_for_external_identity(
     return _binding_from_row(row) if row is not None else None
 
 
+def binding_for_surface_identity(
+    conn: sqlite3.Connection,
+    *,
+    surface: str,
+    external_binding_id: str,
+) -> SurfaceBinding | None:
+    """Resolve one globally unique transport identity at trusted ingress."""
+    if (
+        type(surface) is not str
+        or surface not in {"desktop", "discord"}
+        or type(external_binding_id) is not str
+        or not external_binding_id
+    ):
+        raise ValueError("invalid surface identity")
+    row = conn.execute(
+        """
+        SELECT * FROM project_surface_bindings
+        WHERE surface = ? AND external_binding_id = ?
+        """,
+        (surface, external_binding_id),
+    ).fetchone()
+    return _binding_from_row(row) if row is not None else None
+
+
+def principal_for_surface_binding(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    binding_id: str,
+) -> str | None:
+    """Read the immutable authenticated transport principal for a binding."""
+    if (
+        type(project_id) is not str
+        or not project_id
+        or type(binding_id) is not str
+        or not binding_id
+    ):
+        raise ValueError("invalid surface binding identity")
+    row = conn.execute(
+        """
+        SELECT principal_id
+        FROM project_surface_principals
+        WHERE project_id = ? AND binding_id = ?
+        """,
+        (project_id, binding_id),
+    ).fetchone()
+    return row["principal_id"] if row is not None else None
+
+
 def bindings_for_project(
     conn: sqlite3.Connection, *, project_id: str
 ) -> tuple[SurfaceBinding, ...]:
@@ -6592,6 +9177,142 @@ def bindings_for_project(
     return tuple(_binding_from_row(row) for row in rows)
 
 
+def desktop_read_cursor(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    binding_id: str,
+) -> int:
+    """Read the additive Desktop UI cursor without touching deliveries."""
+    if not all(
+        type(value) is str and value
+        for value in (project_id, binding_id)
+    ):
+        raise ValueError(
+            "project_id and binding_id must be non-empty strings"
+        )
+    row = conn.execute(
+        """
+        SELECT cursor
+        FROM project_desktop_read_cursors
+        WHERE project_id = ? AND binding_id = ?
+        """,
+        (project_id, binding_id),
+    ).fetchone()
+    if row is None:
+        return 0
+    cursor = row["cursor"]
+    if not (
+        type(cursor) is int
+        and 0 <= cursor <= _SQLITE_INT_MAX
+    ):
+        raise RuntimeError("malformed desktop read cursor")
+    return cursor
+
+
+def acknowledge_desktop_read_cursor(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    binding_id: str,
+    cursor: int,
+    actor: ActorContext,
+    now: int,
+) -> int:
+    """Advance one exact Desktop owner's local read cursor monotonically."""
+    if not all(
+        type(value) is str and value
+        for value in (project_id, binding_id)
+    ):
+        raise ValueError(
+            "project_id and binding_id must be non-empty strings"
+        )
+    if (
+        type(cursor) is not int
+        or not 0 <= cursor <= _SQLITE_INT_MAX
+        or type(now) is not int
+        or not 0 <= now <= _SQLITE_INT_MAX
+    ):
+        raise ValueError("cursor and now must be non-negative integers")
+    with write_transaction(conn):
+        binding = binding_for_id(
+            conn,
+            project_id=project_id,
+            binding_id=binding_id,
+        )
+        if not (
+            isinstance(actor, ActorContext)
+            and actor.is_owner is True
+            and actor.surface == "desktop"
+            and actor.binding_id == binding_id
+            and binding is not None
+            and binding.surface == "desktop"
+            and binding.actor_id == actor.actor_id
+        ):
+            raise PermissionError(
+                "desktop read cursor requires the exact owner binding"
+            )
+        matching_owner_bindings = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM project_surface_bindings
+            WHERE project_id = ?
+              AND surface = 'desktop'
+              AND actor_id = ?
+            """,
+            (project_id, actor.actor_id),
+        ).fetchone()[0]
+        if matching_owner_bindings != 1:
+            raise PermissionError(
+                "desktop read cursor owner binding is ambiguous"
+            )
+        state = runtime_state_for_project(conn, project_id)
+        if state is None:
+            raise PermissionError(
+                "desktop read cursor requires a managed project"
+            )
+        if (
+            state.transcript_pending_batch_id is not None
+            or state.transcript_dispatch_block_key is not None
+        ):
+            raise DesktopReadCursorUnavailableError(
+                "canonical transcript is not ready"
+            )
+        last_sequence = conn.execute(
+            """
+            SELECT COALESCE(MAX(sequence), 0)
+            FROM project_events
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()[0]
+        if not (
+            type(last_sequence) is int
+            and 0 <= last_sequence <= _SQLITE_INT_MAX
+        ):
+            raise RuntimeError("malformed project event sequence")
+        if cursor > last_sequence:
+            raise ValueError("cursor cannot exceed the latest event")
+        conn.execute(
+            """
+            INSERT INTO project_desktop_read_cursors (
+                project_id, binding_id, cursor, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT (project_id, binding_id) DO UPDATE SET
+                cursor = excluded.cursor,
+                updated_at = excluded.updated_at
+            WHERE excluded.cursor
+                > project_desktop_read_cursors.cursor
+            """,
+            (project_id, binding_id, cursor, now),
+        )
+        return desktop_read_cursor(
+            conn,
+            project_id=project_id,
+            binding_id=binding_id,
+        )
+
+
 def bind_surface(
     conn: sqlite3.Connection,
     *,
@@ -6601,6 +9322,7 @@ def bind_surface(
     external_binding_id: str,
     actor_id: str,
     now: int,
+    principal_id: str | None = None,
 ) -> SurfaceBinding:
     """Insert-or-read one immutable Desktop/Discord binding identity."""
     binding = make_surface_binding(
@@ -6611,6 +9333,14 @@ def bind_surface(
         actor_id=actor_id,
         created_at=now,
     )
+    if principal_id is not None and (
+        binding.surface != "discord"
+        or type(principal_id) is not str
+        or not principal_id
+    ):
+        raise ValueError(
+            "principal_id must be a non-empty Discord principal"
+        )
     with write_transaction(conn):
         conn.execute(
             """
@@ -6646,6 +9376,30 @@ def bind_surface(
             raise BindingConflictError(
                 "binding id or external identity already has another tuple"
             )
+        if principal_id is not None:
+            conn.execute(
+                """
+                INSERT INTO project_surface_principals (
+                    project_id, binding_id, principal_id, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    binding.project_id,
+                    binding.binding_id,
+                    principal_id,
+                    binding.created_at,
+                ),
+            )
+            stored_principal = principal_for_surface_binding(
+                conn,
+                project_id=binding.project_id,
+                binding_id=binding.binding_id,
+            )
+            if stored_principal != principal_id:
+                raise BindingConflictError(
+                    "binding transport principal conflicts"
+                )
     return stored
 
 
@@ -6915,6 +9669,7 @@ def _create_approval_request(
     now: int,
     effective_runtime_version: int,
     turn_expected_control_version: int | None = None,
+    caller_owns_transaction: bool = False,
 ) -> ApprovalRequest:
     """Persist one request with distinct immutable and live authority versions."""
     canonical_targets, targets_json, boundary_json = _approval_storage_values(
@@ -6934,7 +9689,16 @@ def _create_approval_request(
         raise ValueError(
             "turn_expected_control_version must be a non-negative integer"
         )
-    with write_transaction(conn):
+    if caller_owns_transaction and not conn.in_transaction:
+        raise RuntimeError(
+            "approval caller-owned transaction is not active"
+        )
+    transaction = (
+        contextlib.nullcontext(conn)
+        if caller_owns_transaction
+        else write_transaction(conn)
+    )
+    with transaction:
         state = _runtime_state_for_project(conn, request.project_id)
         if not (
             state is not None

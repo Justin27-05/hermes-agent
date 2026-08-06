@@ -635,6 +635,27 @@ class PlatformConfig:
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
 
+    # Canonical project workspace routing.  Currently only Discord consumes
+    # this, but storing it on PlatformConfig keeps nested platform config
+    # round-trippable without inventing a second global allowlist.
+    project_workspaces: "DiscordProjectWorkspaceConfig | None" = None
+
+    def __post_init__(self) -> None:
+        """Normalize programmatic workspace mappings to the typed policy form."""
+        if self.project_workspaces is None:
+            return
+        from gateway.project_surfaces import (
+            DiscordProjectWorkspaceConfig,
+            parse_discord_project_workspace,
+        )
+
+        if not isinstance(
+            self.project_workspaces, DiscordProjectWorkspaceConfig
+        ):
+            self.project_workspaces = parse_discord_project_workspace(
+                self.project_workspaces
+            )
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "enabled": self.enabled,
@@ -655,10 +676,17 @@ class PlatformConfig:
             result["channel_overrides"] = {
                 cid: ov.to_dict() for cid, ov in self.channel_overrides.items()
             }
+        if self.project_workspaces is not None:
+            result["project_workspaces"] = self.project_workspaces.to_dict()
         return result
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PlatformConfig":
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        *,
+        platform: Platform | None = None,
+    ) -> "PlatformConfig":
         data = _coerce_dict(data)
         home_channel = None
         if isinstance(data.get("home_channel"), dict):
@@ -668,7 +696,25 @@ class PlatformConfig:
         # shared-key loop in load_gateway_config(); check both top-level
         # and extra so YAML ``discord: gateway_restart_notification: false``
         # works without needing a separate platforms: block.
-        extra = _coerce_dict(data.get("extra", {}))
+        extra = dict(_coerce_dict(data.get("extra", {})))
+        if "allow_from" in data and "allow_from" not in extra:
+            extra["allow_from"] = data["allow_from"]
+        workspace_raw = None
+        if platform is Platform.DISCORD or platform is None:
+            workspace_raw = data.get("project_workspaces")
+            if workspace_raw is None:
+                workspace_raw = extra.get("project_workspaces")
+        # Keep this in extra too: platform adapters and persisted config already
+        # use extra as their lossless extension route.
+        if workspace_raw is not None:
+            extra["project_workspaces"] = workspace_raw
+        from gateway.project_surfaces import parse_discord_project_workspace
+
+        project_workspaces = (
+            parse_discord_project_workspace(workspace_raw)
+            if platform is Platform.DISCORD or platform is None
+            else None
+        )
         _grn = data.get("gateway_restart_notification")
         if _grn is None:
             _grn = extra.get("gateway_restart_notification")
@@ -704,6 +750,7 @@ class PlatformConfig:
             typing_status_text=_typing_text,
             channel_overrides=channel_overrides,
             extra=extra,
+            project_workspaces=project_workspaces,
         )
 
 
@@ -1091,9 +1138,12 @@ class GatewayConfig:
                 continue
             try:
                 platform = Platform(platform_name)
-                platforms[platform] = PlatformConfig.from_dict(platform_data)
             except ValueError:
                 pass  # Skip unknown platforms
+                continue
+            platforms[platform] = PlatformConfig.from_dict(
+                platform_data, platform=platform
+            )
         
         reset_by_type = {}
         for type_name, policy_data in _coerce_dict(data.get("reset_by_type", {})).items():
@@ -1582,6 +1632,11 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
                 if plat in {Platform.DISCORD, Platform.SLACK} and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
+                if plat == Platform.DISCORD and "project_workspaces" in platform_cfg:
+                    # Workspace identity is policy, not an adapter channel
+                    # allowlist. Preserve it as a first-class PlatformConfig
+                    # field and in extra for lossless platform round-trips.
+                    bridged["project_workspaces"] = platform_cfg["project_workspaces"]
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]
                     if isinstance(channel_prompts, dict):
@@ -1628,6 +1683,10 @@ def load_gateway_config() -> GatewayConfig:
                 if not bridged and not enabled_was_explicit and not has_channel_overrides:
                     continue
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
+                if plat == Platform.DISCORD and "project_workspaces" in platform_cfg:
+                    plat_data["project_workspaces"] = platform_cfg[
+                        "project_workspaces"
+                    ]
                 if enabled_was_explicit:
                     plat_data["enabled"] = platform_cfg["enabled"]
                     # Mark the explicit enable/disable so the registry-driven
@@ -1741,6 +1800,16 @@ def load_gateway_config() -> GatewayConfig:
 
     # Override with environment variables
     _apply_env_overrides(config)
+
+    # Validate project-workspace ownership only after profile-scoped
+    # environment overrides are available.  ``_getenv`` honours the active
+    # multiplex profile and avoids leaking process-global credentials.
+    from gateway.project_surfaces import project_surfaces_for_config
+
+    project_surfaces_for_config(
+        config,
+        discord_allowed_users=_getenv("DISCORD_ALLOWED_USERS", ""),
+    )
     
     # --- Validate loaded values ---
     _validate_gateway_config(config)

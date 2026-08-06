@@ -500,6 +500,19 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        project_execution_gate=None,
+        project_tool_schemas=None,
+        project_registry_generation: int = None,
+        project_request_timeout: float = None,
+        project_bedrock_guardrail_config=None,
+        streaming_callback: callable = None,
+        delivery_callback: callable = None,
+        approval_notifier: callable = None,
+        provider_metadata_prewarm: bool = True,
+        external_memory_sync: bool = True,
+        memory_review: bool = True,
+        skill_review: bool = True,
+        plugin_lifecycle: bool = True,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -577,6 +590,19 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            project_execution_gate=project_execution_gate,
+            project_tool_schemas=project_tool_schemas,
+            project_registry_generation=project_registry_generation,
+            project_request_timeout=project_request_timeout,
+            project_bedrock_guardrail_config=project_bedrock_guardrail_config,
+            streaming_callback=streaming_callback,
+            delivery_callback=delivery_callback,
+            approval_notifier=approval_notifier,
+            provider_metadata_prewarm=provider_metadata_prewarm,
+            external_memory_sync=external_memory_sync,
+            memory_review=memory_review,
+            skill_review=skill_review,
+            plugin_lifecycle=plugin_lifecycle,
         )
 
     def _get_session_db_for_recall(self):
@@ -1321,6 +1347,8 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
+        if getattr(self, "_hermetic_project_mode", False):
+            return self._project_request_timeout
         cfg = get_provider_request_timeout(self.provider, self.model)
         if cfg is not None:
             return cfg
@@ -1665,6 +1693,8 @@ class AIAgent:
 
     def _cleanup_task_resources(self, task_id: str) -> None:
         """Forwarder — see ``agent.chat_completion_helpers.cleanup_task_resources``."""
+        if getattr(self, "_hermetic_project_mode", False) is True:
+            return None
         from agent.chat_completion_helpers import cleanup_task_resources
         return cleanup_task_resources(self, task_id)
 
@@ -2869,6 +2899,15 @@ class AIAgent:
             if session_has_running_agent:
                 running_agent.interrupt(new_message.text)
         """
+        _project_gate = getattr(self, "project_execution_gate", None)
+        _request_project_cancel = getattr(
+            _project_gate,
+            "request_cancel",
+            None,
+        )
+        if callable(_request_project_cancel):
+            _request_project_cancel()
+
         # A hard stop and redirect share one lock so /stop cannot race with an
         # accepted correction and accidentally turn itself into a retry.
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
@@ -3313,6 +3352,8 @@ class AIAgent:
         config.  Exposed as a method so tests can patch a single seam,
         mirroring ``_file_mutation_verifier_enabled``.
         """
+        if getattr(self, "_hermetic_project_mode", False) is True:
+            return False
         try:
             import os as _os
             env = _os.environ.get("HERMES_TURN_COMPLETION_EXPLAINER")
@@ -3752,6 +3793,16 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
+        if (
+            getattr(self, "_hermetic_project_mode", False) is True
+            or getattr(
+                self,
+                "_external_memory_sync_enabled",
+                True,
+            )
+            is not True
+        ):
+            return
         if interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):
@@ -3845,6 +3896,19 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
+        if getattr(self, "_hermetic_project_mode", False) is True:
+            try:
+                client = getattr(self, "client", None)
+                if client is not None:
+                    self._close_openai_client(
+                        client,
+                        reason="agent_close",
+                        shared=True,
+                    )
+                    self.client = None
+            finally:
+                self._session_messages = []
+            return
 
         # 1. Kill background processes for this task
         try:
@@ -6553,8 +6617,26 @@ class AIAgent:
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
+        project_batch_token = None
+        project_forces_sequential = False
         try:
-            if len(tool_calls) <= 1:
+            project_gate = getattr(self, "project_execution_gate", None)
+            if project_gate is not None:
+                from agent.tool_executor import (
+                    clear_project_tool_batch,
+                    prepare_project_tool_batch,
+                )
+
+                (
+                    project_batch_token,
+                    project_forces_sequential,
+                ) = prepare_project_tool_batch(
+                    self,
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                )
+            if len(tool_calls) <= 1 or project_forces_sequential:
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )
@@ -6580,6 +6662,8 @@ class AIAgent:
                 segments=segments,
             )
         finally:
+            if getattr(self, "project_execution_gate", None) is not None:
+                clear_project_tool_batch(project_batch_token)
             self._executing_tools = False
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:

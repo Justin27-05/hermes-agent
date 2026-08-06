@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import urljoin
@@ -134,6 +135,18 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     utf16_len,
     validate_inbound_media_size,
+)
+from hermes_cli.project_events import ProjectEvent
+from plugins.platforms.discord.project_channels import (
+    DiscordProjectErrorCode,
+    DiscordProjectPortError,
+    ProjectChannelSpec,
+    ProjectChannelState,
+    ProjectSegmentFence,
+    parse_project_channel_marker,
+    project_channel_marker,
+    project_event_marker,
+    state_matches_spec,
 )
 from tools.url_safety import is_safe_url
 
@@ -980,6 +993,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # rate limit (~1 edit per stream tick for the rest of a long reply).
         # Mirrors the Telegram #58563 fix. Entries are dropped on finalize.
         self._last_overflow_preview: Dict[tuple, str] = {}
+        # Serialize project-channel discovery and mutation so concurrent
+        # delivery workers cannot create or edit the same managed channel
+        # from stale observations.
+        self._project_channel_lock = asyncio.Lock()
         self._warned_fail_closed_default = False
 
     def _config_value(
@@ -1293,6 +1310,7 @@ class DiscordAdapter(BasePlatformAdapter):
         message: Any,
         *,
         claim: bool,
+        apply_mention_policy: bool = True,
     ) -> tuple[bool, bool]:
         """Return ``(admitted, role_authorized)`` for one Discord event."""
         message_id = str(getattr(message, "id", ""))
@@ -1339,7 +1357,7 @@ class DiscordAdapter(BasePlatformAdapter):
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
         raw_self_mention = self._self_is_explicitly_mentioned(message)
-        if not isinstance(message.channel, discord.DMChannel) and (
+        if apply_mention_policy and not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
             other_bots_mentioned = any(
@@ -1369,14 +1387,152 @@ class DiscordAdapter(BasePlatformAdapter):
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
+        return await self._dispatch_admitted_discord_message(
+            message,
+            recovered=False,
+        )
+
+    async def _dispatch_admitted_discord_message(
+        self,
+        message: Any,
+        *,
+        recovered: bool,
+    ) -> bool:
+        """Share reserved-workspace admission between live and recovery."""
+        project_event = self._managed_project_message_event(message)
+        if project_event is not None and (
+            project_event.source.is_bot
+            or project_event.source.user_id
+            != getattr(
+                getattr(self.config, "project_workspaces", None),
+                "owner_user_id",
+                None,
+            )
+        ):
+            return False
         admitted, role_authorized = self._discord_message_admission(
-            message, claim=True,
+            message,
+            claim=not recovered or project_event is not None,
+            apply_mention_policy=project_event is None,
         )
         if not admitted:
             return False
+        if project_event is not None:
+            await self.handle_message(project_event)
+            return True
+        if recovered and not isinstance(message.channel, discord.DMChannel):
+            parent_id = self._get_parent_channel_id(message.channel)
+            channel_keys = self._discord_channel_keys(message, parent_id)
+            free_channels = self._discord_free_response_channels()
+            in_bot_thread = (
+                isinstance(message.channel, discord.Thread)
+                and str(message.channel.id) in self._threads
+                and not self._discord_thread_require_mention()
+            )
+            if (
+                self._discord_require_mention()
+                and "*" not in free_channels
+                and not (channel_keys & free_channels)
+                and not in_bot_thread
+                and not self._self_is_explicitly_mentioned(message)
+            ):
+                return False
         return await self._handle_message(
-            message, role_authorized=role_authorized,
+            message,
+            role_authorized=role_authorized,
+            **({"recovered": True} if recovered else {}),
         )
+
+    def _managed_project_message_event(
+        self, message: Any
+    ) -> MessageEvent | None:
+        """Build the narrow pre-mention event for a configured project channel.
+
+        Durable binding lookup, principal validation, and all project mutations
+        remain in the gateway's canonical ingress.  The adapter only recognizes
+        the configured guild/category location early enough to avoid
+        mention gating, auto-threading, batching, and conversational queues.
+        """
+        workspace = getattr(self.config, "project_workspaces", None)
+        if workspace is None or not getattr(workspace, "enabled", False):
+            return None
+        try:
+            from gateway.project_surfaces import DiscordProjectSurface
+
+            surface = DiscordProjectSurface.from_config(workspace)
+        except (ImportError, TypeError, ValueError):
+            return None
+
+        channel = getattr(message, "channel", None)
+        author = getattr(message, "author", None)
+        guild = getattr(message, "guild", None) or getattr(
+            channel, "guild", None
+        )
+        channel_id = getattr(channel, "id", None)
+        author_id = getattr(author, "id", None)
+        if channel_id is None or author_id is None:
+            return None
+        is_thread = isinstance(channel, discord.Thread)
+        parent = getattr(channel, "parent", None)
+        category_id = getattr(channel, "category_id", None)
+        if category_id is None:
+            category_id = getattr(parent, "category_id", None)
+        source = self.build_source(
+            chat_id=str(channel_id),
+            chat_name=getattr(channel, "name", str(channel_id)),
+            chat_type="thread" if is_thread else "group",
+            user_id=str(author_id),
+            user_name=getattr(author, "display_name", None),
+            thread_id=str(channel_id) if is_thread else None,
+            is_bot=bool(getattr(author, "bot", False)),
+            guild_id=(
+                str(getattr(guild, "id", ""))
+                if getattr(guild, "id", None) is not None
+                else None
+            ),
+            parent_chat_id=(
+                str(getattr(channel, "parent_id", "")) or None
+            ),
+            message_id=str(getattr(message, "id", "")) or None,
+        )
+        ownership_topic = getattr(
+            parent if is_thread else channel,
+            "topic",
+            None,
+        )
+        has_owned_topic = (
+            source.scope_id == surface.guild_id
+            and parse_project_channel_marker(ownership_topic) is not None
+        )
+        if not (
+            has_owned_topic
+            or surface.reserves_discord_location(
+                guild_id=source.scope_id,
+                category_id=(
+                    str(category_id)
+                    if category_id is not None
+                    else None
+                ),
+            )
+        ):
+            return None
+        attachments = list(getattr(message, "attachments", ()) or ())
+        event = MessageEvent(
+            text=str(getattr(message, "content", "") or ""),
+            message_type=(
+                MessageType.DOCUMENT if attachments else MessageType.TEXT
+            ),
+            source=source,
+            raw_message=message,
+            message_id=source.message_id,
+            media_urls=["managed-discord-attachment"] if attachments else [],
+            media_types=["application/octet-stream"] if attachments else [],
+            timestamp=getattr(message, "created_at", None),
+        )
+        # Deliberately not serialized into metadata: only this adapter can mark
+        # a location-derived candidate as trusted for local queue bypass.
+        setattr(event, "_hermes_managed_project_candidate", True)
+        return event
 
     async def _cancel_bot_task(self) -> None:
         """Cancel and await the background client.start() task, if running."""
@@ -2158,31 +2314,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
-        if not isinstance(message.channel, discord.DMChannel):
-            parent_id = self._get_parent_channel_id(message.channel)
-            channel_keys = self._discord_channel_keys(message, parent_id)
-            free_channels = self._discord_free_response_channels()
-            in_bot_thread = (
-                isinstance(message.channel, discord.Thread)
-                and str(message.channel.id) in self._threads
-                and not self._discord_thread_require_mention()
-            )
-            if (
-                self._discord_require_mention()
-                and "*" not in free_channels
-                and not (channel_keys & free_channels)
-                and not in_bot_thread
-                and not self._self_is_explicitly_mentioned(message)
-            ):
-                return False
-        admitted, role_authorized = self._discord_message_admission(
-            message, claim=False,
-        )
-        if not admitted:
-            return False
-        return await self._handle_message(
+        return await self._dispatch_admitted_discord_message(
             message,
-            role_authorized=role_authorized,
             recovered=True,
         )
 
@@ -2854,6 +2987,846 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._add_reaction(message, "✅")
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
+
+    @staticmethod
+    def _project_external_id(value: object) -> str:
+        if type(value) is not str or not value or not value.isdecimal():
+            raise DiscordProjectPortError(
+                DiscordProjectErrorCode.INVALID_ARGUMENT
+            )
+        return value
+
+    def _project_workspace(self) -> Any:
+        workspace = getattr(self.config, "project_workspaces", None)
+        if workspace is None or not getattr(workspace, "enabled", False):
+            raise DiscordProjectPortError(DiscordProjectErrorCode.UNAVAILABLE)
+        return workspace
+
+    @staticmethod
+    def _project_http_status(exc: BaseException) -> Optional[int]:
+        status = getattr(exc, "status", None)
+        if status is None:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status", None)
+            if status is None:
+                status = getattr(response, "status_code", None)
+        try:
+            return int(status) if status is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _project_port_error(
+        self,
+        exc: BaseException,
+        *,
+        operation_id: Optional[str] = None,
+        mutation: bool = False,
+    ) -> DiscordProjectPortError:
+        if isinstance(exc, DiscordProjectPortError):
+            return exc
+        status = self._project_http_status(exc)
+        if self._is_discord_rate_limit(exc) or status == 429:
+            return DiscordProjectPortError(
+                DiscordProjectErrorCode.RATE_LIMITED,
+                retryable=True,
+                retry_after=self._extract_discord_retry_after(exc),
+                operation_id=operation_id,
+            )
+        if status == 403:
+            return DiscordProjectPortError(
+                DiscordProjectErrorCode.FORBIDDEN,
+                operation_id=operation_id,
+            )
+        if status == 404:
+            return DiscordProjectPortError(
+                DiscordProjectErrorCode.NOT_FOUND,
+                operation_id=operation_id,
+            )
+        if (
+            isinstance(exc, (asyncio.TimeoutError, TimeoutError, OSError))
+            or status is not None
+            and status >= 500
+        ):
+            return DiscordProjectPortError(
+                DiscordProjectErrorCode.TRANSIENT,
+                retryable=True,
+                operation_id=operation_id,
+            )
+        return DiscordProjectPortError(
+            (
+                DiscordProjectErrorCode.AMBIGUOUS
+                if mutation
+                else DiscordProjectErrorCode.UNAVAILABLE
+            ),
+            retryable=mutation,
+            operation_id=operation_id,
+        )
+
+    async def _project_fetch_channel(self, channel_id: str) -> Any | None:
+        if not self._client:
+            raise DiscordProjectPortError(DiscordProjectErrorCode.UNAVAILABLE)
+        try:
+            return await self._client.fetch_channel(int(channel_id))
+        except Exception as exc:
+            if self._project_http_status(exc) == 404:
+                return None
+            raise self._project_port_error(exc) from None
+
+    async def _project_guild(self, guild_id: str) -> Any:
+        if not self._client:
+            raise DiscordProjectPortError(DiscordProjectErrorCode.UNAVAILABLE)
+        guild = self._client.get_guild(int(guild_id))
+        if guild is not None:
+            return guild
+        try:
+            return await self._client.fetch_guild(int(guild_id))
+        except Exception as exc:
+            raise self._project_port_error(exc) from None
+
+    async def _project_guild_channels(self, guild: Any) -> list[Any]:
+        try:
+            return list(await guild.fetch_channels())
+        except Exception as exc:
+            raise self._project_port_error(exc) from None
+
+    @staticmethod
+    def _project_channel_type_value(channel: Any) -> Any:
+        channel_type = getattr(channel, "type", None)
+        return getattr(channel_type, "value", channel_type)
+
+    @classmethod
+    def _project_is_text_channel(cls, channel: Any) -> bool:
+        return cls._project_channel_type_value(channel) == 0
+
+    @classmethod
+    def _project_is_category(cls, channel: Any) -> bool:
+        return cls._project_channel_type_value(channel) == 4
+
+    async def _project_member(self, guild: Any, member_id: str) -> Any:
+        member = guild.get_member(int(member_id))
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(int(member_id))
+        except Exception as exc:
+            raise self._project_port_error(exc) from None
+
+    async def _project_targets(
+        self, guild: Any, owner_user_id: str
+    ) -> tuple[Any, Any, Any]:
+        default_role = getattr(guild, "default_role", None)
+        if default_role is None:
+            raise DiscordProjectPortError(
+                DiscordProjectErrorCode.STATE_MISMATCH
+            )
+        owner = await self._project_member(guild, owner_user_id)
+        bot = getattr(guild, "me", None)
+        if bot is None:
+            client_user = getattr(self._client, "user", None)
+            bot_id = getattr(client_user, "id", None)
+            if bot_id is None:
+                raise DiscordProjectPortError(
+                    DiscordProjectErrorCode.UNAVAILABLE
+                )
+            bot = await self._project_member(guild, str(bot_id))
+        return default_role, owner, bot
+
+    @staticmethod
+    def _project_permission_value(overwrite: Any, name: str) -> Any:
+        return getattr(overwrite, name, None)
+
+    async def _project_channel_state(
+        self,
+        channel: Any,
+        *,
+        guild: Any,
+        owner_user_id: str,
+    ) -> ProjectChannelState:
+        default_role, owner, bot = await self._project_targets(
+            guild, owner_user_id
+        )
+        default_permissions = channel.overwrites_for(default_role)
+        owner_permissions = channel.overwrites_for(owner)
+        bot_permissions = channel.overwrites_for(bot)
+        allowed_ids = {
+            int(default_role.id),
+            int(owner.id),
+            int(bot.id),
+        }
+        other_view_grant = any(
+            getattr(target, "id", None) not in allowed_ids
+            and self._project_permission_value(overwrite, "view_channel")
+            is True
+            for target, overwrite in dict(
+                getattr(channel, "overwrites", {}) or {}
+            ).items()
+        )
+        default_denied = (
+            self._project_permission_value(
+                default_permissions, "view_channel"
+            )
+            is False
+        )
+        owner_view = (
+            self._project_permission_value(owner_permissions, "view_channel")
+            is True
+        )
+        bot_view = (
+            self._project_permission_value(bot_permissions, "view_channel")
+            is True
+        )
+        category_id = getattr(channel, "category_id", None)
+        if category_id is None:
+            category_id = getattr(getattr(channel, "category", None), "id", None)
+        return ProjectChannelState(
+            guild_id=str(guild.id),
+            channel_id=str(channel.id),
+            name=str(getattr(channel, "name", "")),
+            category_id=(
+                str(category_id) if category_id is not None else None
+            ),
+            ownership_marker=getattr(channel, "topic", None),
+            only_owner_and_bot_can_view=(
+                default_denied and owner_view and bot_view and not other_view_grant
+            ),
+            owner_can_view=owner_view,
+            owner_can_send=(
+                self._project_permission_value(
+                    owner_permissions, "send_messages"
+                )
+                is True
+            ),
+            owner_can_read_history=(
+                self._project_permission_value(
+                    owner_permissions, "read_message_history"
+                )
+                is True
+            ),
+            bot_can_view=bot_view,
+            bot_can_send=(
+                self._project_permission_value(
+                    bot_permissions, "send_messages"
+                )
+                is True
+            ),
+            bot_can_read_history=(
+                self._project_permission_value(
+                    bot_permissions, "read_message_history"
+                )
+                is True
+            ),
+        )
+
+    async def _project_category(
+        self,
+        *,
+        channels: list[Any],
+        guild_id: str,
+        category_id: str,
+    ) -> Any:
+        category = next(
+            (
+                channel
+                for channel in channels
+                if str(getattr(channel, "id", "")) == category_id
+            ),
+            None,
+        )
+        if (
+            category is None
+            or str(getattr(getattr(category, "guild", None), "id", ""))
+            != guild_id
+            or not self._project_is_category(category)
+        ):
+            raise DiscordProjectPortError(
+                DiscordProjectErrorCode.NOT_FOUND
+            )
+        return category
+
+    async def _project_overwrites(
+        self,
+        *,
+        guild: Any,
+        owner_user_id: str,
+        owner_can_send: bool,
+    ) -> dict[Any, Any]:
+        default_role, owner, bot = await self._project_targets(
+            guild, owner_user_id
+        )
+        return {
+            default_role: discord.PermissionOverwrite(
+                view_channel=False,
+                send_messages=False,
+                read_message_history=False,
+            ),
+            owner: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=owner_can_send,
+                read_message_history=True,
+            ),
+            bot: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+            ),
+        }
+
+    def _validate_project_spec(
+        self,
+        spec: ProjectChannelSpec,
+        *,
+        operation_id: str,
+    ) -> Any:
+        workspace = self._project_workspace()
+        if (
+            not isinstance(spec, ProjectChannelSpec)
+            or type(operation_id) is not str
+            or not operation_id
+            or type(spec.project_id) is not str
+            or not spec.project_id
+            or type(spec.name) is not str
+            or not spec.name
+            or len(spec.name) > 100
+            or type(spec.owner_can_send) is not bool
+        ):
+            raise DiscordProjectPortError(
+                DiscordProjectErrorCode.INVALID_ARGUMENT,
+                operation_id=operation_id,
+            )
+        for value in (
+            spec.guild_id,
+            spec.owner_user_id,
+            spec.category_id,
+        ):
+            self._project_external_id(value)
+        if spec.channel_id is not None:
+            self._project_external_id(spec.channel_id)
+        allowed_categories = {
+            workspace.active_category_id,
+            workspace.completed_category_id,
+        }
+        if (
+            spec.guild_id != workspace.guild_id
+            or spec.owner_user_id != workspace.owner_user_id
+            or spec.category_id not in allowed_categories
+        ):
+            raise DiscordProjectPortError(
+                DiscordProjectErrorCode.FORBIDDEN,
+                operation_id=operation_id,
+            )
+        return workspace
+
+    async def read_channel(
+        self,
+        *,
+        guild_id: str,
+        channel_id: str,
+    ) -> ProjectChannelState | None:
+        workspace = self._project_workspace()
+        self._project_external_id(guild_id)
+        self._project_external_id(channel_id)
+        if guild_id != workspace.guild_id:
+            raise DiscordProjectPortError(DiscordProjectErrorCode.FORBIDDEN)
+        channel = await self._project_fetch_channel(channel_id)
+        if channel is None:
+            return None
+        guild = getattr(channel, "guild", None)
+        if (
+            guild is None
+            or str(getattr(guild, "id", "")) != guild_id
+            or not self._project_is_text_channel(channel)
+        ):
+            raise DiscordProjectPortError(DiscordProjectErrorCode.CONFLICT)
+        return await self._project_channel_state(
+            channel,
+            guild=guild,
+            owner_user_id=workspace.owner_user_id,
+        )
+
+    async def ensure_channel(
+        self,
+        spec: ProjectChannelSpec,
+        *,
+        operation_id: str,
+    ) -> ProjectChannelState:
+        """Converge a claimed surface operation to one exact Discord channel.
+
+        The caller owns the durable cross-process claim.  This adapter's single
+        lock only serializes concurrent work inside this adapter instance.
+        """
+        workspace = self._validate_project_spec(
+            spec, operation_id=operation_id
+        )
+        marker = project_channel_marker(spec.project_id)
+        async with self._project_channel_lock:
+            guild = await self._project_guild(spec.guild_id)
+            channels = await self._project_guild_channels(guild)
+            category = await self._project_category(
+                channels=channels,
+                guild_id=spec.guild_id,
+                category_id=spec.category_id,
+            )
+            overwrites = await self._project_overwrites(
+                guild=guild,
+                owner_user_id=spec.owner_user_id,
+                owner_can_send=spec.owner_can_send,
+            )
+
+            if spec.channel_id is not None:
+                channel = await self._project_fetch_channel(spec.channel_id)
+                if channel is None:
+                    raise DiscordProjectPortError(
+                        DiscordProjectErrorCode.NOT_FOUND,
+                        operation_id=operation_id,
+                    )
+                if (
+                    str(getattr(getattr(channel, "guild", None), "id", ""))
+                    != spec.guild_id
+                    or not self._project_is_text_channel(channel)
+                    or getattr(channel, "topic", None) != marker
+                ):
+                    raise DiscordProjectPortError(
+                        DiscordProjectErrorCode.CONFLICT,
+                        operation_id=operation_id,
+                    )
+            else:
+                marker_matches = [
+                    candidate
+                    for candidate in channels
+                    if self._project_is_text_channel(candidate)
+                    and str(
+                        getattr(
+                            getattr(candidate, "guild", None), "id", ""
+                        )
+                    )
+                    == spec.guild_id
+                    and getattr(candidate, "topic", None) == marker
+                ]
+                if len(marker_matches) > 1:
+                    raise DiscordProjectPortError(
+                        DiscordProjectErrorCode.CONFLICT,
+                        operation_id=operation_id,
+                    )
+                channel = marker_matches[0] if marker_matches else None
+                if channel is None:
+                    same_name_foreign = any(
+                        self._project_is_text_channel(candidate)
+                        and str(getattr(getattr(candidate, "guild", None), "id", ""))
+                        == spec.guild_id
+                        and getattr(candidate, "name", None) == spec.name
+                        and getattr(candidate, "topic", None) != marker
+                        for candidate in channels
+                    )
+                    if same_name_foreign:
+                        raise DiscordProjectPortError(
+                            DiscordProjectErrorCode.CONFLICT,
+                            operation_id=operation_id,
+                        )
+                    try:
+                        channel = await guild.create_text_channel(
+                            spec.name,
+                            category=category,
+                            topic=marker,
+                            overwrites=overwrites,
+                            reason=self._project_audit_reason(operation_id),
+                        )
+                    except Exception as exc:
+                        # The create may have committed before its response was
+                        # lost. Reconcile by marker; never create a second time.
+                        refreshed = await self._project_guild_channels(guild)
+                        recovered = [
+                            candidate
+                            for candidate in refreshed
+                            if self._project_is_text_channel(candidate)
+                            and str(
+                                getattr(
+                                    getattr(candidate, "guild", None),
+                                    "id",
+                                    "",
+                                )
+                            )
+                            == spec.guild_id
+                            and getattr(candidate, "topic", None) == marker
+                        ]
+                        if len(recovered) > 1:
+                            raise DiscordProjectPortError(
+                                DiscordProjectErrorCode.CONFLICT,
+                                operation_id=operation_id,
+                            ) from None
+                        if not recovered:
+                            raise self._project_port_error(
+                                exc,
+                                operation_id=operation_id,
+                                mutation=True,
+                            ) from None
+                        channel = recovered[0]
+
+            state = await self._project_channel_state(
+                channel,
+                guild=guild,
+                owner_user_id=workspace.owner_user_id,
+            )
+            if state_matches_spec(spec, state):
+                return state
+
+            try:
+                await channel.edit(
+                    name=spec.name,
+                    topic=marker,
+                    category=category,
+                    sync_permissions=False,
+                    overwrites=overwrites,
+                    reason=self._project_audit_reason(operation_id),
+                )
+            except Exception as exc:
+                classified = self._project_port_error(
+                    exc,
+                    operation_id=operation_id,
+                    mutation=True,
+                )
+                try:
+                    readback = await self.read_channel(
+                        guild_id=spec.guild_id,
+                        channel_id=str(channel.id),
+                    )
+                except DiscordProjectPortError:
+                    raise classified from None
+                if readback is not None and state_matches_spec(spec, readback):
+                    return readback
+                if classified.code is not DiscordProjectErrorCode.TRANSIENT:
+                    raise classified from None
+                raise DiscordProjectPortError(
+                    DiscordProjectErrorCode.STATE_MISMATCH,
+                    retryable=True,
+                    operation_id=operation_id,
+                ) from None
+
+            readback = await self.read_channel(
+                guild_id=spec.guild_id,
+                channel_id=str(channel.id),
+            )
+            if readback is not None and state_matches_spec(spec, readback):
+                return readback
+            raise DiscordProjectPortError(
+                DiscordProjectErrorCode.STATE_MISMATCH,
+                retryable=True,
+                operation_id=operation_id,
+            )
+
+    @staticmethod
+    def _project_audit_reason(operation_id: str) -> str:
+        digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:16]
+        return f"Hermes project operation {digest}"
+
+    async def _project_event_channel(self, channel_id: str) -> Any:
+        workspace = self._project_workspace()
+        self._project_external_id(channel_id)
+        channel = await self._project_fetch_channel(channel_id)
+        if channel is None:
+            raise DiscordProjectPortError(DiscordProjectErrorCode.NOT_FOUND)
+        if (
+            not self._project_is_text_channel(channel)
+            or str(getattr(getattr(channel, "guild", None), "id", ""))
+            != workspace.guild_id
+            or not str(getattr(channel, "topic", "")).startswith(
+                "hermes-project:v1:"
+            )
+        ):
+            raise DiscordProjectPortError(DiscordProjectErrorCode.CONFLICT)
+        return channel
+
+    @staticmethod
+    def _project_json_value(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                key: DiscordAdapter._project_json_value(item)
+                for key, item in value.items()
+            }
+        if type(value) in {list, tuple}:
+            return [
+                DiscordAdapter._project_json_value(item) for item in value
+            ]
+        return value
+
+    @classmethod
+    def _project_event_document(cls, event: ProjectEvent) -> str:
+        return json.dumps(
+            {
+                "created_at": event.created_at,
+                "kind": event.kind,
+                "payload": cls._project_json_value(event.payload),
+                "sequence": event.sequence,
+                "turn_id": event.turn_id,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _project_event_nonce(
+        nonce: str,
+        *,
+        part: int,
+        total: int,
+    ) -> str:
+        return hashlib.sha256(
+            f"{nonce}\0{part}\0{total}".encode("utf-8")
+        ).hexdigest()[:24]
+
+    async def _project_event_parts(
+        self,
+        channel: Any,
+        event_id: str,
+    ) -> tuple[dict[int, Any], Optional[int]]:
+        digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()
+        pattern = re.compile(
+            rf"(?:^|\n)-# hermes-event:v1:{digest}:(\d+)/(\d+)\Z"
+        )
+        bot_id = str(getattr(getattr(self._client, "user", None), "id", ""))
+        parts: dict[int, Any] = {}
+        total: Optional[int] = None
+        try:
+            history = channel.history(limit=None, oldest_first=False)
+            async for message in history:
+                if (
+                    str(getattr(getattr(message, "author", None), "id", ""))
+                    != bot_id
+                ):
+                    continue
+                match = pattern.search(str(getattr(message, "content", "")))
+                if match is None:
+                    continue
+                part = int(match.group(1))
+                candidate_total = int(match.group(2))
+                invalid = (
+                    part < 1
+                    or candidate_total < 1
+                    or part > candidate_total
+                    or total is not None
+                    and total != candidate_total
+                    or part in parts
+                )
+                if invalid:
+                    raise DiscordProjectPortError(
+                        DiscordProjectErrorCode.CONFLICT
+                    )
+                total = candidate_total
+                parts[part] = message
+        except DiscordProjectPortError:
+            raise
+        except Exception as exc:
+            raise self._project_port_error(exc) from None
+        return parts, total
+
+    async def find_event_message(
+        self,
+        *,
+        channel_id: str,
+        event_id: str,
+        before_segment: ProjectSegmentFence | None = None,
+    ) -> str | None:
+        if (
+            type(event_id) is not str
+            or not event_id
+            or before_segment is not None
+            and not callable(before_segment)
+        ):
+            raise DiscordProjectPortError(
+                DiscordProjectErrorCode.INVALID_ARGUMENT
+            )
+
+        async def fence() -> None:
+            if before_segment is not None:
+                await before_segment()
+
+        await fence()
+        channel = await self._project_event_channel(channel_id)
+        await fence()
+        parts, total = await self._project_event_parts(channel, event_id)
+        if total is None:
+            return None
+        if set(parts) != set(range(1, total + 1)):
+            raise DiscordProjectPortError(
+                DiscordProjectErrorCode.PARTIAL_DELIVERY,
+                retryable=True,
+            )
+        return str(parts[1].id)
+
+    async def publish_event(
+        self,
+        *,
+        channel_id: str,
+        event: ProjectEvent,
+        nonce: str,
+        before_segment: ProjectSegmentFence | None = None,
+    ) -> SendResult:
+        if (
+            not isinstance(event, ProjectEvent)
+            or type(nonce) is not str
+            or not nonce
+            or type(event.event_id) is not str
+            or not event.event_id
+            or type(event.project_id) is not str
+            or not event.project_id
+            or before_segment is not None
+            and not callable(before_segment)
+        ):
+            raise DiscordProjectPortError(
+                DiscordProjectErrorCode.INVALID_ARGUMENT
+            )
+
+        async def fence() -> None:
+            if before_segment is not None:
+                await before_segment()
+
+        await fence()
+        channel = await self._project_event_channel(channel_id)
+        if getattr(channel, "topic", None) != project_channel_marker(
+            event.project_id
+        ):
+            raise DiscordProjectPortError(DiscordProjectErrorCode.CONFLICT)
+
+        chunks = self.truncate_message(
+            self._project_event_document(event), 1800
+        )
+        total = len(chunks)
+        await fence()
+        parts, found_total = await self._project_event_parts(
+            channel, event.event_id
+        )
+        if found_total is not None and found_total != total:
+            raise DiscordProjectPortError(DiscordProjectErrorCode.CONFLICT)
+        expected_parts = set(range(1, total + 1))
+        if set(parts) == expected_parts:
+            ids = [str(parts[index].id) for index in sorted(parts)]
+            return SendResult(
+                success=True,
+                message_id=ids[0],
+                raw_response={"message_ids": ids},
+            )
+
+        for part, chunk in enumerate(chunks, start=1):
+            if part in parts:
+                continue
+            marker = project_event_marker(
+                event.event_id,
+                part=part,
+                total=total,
+            )
+            send_kwargs: dict[str, Any] = {
+                "content": f"{chunk}\n-# {marker}",
+                "nonce": self._project_event_nonce(
+                    nonce, part=part, total=total
+                ),
+                "allowed_mentions": discord.AllowedMentions.none(),
+            }
+            try:
+                send_parameters = inspect.signature(
+                    channel.send
+                ).parameters.values()
+                supports_enforce_nonce = any(
+                    parameter.name == "enforce_nonce"
+                    or parameter.kind
+                    is inspect.Parameter.VAR_KEYWORD
+                    for parameter in send_parameters
+                )
+            except (TypeError, ValueError):
+                supports_enforce_nonce = False
+            if supports_enforce_nonce:
+                send_kwargs["enforce_nonce"] = True
+            await fence()
+            try:
+                await channel.send(
+                    **send_kwargs,
+                )
+            except Exception as exc:
+                # A failed response is not proof that the send did not commit.
+                await fence()
+                parts, found_total = await self._project_event_parts(
+                    channel, event.event_id
+                )
+                if found_total is not None and found_total != total:
+                    raise DiscordProjectPortError(
+                        DiscordProjectErrorCode.CONFLICT
+                    ) from None
+                if part in parts:
+                    continue
+                classified = self._project_port_error(exc, mutation=True)
+                delivered = len(parts)
+                code = (
+                    DiscordProjectErrorCode.PARTIAL_DELIVERY
+                    if delivered
+                    else classified.code
+                )
+                error_kind = {
+                    DiscordProjectErrorCode.FORBIDDEN: "forbidden",
+                    DiscordProjectErrorCode.NOT_FOUND: "not_found",
+                    DiscordProjectErrorCode.RATE_LIMITED: "rate_limited",
+                    DiscordProjectErrorCode.TRANSIENT: "transient",
+                    DiscordProjectErrorCode.PARTIAL_DELIVERY: "transient",
+                }.get(code, "unknown")
+                ids = [str(parts[index].id) for index in sorted(parts)]
+                return SendResult(
+                    success=False,
+                    error=code.value,
+                    raw_response={
+                        "delivered_chunks": delivered,
+                        "total_chunks": total,
+                        "message_ids": ids,
+                    },
+                    retryable=(
+                        code
+                        in {
+                            DiscordProjectErrorCode.PARTIAL_DELIVERY,
+                            DiscordProjectErrorCode.RATE_LIMITED,
+                            DiscordProjectErrorCode.TRANSIENT,
+                            DiscordProjectErrorCode.AMBIGUOUS,
+                        }
+                    ),
+                    retry_after=classified.retry_after,
+                    error_kind=error_kind,
+                )
+            await fence()
+            parts, found_total = await self._project_event_parts(
+                channel, event.event_id
+            )
+            if found_total != total or part not in parts:
+                return SendResult(
+                    success=False,
+                    error=DiscordProjectErrorCode.STATE_MISMATCH.value,
+                    raw_response={
+                        "delivered_chunks": len(parts),
+                        "total_chunks": total,
+                        "message_ids": [
+                            str(parts[index].id)
+                            for index in sorted(parts)
+                        ],
+                    },
+                    retryable=True,
+                    error_kind="transient",
+                )
+
+        if set(parts) != expected_parts:
+            return SendResult(
+                success=False,
+                error=DiscordProjectErrorCode.PARTIAL_DELIVERY.value,
+                raw_response={
+                    "delivered_chunks": len(parts),
+                    "total_chunks": total,
+                    "message_ids": [
+                        str(parts[index].id) for index in sorted(parts)
+                    ],
+                },
+                retryable=True,
+                error_kind="transient",
+            )
+        ids = [str(parts[index].id) for index in sorted(parts)]
+        return SendResult(
+            success=True,
+            message_id=ids[0],
+            raw_response={"message_ids": ids},
+        )
 
     async def send(
         self,
@@ -4450,9 +5423,8 @@ class DiscordAdapter(BasePlatformAdapter):
         guild_id = getattr(interaction, "guild_id", None)
 
         logger.warning(
-            "[Discord] Unauthorized slash attempt: user=%s id=%s channel=%s "
-            "guild=%s cmd=%r reason=%r",
-            user_name, user_id, chan_id, guild_id, command_text, reason,
+            "[Discord] Unauthorized slash attempt rejected: %s",
+            reason,
         )
 
         try:
@@ -4930,23 +5902,8 @@ class DiscordAdapter(BasePlatformAdapter):
         the "thinking..." indicator is replaced with that text; otherwise it
         is deleted so the channel isn't cluttered.
         """
-        # Log the invoker so ghost-command reports can be triaged.  Discord
-        # native slash invocations are always user-initiated (no bot can fire
-        # them), but mobile autocomplete / keyboard shortcuts / other users
-        # in the same channel are easy to miss in post-mortems.
-        try:
-            _user = interaction.user
-            _chan_id = getattr(interaction.channel, "id", None) or getattr(interaction, "channel_id", None)
-            logger.info(
-                "[Discord] slash '%s' invoked by user=%s id=%s channel=%s guild=%s",
-                command_text,
-                getattr(_user, "name", "?"),
-                getattr(_user, "id", "?"),
-                _chan_id,
-                getattr(interaction, "guild_id", None),
-            )
-        except Exception:
-            pass  # logging must never block command dispatch
+        # Keep INFO telemetry free of command arguments and Discord identities.
+        logger.info("[Discord] native slash invoked")
 
         # Auth gate — must run before defer() so an ephemeral rejection can
         # be delivered on the still-unresponded interaction.
@@ -5037,6 +5994,18 @@ class DiscordAdapter(BasePlatformAdapter):
         @tree.command(name="status", description="Show Hermes session status")
         async def slash_status(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/status", "Status sent~")
+
+        @tree.command(name="project", description="Control the managed project in this channel")
+        @discord.app_commands.describe(
+            command=(
+                "create NAME, rename NAME, status, queue, stop TURN VERSION, "
+                "resume TURN VERSION, complete confirm, or reopen"
+            )
+        )
+        async def slash_project(interaction: discord.Interaction, command: str):
+            await self._run_simple_slash(
+                interaction, f"/project {command}".strip()
+            )
 
         @tree.command(name="sethome", description="Set this chat as the home channel")
         async def slash_sethome(interaction: discord.Interaction):
@@ -5556,6 +6525,16 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=(
+                str(getattr(interaction, "guild_id", ""))
+                if getattr(interaction, "guild_id", None) is not None
+                else None
+            ),
+            message_id=(
+                str(getattr(interaction, "id", ""))
+                if getattr(interaction, "id", None) is not None
+                else None
+            ),
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -5566,6 +6545,7 @@ class DiscordAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=interaction,
+            message_id=source.message_id,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
         )
 

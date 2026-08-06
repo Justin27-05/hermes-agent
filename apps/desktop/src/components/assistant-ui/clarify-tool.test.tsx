@@ -1,13 +1,19 @@
 import type { ToolCallMessagePartProps } from '@assistant-ui/react'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { atom } from 'nanostores'
 import type { ReactNode } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerInsertRequest } from '@/app/chat/composer/focus'
+import { PRIMARY_SESSION_VIEW, type SessionView, SessionViewProvider } from '@/app/chat/session-view'
 import { I18nProvider } from '@/i18n'
 import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
-import { $activeSessionId } from '@/store/session'
+import { $activeGatewayProfile } from '@/store/profile'
+import { $projectRuntimes, configureProjectRuntimeRequester, resetProjectRuntimeStore } from '@/store/project-runtime'
+import { $projectCatalogAuthority, $projects } from '@/store/projects'
+import { $activeSessionId, $selectedStoredSessionId, $sessions } from '@/store/session'
+import type { ProjectInfo, ProjectRuntimeSnapshot, SessionInfo } from '@/types/hermes'
 
 import { ClarifyTool, readClarifyResult } from './clarify-tool'
 
@@ -17,11 +23,29 @@ vi.mock('@assistant-ui/react', () => ({
   useAuiState: () => true
 }))
 
+beforeEach(() => {
+  $activeGatewayProfile.set('default')
+  configureProjectRuntimeRequester(
+    vi.fn(async () => undefined),
+    'default'
+  )
+  $projectCatalogAuthority.set({ catalogGeneration: 1, contextGeneration: 1, profile: 'default' })
+  $projects.set([])
+  $sessions.set([{ id: 'session-1', profile: 'default', project_id: null } as SessionInfo])
+  $selectedStoredSessionId.set('session-1')
+})
+
 afterEach(() => {
   cleanup()
   clearClarifyRequest()
   $activeSessionId.set(null)
+  $selectedStoredSessionId.set(null)
   $gateway.set(null)
+  $sessions.set([])
+  $projects.set([])
+  $projectCatalogAuthority.set({ catalogGeneration: null, contextGeneration: 0, profile: null })
+  resetProjectRuntimeStore()
+  configureProjectRuntimeRequester(undefined)
   vi.clearAllMocks()
 })
 
@@ -31,6 +55,26 @@ function renderClarify(ui: ReactNode) {
       {ui}
     </I18nProvider>
   )
+}
+
+function renderClarifyForSurface(ui: ReactNode, runtimeId: string, storedId: null | string) {
+  const view: SessionView = {
+    ...PRIMARY_SESSION_VIEW,
+    kind: 'tile',
+    $runtimeId: atom(runtimeId),
+    $storedId: atom(storedId)
+  }
+
+  return renderClarify(<SessionViewProvider value={view}>{ui}</SessionViewProvider>)
+}
+
+function markCatalogCurrent(): void {
+  const authority = $projectCatalogAuthority.get()
+  $projectCatalogAuthority.set({
+    catalogGeneration: authority.contextGeneration,
+    contextGeneration: authority.contextGeneration,
+    profile: 'default'
+  })
 }
 
 function settledClarifyProps(
@@ -76,6 +120,7 @@ function renderLiveClarify() {
 
   $activeSessionId.set('session-1')
   $gateway.set({ request } as never)
+  markCatalogCurrent()
   setClarifyRequest({
     choices: ['staging', 'production'],
     question: 'Which deployment target?',
@@ -86,6 +131,25 @@ function renderLiveClarify() {
 
   return request
 }
+
+const managedSnapshot = (overrides: Partial<ProjectRuntimeSnapshot> = {}): ProjectRuntimeSnapshot => ({
+  active_run: { control_state: 'running', control_version: 3, turn_id: 'turn-clarify' },
+  artifacts: [],
+  binding_id: 'binding-clarify',
+  block: null,
+  canonical_session_id: 'canonical-clarify',
+  current_phase: 'implementation',
+  delivery_status: { error_code: null, state: 'caught_up' },
+  last_sequence: 7,
+  lifecycle: 'active',
+  pending_approval: null,
+  project_id: 'project-clarify',
+  queue: [],
+  transcript: [],
+  transcript_revision: 2,
+  version: 4,
+  ...overrides
+})
 
 describe('readClarifyResult', () => {
   it('reads question + user_response from the tool JSON payload', () => {
@@ -310,6 +374,7 @@ describe('ClarifyTool pending marker', () => {
   it('does not mark a free-text (no-choice) pending card', () => {
     $activeSessionId.set('session-1')
     $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    markCatalogCurrent()
     setClarifyRequest({
       choices: null,
       question: 'Anything else?',
@@ -336,5 +401,64 @@ describe('ClarifyTool pending marker', () => {
 
     // No shortcuts → nothing to protect → composer type-to-focus stays live.
     expect(document.querySelector('[data-clarify-choices]')).toBeNull()
+  })
+})
+
+describe('ClarifyTool managed project boundary', () => {
+  it('renders a typed unsupported block and never sends clarify.respond when live and durable ids differ', () => {
+    const request = vi.fn().mockResolvedValue({ ok: true })
+    $gateway.set({ request } as never)
+    $sessions.set([
+      {
+        id: 'canonical-clarify',
+        profile: 'default',
+        project_id: 'project-clarify'
+      } as SessionInfo
+    ])
+    $projects.set([{ id: 'project-clarify', managed: true } as ProjectInfo])
+    $projectRuntimes.set({
+      'project-clarify': { events: [], snapshot: managedSnapshot() }
+    })
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      question: 'Which deployment target?',
+      requestId: 'legacy-request',
+      sessionId: 'runtime-clarify'
+    })
+
+    renderClarifyForSurface(<ClarifyTool {...liveClarifyProps()} />, 'runtime-clarify', 'canonical-clarify')
+
+    const status = screen.getByRole('status')
+    expect(status.getAttribute('data-clarify-managed-block')).toBe('unsupported')
+    expect(status.textContent).toMatch(/not supported.*managed project/i)
+    expect(screen.queryByRole('button', { name: /Continue|Skip|staging|production/i })).toBeNull()
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('fails closed while a catalog-managed runtime is unavailable', () => {
+    $sessions.set([
+      {
+        id: 'canonical-clarify',
+        profile: 'default',
+        project_id: 'project-clarify'
+      } as SessionInfo
+    ])
+    $projects.set([{ id: 'project-clarify', managed: true } as ProjectInfo])
+    $projectRuntimes.set({})
+
+    renderClarifyForSurface(<ClarifyTool {...liveClarifyProps()} />, 'runtime-clarify', 'canonical-clarify')
+
+    expect(screen.getByRole('status').getAttribute('data-clarify-managed-block')).toBe('unsupported')
+    expect(screen.queryByRole('button')).toBeNull()
+  })
+
+  it('fails closed during boot when the surface has no durable stored identity', () => {
+    $sessions.set([])
+    $projectRuntimes.set({})
+
+    renderClarifyForSurface(<ClarifyTool {...liveClarifyProps()} />, 'runtime-unknown', null)
+
+    expect(screen.getByRole('status').getAttribute('data-clarify-managed-block')).toBe('unsupported')
+    expect(screen.queryByRole('button')).toBeNull()
   })
 })

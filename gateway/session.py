@@ -11,6 +11,7 @@ Handles:
 import asyncio
 import hashlib
 import logging
+import math
 import os
 import json
 import threading
@@ -18,7 +19,28 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Mapping,
+    Sequence,
+)
+
+from hermes_cli.project_runtime import (
+    Task7TerminalReadbackEvidence,
+    TerminalTranscriptConflict,
+    TurnReadbackRequest,
+    TurnReadbackResult,
+)
+
+if TYPE_CHECKING:
+    from hermes_state import SessionDB
 
 logger = logging.getLogger(__name__)
 
@@ -1140,11 +1162,947 @@ class _SessionFlight:
         self.error: Optional[BaseException] = None
 
 
+@dataclass(frozen=True)
+class ProjectBatchApplyResult:
+    outcome: Literal[
+        "wait",
+        "published",
+        "discarded",
+        "conflicted",
+        "already_published",
+        "already_discarded",
+        "already_conflicted",
+        "settlement_pending",
+        "remediation_pending",
+        "state_conflict",
+        "authority_conflict",
+    ]
+
+
+@dataclass(frozen=True)
+class ProjectHistorySnapshot:
+    session_id: str
+    messages: tuple[Mapping[str, object], ...]
+    message_count: int
+
+
+@dataclass(frozen=True)
+class ProjectBatchAuthorityDecision:
+    action: Literal["wait", "publish", "discard"]
+    discard_authority: Literal[
+        "stop_requested",
+        "cancelled",
+        "superseded_attempt",
+        "superseded_terminal",
+        "recovery_blocked",
+    ] | None
+
+
+class StateTask7TerminalReadbackAdapter:
+    """Narrow read-only Task-7 terminal evidence adapter over State."""
+
+    def __init__(self, store: "SessionDB") -> None:
+        from hermes_state import SessionDB
+
+        if not isinstance(store, SessionDB):
+            raise TypeError("store must be a SessionDB")
+        self._store = store
+
+    @staticmethod
+    def _unknown() -> Task7TerminalReadbackEvidence:
+        return Task7TerminalReadbackEvidence(
+            TurnReadbackResult("unknown"),
+            None,
+        )
+
+    @staticmethod
+    def _strict_terminal_snapshot(
+        snapshot: dict[str, object],
+        request: TurnReadbackRequest,
+    ) -> bool:
+        from hermes_state import _canonical_terminal_transcript
+
+        batch_id = snapshot.get("batch_id")
+        try:
+            parsed_batch_id = uuid.UUID(batch_id)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if not (
+            type(batch_id) is str
+            and parsed_batch_id.version == 4
+            and parsed_batch_id.variant == uuid.RFC_4122
+            and str(parsed_batch_id) == batch_id
+            and type(snapshot.get("batch_creation_sequence")) is int
+            and snapshot["batch_creation_sequence"] > 0
+            and snapshot.get("kind") == "terminal_result"
+            and type(snapshot.get("kind")) is str
+            and snapshot.get("project_id") == request.project_id
+            and type(snapshot.get("project_id")) is str
+            and snapshot.get("turn_id") == request.turn_id
+            and type(snapshot.get("turn_id")) is str
+            and snapshot.get("sequence") == request.sequence
+            and type(snapshot.get("sequence")) is int
+            and snapshot.get("worker_id") == request.worker_id
+            and type(snapshot.get("worker_id")) is str
+            and snapshot.get("attempt_id") == request.attempt_id
+            and type(snapshot.get("attempt_id")) is str
+            and snapshot.get("lease_generation")
+            == request.lease_generation
+            and type(snapshot.get("lease_generation")) is int
+            and snapshot.get("fencing_token")
+            == request.fencing_token
+            and type(snapshot.get("fencing_token")) is int
+            and snapshot.get("session_id")
+            == request.canonical_session_id
+            and type(snapshot.get("session_id")) is str
+            and type(snapshot.get("lease_expires_at")) is int
+            and 0
+            <= snapshot["lease_expires_at"]
+            <= request.lease_expires_at
+            and snapshot.get("terminal_status")
+            in {"succeeded", "failed"}
+            and type(snapshot.get("terminal_status")) is str
+            and snapshot.get("operation_id") is None
+            and snapshot.get("approval_id") is None
+            and type(snapshot.get("base_message_count")) is int
+            and snapshot["base_message_count"] >= 0
+            and type(snapshot.get("created_at")) in {int, float}
+            and math.isfinite(snapshot["created_at"])
+            and snapshot["created_at"] >= 0
+        ):
+            return False
+
+        transcript_json = snapshot.get("transcript_json")
+        transcript_sha256 = snapshot.get("transcript_sha256")
+        if not (
+            type(transcript_json) is str
+            and type(transcript_sha256) is str
+        ):
+            return False
+        try:
+            decoded = json.loads(
+                transcript_json,
+                parse_constant=lambda _: (_ for _ in ()).throw(
+                    ValueError()
+                ),
+            )
+            canonical = _canonical_terminal_transcript(decoded)
+            digest = hashlib.sha256(
+                transcript_json.encode("utf-8")
+            ).hexdigest()
+        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            return False
+        return (
+            canonical == transcript_json
+            and digest == transcript_sha256
+        )
+
+    def read_turn_with_evidence(
+        self,
+        request: TurnReadbackRequest,
+    ) -> Task7TerminalReadbackEvidence:
+        snapshots = (
+            self._store._task7_terminal_batch_evidence_snapshots(
+                request
+            )
+        )
+        if (
+            len(snapshots) != 1
+            or request.execution_state != "started"
+        ):
+            return self._unknown()
+        snapshot = snapshots[0]
+        if not self._strict_terminal_snapshot(snapshot, request):
+            return self._unknown()
+
+        state = snapshot.get("state")
+        clean_final_fields = (
+            snapshot.get("published_at") is None
+            and snapshot.get("projects_acknowledged_at") is None
+            and snapshot.get("transcript_conflict_key") is None
+            and snapshot.get("observed_message_count") is None
+            and snapshot.get("remediated_at") is None
+        )
+        if request.source_status == "claimed":
+            if not (
+                state == "prepared"
+                and type(state) is str
+                and clean_final_fields
+                and snapshot.get("discard_authority") is None
+            ):
+                return self._unknown()
+            batch_id = snapshot["batch_id"]
+            terminal_status = snapshot["terminal_status"]
+            return Task7TerminalReadbackEvidence(
+                TurnReadbackResult(terminal_status, batch_id),
+                batch_id,
+            )
+
+        if request.source_status == "stop_requested" and (
+            (
+                state == "prepared"
+                and type(state) is str
+                and snapshot.get("discard_authority") is None
+            )
+            or (
+                state == "discarded"
+                and type(state) is str
+                and snapshot.get("discard_authority")
+                == "stop_requested"
+            )
+        ) and clean_final_fields:
+            return Task7TerminalReadbackEvidence(
+                TurnReadbackResult("stopped"),
+                None,
+            )
+        return self._unknown()
+
+
+class ProjectBatchAuthorityResolver:
+    """Construction-bound access to one fresh Projects authority at a time."""
+
+    def __init__(
+        self,
+        projects_db_factory: Callable[[], Any],
+    ) -> None:
+        if not callable(projects_db_factory):
+            raise TypeError("projects_db_factory must be callable")
+        self._projects_db_factory = projects_db_factory
+
+    def resolve_prepared_terminal(
+        self,
+        attempt: Any,
+        *,
+        prepared_result_id: str,
+        status: Literal["succeeded", "failed"],
+    ) -> Any:
+        from hermes_cli.project_runtime import ProjectRuntime
+
+        connection = None
+        try:
+            connection = self._projects_db_factory()
+            return ProjectRuntime(
+                connection
+            ).resolve_prepared_terminal(
+                attempt,
+                prepared_result_id=prepared_result_id,
+                status=status,
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def resolve_approval_checkpoint(
+        self,
+        checkpoint: Any,
+    ) -> ProjectBatchAuthorityDecision:
+        from hermes_cli.project_operations import ProjectOperationGuard
+        from hermes_cli.project_runtime import ProjectRuntime
+
+        connection = None
+        try:
+            connection = self._projects_db_factory()
+            guard = ProjectOperationGuard(
+                ProjectRuntime(connection)
+            )
+            resolved, discard_authority = (
+                guard._resolve_approval_checkpoint_authority(
+                    checkpoint
+                )
+            )
+            return ProjectBatchAuthorityDecision(
+                resolved.action,
+                discard_authority,
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def ack_terminal_transcript_applied(
+        self,
+        acknowledgement: Any,
+    ) -> Literal["acknowledged", "already_acknowledged"]:
+        from hermes_cli.project_runtime import ProjectRuntime
+
+        connection = None
+        try:
+            connection = self._projects_db_factory()
+            return ProjectRuntime(
+                connection
+            ).ack_terminal_transcript_applied(
+                acknowledgement
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def record_terminal_transcript_conflict(
+        self,
+        conflict: TerminalTranscriptConflict,
+    ) -> Literal["recorded", "already_recorded"]:
+        from hermes_cli.project_runtime import ProjectRuntime
+
+        connection = None
+        try:
+            connection = self._projects_db_factory()
+            return ProjectRuntime(
+                connection
+            ).record_terminal_transcript_conflict(conflict)
+        finally:
+            if connection is not None:
+                connection.close()
+
+
+@dataclass(frozen=True)
+class FixedUpperPendingProjectBatchPage:
+    members: tuple[Any, ...]
+    scanned_through: Any | None
+    reached_epoch_end: bool
+
+    @property
+    def batches(self) -> tuple[Any, ...]:
+        return self.members
+
+
+class _FreshStateFacade:
+    def __init__(
+        self,
+        state_db_factory: Callable[[], Any],
+        *,
+        io_runner: Callable[..., Awaitable[Any]],
+    ) -> None:
+        if not callable(state_db_factory) or not callable(io_runner):
+            raise TypeError("state factory and I/O runner must be callable")
+        self._state_db_factory = state_db_factory
+        self._io_runner = io_runner
+
+    def _with_state(self, operation: Callable[[Any], Any]) -> Any:
+        connection = None
+        try:
+            connection = self._state_db_factory()
+            return operation(connection)
+        finally:
+            if connection is not None:
+                connection.close()
+
+    async def _run_state(
+        self,
+        operation: Callable[[Any], Any],
+    ) -> Any:
+        return await self._io_runner(self._with_state, operation)
+
+
+class ProjectBatchWorkerFacade(_FreshStateFacade):
+    """Fresh-connection State capabilities used by the canonical worker."""
+
+    def __init__(
+        self,
+        state_db_factory: Callable[[], Any],
+        *,
+        projects_db_factory: Callable[[], Any],
+        io_runner: Callable[..., Awaitable[Any]],
+    ) -> None:
+        super().__init__(state_db_factory, io_runner=io_runner)
+        if not callable(projects_db_factory):
+            raise TypeError("projects_db_factory must be callable")
+        self._projects_db_factory = projects_db_factory
+
+    async def load_project_history(
+        self,
+        session_id: str,
+    ) -> ProjectHistorySnapshot:
+        def load(connection: Any) -> ProjectHistorySnapshot:
+            direct = getattr(connection, "load_project_history", None)
+            if callable(direct):
+                return direct(session_id)
+            adapter = AsyncSessionStore(
+                connection,
+                projects_db_factory=self._projects_db_factory,
+            )
+            return adapter._load_project_history_sync(session_id)
+
+        return await self._run_state(load)
+
+    async def prepare_terminal_result(
+        self,
+        claim: Any,
+        *,
+        batch_id: str,
+        status: Literal["succeeded", "failed"],
+        base_message_count: int,
+        messages: Sequence[Mapping[str, object]],
+    ) -> Any:
+        return await self._run_state(
+            lambda connection: connection.prepare_terminal_result(
+                claim,
+                batch_id=batch_id,
+                status=status,
+                base_message_count=base_message_count,
+                messages=messages,
+            )
+        )
+
+    async def prepare_approval_checkpoint(
+        self,
+        claim: Any,
+        *,
+        batch_id: str,
+        operation_id: str,
+        approval_id: str,
+        base_message_count: int,
+        messages: Sequence[Mapping[str, object]],
+    ) -> Any:
+        return await self._run_state(
+            lambda connection: connection.prepare_approval_checkpoint(
+                claim,
+                batch_id=batch_id,
+                operation_id=operation_id,
+                approval_id=approval_id,
+                base_message_count=base_message_count,
+                messages=messages,
+            )
+        )
+
+    async def apply_project_batch(
+        self,
+        batch_id: str,
+    ) -> ProjectBatchApplyResult:
+        def apply(connection: Any) -> ProjectBatchApplyResult:
+            direct = getattr(connection, "apply_project_batch", None)
+            if callable(direct) and not hasattr(
+                connection,
+                "_project_batch_settlement_snapshot",
+            ):
+                resolver = ProjectBatchAuthorityResolver(
+                    self._projects_db_factory
+                )
+                return direct(batch_id, resolver)
+            adapter = AsyncSessionStore(
+                connection,
+                projects_db_factory=self._projects_db_factory,
+            )
+            return adapter._apply_project_batch_sync(batch_id)
+
+        return await self._run_state(apply)
+
+
+class ProjectBatchSettlementFacade(_FreshStateFacade):
+    """Fresh-connection fixed-upper State settlement capabilities."""
+
+    def __init__(
+        self,
+        state_db_factory: Callable[[], Any],
+        *,
+        projects_db_factory: Callable[[], Any],
+        io_runner: Callable[..., Awaitable[Any]],
+    ) -> None:
+        super().__init__(state_db_factory, io_runner=io_runner)
+        if not callable(projects_db_factory):
+            raise TypeError("projects_db_factory must be callable")
+        self._projects_db_factory = projects_db_factory
+
+    async def pending_project_batch_upper_watermark(self) -> Any | None:
+        return await self._run_state(
+            lambda connection: (
+                connection.pending_project_batch_upper_watermark()
+            )
+        )
+
+    async def scan_pending_project_batches(
+        self,
+        *,
+        after: Any | None,
+        through_batch_sequence: int,
+        limit: int,
+    ) -> Any:
+        def scan(connection: Any) -> Any:
+            direct = getattr(
+                connection,
+                "scan_pending_project_batches",
+                None,
+            )
+            if callable(direct):
+                return direct(
+                    after=after,
+                    through_batch_sequence=through_batch_sequence,
+                    limit=limit,
+                )
+            from hermes_state import ProjectBatchCursor
+
+            through = ProjectBatchCursor(
+                through_batch_sequence,
+                "ffffffff-ffff-4fff-bfff-ffffffffffff",
+            )
+            members = tuple(
+                connection.list_pending_project_batches(
+                    after=after,
+                    through=through,
+                    limit=limit,
+                )
+            )
+            scanned_through = (
+                ProjectBatchCursor(
+                    members[-1].batch_creation_sequence,
+                    members[-1].batch_id,
+                )
+                if members
+                else after
+            )
+            reached = (
+                True
+                if scanned_through is None
+                else not connection._pending_project_batches_remaining(
+                    after=scanned_through,
+                    through=through,
+                )
+            )
+            return FixedUpperPendingProjectBatchPage(
+                members,
+                scanned_through,
+                reached,
+            )
+
+        return await self._run_state(scan)
+
+    async def apply_project_batch(
+        self,
+        batch_id: str,
+    ) -> ProjectBatchApplyResult:
+        worker = ProjectBatchWorkerFacade(
+            self._state_db_factory,
+            projects_db_factory=self._projects_db_factory,
+            io_runner=self._io_runner,
+        )
+        return await worker.apply_project_batch(batch_id)
+
+
+class ProjectTask7TerminalReadbackFacade(_FreshStateFacade):
+    async def read_turn_with_evidence(
+        self,
+        request: TurnReadbackRequest,
+    ) -> Task7TerminalReadbackEvidence:
+        def read(connection: Any) -> Task7TerminalReadbackEvidence:
+            direct = getattr(connection, "read_turn_with_evidence", None)
+            if callable(direct):
+                return direct(request)
+            return StateTask7TerminalReadbackAdapter(
+                connection
+            ).read_turn_with_evidence(request)
+
+        return await self._run_state(read)
+
+
+class ProjectApprovalCheckpointReadFacade(_FreshStateFacade):
+    async def publication_state(self, checkpoint: Any) -> Any:
+        return await self._run_state(
+            lambda connection: connection.publication_state(checkpoint)
+        )
+
+
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
-    def __init__(self, store: "SessionStore") -> None:
+    def __init__(
+        self,
+        store: "SessionStore",
+        *,
+        projects_db_factory: Callable[[], Any] | None = None,
+    ) -> None:
         self._store = store
+        if projects_db_factory is None:
+            def default_projects_db_factory():
+                from hermes_cli import projects_db
+
+                return projects_db.connect()
+
+            projects_db_factory = default_projects_db_factory
+        self._project_batch_authority_resolver = (
+            ProjectBatchAuthorityResolver(projects_db_factory)
+        )
+
+    async def load_project_history(
+        self,
+        session_id: str,
+    ) -> ProjectHistorySnapshot:
+        return await asyncio.to_thread(
+            self._load_project_history_sync,
+            session_id,
+        )
+
+    def _state_store(self):
+        return getattr(self._store, "_db", None) or self._store
+
+    def _load_project_history_sync(
+        self,
+        session_id: str,
+    ) -> ProjectHistorySnapshot:
+        loader = getattr(self._store, "load_project_history", None)
+        if callable(loader):
+            return loader(session_id)
+        messages, message_count = self._state_store()._project_history_snapshot(
+            session_id
+        )
+        return ProjectHistorySnapshot(
+            session_id,
+            messages,
+            message_count,
+        )
+
+    async def prepare_terminal_result(
+        self,
+        claim,
+        *,
+        batch_id: str,
+        status: Literal["succeeded", "failed"],
+        base_message_count: int,
+        messages: Sequence[Mapping[str, object]],
+    ):
+        return await asyncio.to_thread(
+            self._state_store().prepare_terminal_result,
+            claim,
+            batch_id=batch_id,
+            status=status,
+            base_message_count=base_message_count,
+            messages=messages,
+        )
+
+    async def prepare_approval_checkpoint(
+        self,
+        claim,
+        *,
+        batch_id: str,
+        operation_id: str,
+        approval_id: str,
+        base_message_count: int,
+        messages: Sequence[Mapping[str, object]],
+    ):
+        return await asyncio.to_thread(
+            self._state_store().prepare_approval_checkpoint,
+            claim,
+            batch_id=batch_id,
+            operation_id=operation_id,
+            approval_id=approval_id,
+            base_message_count=base_message_count,
+            messages=messages,
+        )
+
+    async def apply_project_batch(
+        self,
+        batch_id: str,
+    ) -> ProjectBatchApplyResult:
+        return await asyncio.to_thread(
+            self._apply_project_batch_sync,
+            batch_id,
+        )
+
+    def _apply_project_batch_sync(
+        self,
+        batch_id: str,
+    ) -> ProjectBatchApplyResult:
+        from hermes_cli.project_operations import (
+            ApprovalCheckpointIdentity,
+        )
+        from hermes_cli.project_runtime import (
+            ProjectRuntimeError,
+            RuntimeErrorCode,
+            TerminalTranscriptAcknowledgement,
+            TerminalTranscriptConflict,
+            TurnAttemptIdentity,
+        )
+        from hermes_state import (
+            _ProjectBatchConflictReservation,
+            _project_batch_fingerprint,
+        )
+
+        state_store = getattr(self._store, "_db", None) or self._store
+        snapshot = state_store._project_batch_settlement_snapshot(
+            batch_id
+        )
+        if snapshot is None:
+            return ProjectBatchApplyResult("state_conflict")
+        state = snapshot["state"]
+        if state == "discarded":
+            return ProjectBatchApplyResult("already_discarded")
+        if snapshot["kind"] == "approval_checkpoint":
+            if not (
+                state in {
+                    "prepared",
+                    "published",
+                    "conflicted",
+                }
+                and snapshot["terminal_status"] is None
+                and type(snapshot["operation_id"]) is str
+                and bool(snapshot["operation_id"])
+                and type(snapshot["approval_id"]) is str
+                and bool(snapshot["approval_id"])
+                and snapshot["projects_acknowledged_at"] is None
+                and snapshot["transcript_conflict_key"] is None
+                and snapshot["observed_message_count"] is None
+                and snapshot["remediated_at"] is None
+                and snapshot["discard_authority"] is None
+            ):
+                return ProjectBatchApplyResult("state_conflict")
+            if state == "published":
+                if snapshot["published_at"] is None:
+                    return ProjectBatchApplyResult("state_conflict")
+                return ProjectBatchApplyResult("already_published")
+            if state == "conflicted":
+                if snapshot["published_at"] is not None:
+                    return ProjectBatchApplyResult("state_conflict")
+                return ProjectBatchApplyResult(
+                    "already_conflicted"
+                )
+            if snapshot["published_at"] is not None:
+                return ProjectBatchApplyResult("state_conflict")
+
+            attempt = TurnAttemptIdentity(
+                project_id=snapshot["project_id"],
+                turn_id=snapshot["turn_id"],
+                sequence=snapshot["sequence"],
+                worker_id=snapshot["worker_id"],
+                attempt_id=snapshot["attempt_id"],
+                lease_generation=snapshot["lease_generation"],
+                fencing_token=snapshot["fencing_token"],
+                canonical_session_id=snapshot["session_id"],
+                lease_expires_at=snapshot["lease_expires_at"],
+            )
+            checkpoint = ApprovalCheckpointIdentity(
+                batch_id,
+                attempt,
+                snapshot["operation_id"],
+                snapshot["approval_id"],
+            )
+            fingerprint = _project_batch_fingerprint(snapshot)
+            resolver = self._project_batch_authority_resolver
+            try:
+                authority = resolver.resolve_approval_checkpoint(
+                    checkpoint
+                )
+            except ProjectRuntimeError as exc:
+                if (
+                    exc.code
+                    is RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+                ):
+                    return ProjectBatchApplyResult(
+                        "authority_conflict"
+                    )
+                return ProjectBatchApplyResult(
+                    "authority_conflict"
+                )
+            except Exception:
+                return ProjectBatchApplyResult(
+                    "authority_conflict"
+                )
+            if authority.action == "wait":
+                return ProjectBatchApplyResult("wait")
+            if authority.action == "discard":
+                if authority.discard_authority is None:
+                    return ProjectBatchApplyResult(
+                        "authority_conflict"
+                    )
+                discarded = state_store._discard_project_batch(
+                    fingerprint,
+                    authority.discard_authority,
+                )
+                return ProjectBatchApplyResult(discarded)
+            if (
+                authority.action != "publish"
+                or authority.discard_authority is not None
+            ):
+                return ProjectBatchApplyResult(
+                    "authority_conflict"
+                )
+            published = (
+                state_store._publish_approval_project_batch(
+                    fingerprint
+                )
+            )
+            return ProjectBatchApplyResult(published)
+        if (
+            state == "published"
+            and snapshot["projects_acknowledged_at"] is not None
+        ):
+            return ProjectBatchApplyResult("already_published")
+        if (
+            snapshot["kind"] != "terminal_result"
+            or state not in {
+                "prepared",
+                "conflict_pending",
+                "conflicted",
+                "published",
+            }
+            or snapshot["terminal_status"]
+                not in {"succeeded", "failed"}
+        ):
+            return ProjectBatchApplyResult("state_conflict")
+
+        attempt = TurnAttemptIdentity(
+            project_id=snapshot["project_id"],
+            turn_id=snapshot["turn_id"],
+            sequence=snapshot["sequence"],
+            worker_id=snapshot["worker_id"],
+            attempt_id=snapshot["attempt_id"],
+            lease_generation=snapshot["lease_generation"],
+            fencing_token=snapshot["fencing_token"],
+            canonical_session_id=snapshot["session_id"],
+            lease_expires_at=snapshot["lease_expires_at"],
+        )
+        fingerprint = _project_batch_fingerprint(snapshot)
+        acknowledgement = TerminalTranscriptAcknowledgement(
+            batch_id=batch_id,
+            attempt=attempt,
+            status=snapshot["terminal_status"],
+            result_id=batch_id,
+        )
+        initial_state = state
+        resolver = self._project_batch_authority_resolver
+
+        if state == "prepared":
+            try:
+                resolved = resolver.resolve_prepared_terminal(
+                    attempt,
+                    prepared_result_id=batch_id,
+                    status=snapshot["terminal_status"],
+                )
+                authority = ProjectBatchAuthorityDecision(
+                    action=resolved.action,
+                    discard_authority=(
+                        resolved.discard_authority
+                    ),
+                )
+                if resolved.action == "publish":
+                    if not (
+                        resolved.terminal is not None
+                        and resolved.terminal.attempt == attempt
+                        and resolved.terminal.status
+                            == snapshot["terminal_status"]
+                        and resolved.terminal.result_id == batch_id
+                    ):
+                        return ProjectBatchApplyResult(
+                            "authority_conflict"
+                        )
+                    acknowledgement = (
+                        TerminalTranscriptAcknowledgement(
+                            batch_id=batch_id,
+                            attempt=resolved.terminal.attempt,
+                            status=resolved.terminal.status,
+                            result_id=resolved.terminal.result_id,
+                        )
+                    )
+            except ProjectRuntimeError as exc:
+                if (
+                    exc.code
+                    is RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+                ):
+                    return ProjectBatchApplyResult(
+                        "authority_conflict"
+                    )
+                return ProjectBatchApplyResult(
+                    "authority_conflict"
+                )
+
+            if authority.action == "wait":
+                return ProjectBatchApplyResult("wait")
+            if authority.action == "discard":
+                if authority.discard_authority is None:
+                    return ProjectBatchApplyResult(
+                        "authority_conflict"
+                    )
+                discarded = state_store._discard_project_batch(
+                    fingerprint,
+                    authority.discard_authority,
+                )
+                return ProjectBatchApplyResult(discarded)
+            if authority.action != "publish":
+                return ProjectBatchApplyResult("authority_conflict")
+
+            published = state_store._publish_project_batch(
+                fingerprint
+            )
+        elif state == "conflict_pending":
+            try:
+                published = state_store._publish_project_batch(
+                    fingerprint
+                )
+            except Exception:
+                return ProjectBatchApplyResult(
+                    "remediation_pending"
+                )
+        elif state == "conflicted":
+            published = state_store._publish_project_batch(
+                fingerprint
+            )
+        else:
+            published = "already_published"
+
+        if type(published) is _ProjectBatchConflictReservation:
+            conflict = TerminalTranscriptConflict(
+                terminal=acknowledgement,
+                conflict_key=published.conflict_key,
+                observed_message_count=(
+                    published.observed_message_count
+                ),
+            )
+            try:
+                recorded = (
+                    resolver.record_terminal_transcript_conflict(
+                        conflict
+                    )
+                )
+            except Exception:
+                return ProjectBatchApplyResult(
+                    "remediation_pending"
+                )
+            if recorded not in {"recorded", "already_recorded"}:
+                return ProjectBatchApplyResult(
+                    "remediation_pending"
+                )
+            try:
+                finalized = (
+                    state_store._finalize_project_batch_conflict(
+                        published
+                    )
+                )
+            except Exception:
+                return ProjectBatchApplyResult(
+                    "remediation_pending"
+                )
+            if finalized in {
+                "conflicted",
+                "already_conflicted",
+            }:
+                return ProjectBatchApplyResult(finalized)
+            return ProjectBatchApplyResult("remediation_pending")
+
+        if published == "already_conflicted":
+            return ProjectBatchApplyResult("already_conflicted")
+        if published not in {
+            "published",
+            "already_published",
+        }:
+            return ProjectBatchApplyResult(published)
+
+        try:
+            resolver.ack_terminal_transcript_applied(acknowledgement)
+        except Exception:
+            return ProjectBatchApplyResult("settlement_pending")
+
+        try:
+            state_ack = state_store._acknowledge_project_batch(
+                fingerprint
+            )
+        except Exception:
+            return ProjectBatchApplyResult("settlement_pending")
+        if state_ack not in {
+            "acknowledged",
+            "already_acknowledged",
+        }:
+            return ProjectBatchApplyResult("settlement_pending")
+        return ProjectBatchApplyResult(
+            "published"
+            if initial_state == "prepared"
+            else "already_published"
+        )
 
     def __getattr__(self, name: str):
         attr = getattr(self._store, name)
@@ -3215,6 +4173,17 @@ class SessionStore:
             logger.debug("Could not load messages from DB: %s", e)
             return []
 
+    def load_project_history(
+        self,
+        session_id: str,
+    ) -> ProjectHistorySnapshot:
+        if self._db is None:
+            raise RuntimeError("project history state store is unavailable")
+        messages, message_count = self._db._project_history_snapshot(
+            session_id
+        )
+        return ProjectHistorySnapshot(session_id, messages, message_count)
+
     def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete, keeping rows for audit.
 
@@ -3329,4 +4298,38 @@ def build_project_session_context(
         raise ValueError("Invalid canonical session_id")
     context = build_session_context(source, config, route_entry)
     context.session_id = canonical_session_id
+    return context
+
+
+def build_canonical_project_session_context(
+    project_id: str,
+    canonical_session_id: str,
+    config: GatewayConfig,
+    *,
+    session_key: str,
+) -> SessionContext:
+    """Build the surface-neutral context used to construct project agents."""
+    if type(project_id) is not str or not project_id:
+        raise ValueError("Invalid project_id")
+    if (
+        type(canonical_session_id) is not str
+        or not canonical_session_id
+        or _is_path_unsafe(canonical_session_id)
+    ):
+        raise ValueError("Invalid canonical session_id")
+    if not isinstance(config, GatewayConfig):
+        raise ValueError("config must be a GatewayConfig")
+    if (
+        type(session_key) is not str
+        or not session_key
+        or _is_session_key_unsafe(session_key)
+    ):
+        raise ValueError("Invalid project session_key")
+    source = SessionSource(
+        platform=Platform.LOCAL,
+        chat_id=f"project:{project_id}",
+    )
+    context = build_session_context(source, config)
+    context.session_id = canonical_session_id
+    context.session_key = session_key
     return context

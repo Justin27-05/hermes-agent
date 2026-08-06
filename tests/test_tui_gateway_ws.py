@@ -9,6 +9,54 @@ from tui_gateway import server
 from tui_gateway import ws as ws_mod
 
 
+def test_ws_rejects_duplicate_json_keys_before_dispatch(monkeypatch):
+    sent = []
+    received = 0
+    dispatch_calls = []
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "dispatch",
+        lambda *args, **kwargs: dispatch_calls.append((args, kwargs)),
+    )
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            nonlocal received
+            received += 1
+            if received == 1:
+                return (
+                    '{"id":"request-1","method":"project.command",'
+                    '"params":{"name":"turn.enqueue",'
+                    '"project_id":"project-1",'
+                    '"payload":{"message":"safe","message":"forged"},'
+                    '"idempotency_key":"turn-1","expected_version":0}}'
+                )
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    asyncio.run(ws_mod.handle_ws(FakeWS()))
+
+    assert dispatch_calls == []
+    assert sent[1] == {
+        "jsonrpc": "2.0",
+        "error": {"code": -32600, "message": "invalid request"},
+        "id": None,
+    }
+
+
 def test_ws_startup_starts_background_mcp_discovery(monkeypatch):
     """The desktop app and dashboard chat reach the agent through this WS
     sidecar, not through tui_gateway.entry.main() (which spawns the discovery

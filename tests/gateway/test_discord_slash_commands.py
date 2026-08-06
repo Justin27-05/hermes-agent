@@ -1,5 +1,6 @@
 """Tests for native Discord slash command fast-paths (thread creation & auto-thread)."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 import sys
@@ -159,6 +160,21 @@ async def test_registers_native_restart_slash_command(adapter):
 
 
 @pytest.mark.asyncio
+async def test_registers_native_managed_project_slash_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["project"](
+        interaction, command="status"
+    )
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/project status"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter):
     class UnknownInteraction(Exception):
         status = 404
@@ -184,6 +200,43 @@ async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter)
     assert event.source.chat_id == "123"
     interaction.edit_original_response.assert_not_awaited()
     interaction.delete_original_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rejected_native_slash_info_log_contains_no_raw_identity_or_arguments(
+    adapter,
+    caplog,
+):
+    secret_values = (
+        "private-project-name",
+        "sensitive-user-name",
+        "420000000000000001",
+        "420000000000000002",
+        "420000000000000003",
+    )
+    adapter._check_slash_authorization = AsyncMock(return_value=False)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(
+            id=int(secret_values[2]),
+            name=secret_values[1],
+        ),
+        channel=SimpleNamespace(id=int(secret_values[3])),
+        channel_id=int(secret_values[3]),
+        guild_id=int(secret_values[4]),
+    )
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="plugins.platforms.discord.adapter",
+    ):
+        await adapter._run_simple_slash(
+            interaction,
+            f"/project rename {secret_values[0]}",
+        )
+
+    rendered = caplog.text
+    assert "native slash invoked" in rendered
+    assert all(secret not in rendered for secret in secret_values)
 
 
 # ------------------------------------------------------------------
@@ -784,6 +837,207 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
         created_at=None,
         id=12345,
     )
+
+
+@pytest.mark.asyncio
+async def test_managed_project_owner_message_bypasses_mention_thread_and_batching(
+    adapter, monkeypatch
+):
+    """A managed project message must not enter Discord's conversational path."""
+    from gateway.project_surfaces import DiscordProjectWorkspaceConfig
+
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter.config.project_workspaces = DiscordProjectWorkspaceConfig(
+        enabled=True,
+        guild_id="1",
+        owner_user_id="42",
+        active_category_id="10",
+        completed_category_id="20",
+    )
+    adapter._allowed_user_ids = {"42"}
+    adapter._ready_event.set()
+    adapter.handle_message = AsyncMock()
+    adapter._auto_create_thread = AsyncMock()
+    adapter._enqueue_text_event = MagicMock()
+    channel = _FakeTextChannel(channel_id=100)
+    channel.category_id = 10
+    message = _fake_message(channel, content="zonder mention")
+    message.guild = channel.guild
+    message.type = _discord_mod.MessageType.default
+
+    handled = await adapter._dispatch_discord_message(message)
+
+    assert handled is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "zonder mention"
+    assert event.source.chat_id == "100"
+    assert event.source.user_id == "42"
+    assert event.source.message_id == "12345"
+    assert getattr(event, "_hermes_managed_project_candidate", False) is True
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter._enqueue_text_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reserved_project_workspace_rejects_wrong_owner_before_generic_dispatch(
+    adapter, monkeypatch
+):
+    """A reserved project location must not become a legacy conversation."""
+    from gateway.project_surfaces import DiscordProjectWorkspaceConfig
+
+    adapter.config.project_workspaces = DiscordProjectWorkspaceConfig(
+        enabled=True,
+        guild_id="1",
+        owner_user_id="42",
+        active_category_id="10",
+        completed_category_id="20",
+    )
+    adapter._allowed_user_ids = {"84"}
+    adapter._ready_event.set()
+    adapter.handle_message = AsyncMock()
+    adapter._handle_message = AsyncMock(return_value=True)
+    adapter._auto_create_thread = AsyncMock()
+    adapter._enqueue_text_event = MagicMock()
+    channel = _FakeTextChannel(channel_id=100)
+    channel.category_id = 10
+    message = _fake_message(channel, author_id=84)
+    message.guild = channel.guild
+    message.type = _discord_mod.MessageType.default
+
+    handled = await adapter._dispatch_discord_message(message)
+
+    assert handled is False
+    adapter.handle_message.assert_not_awaited()
+    adapter._handle_message.assert_not_awaited()
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter._enqueue_text_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_completed_project_workspace_is_reserved_and_bypasses_generic_dispatch(
+    adapter,
+):
+    """The completed category is reserved even though its project is read-only."""
+    from gateway.project_surfaces import DiscordProjectWorkspaceConfig
+
+    adapter.config.project_workspaces = DiscordProjectWorkspaceConfig(
+        enabled=True,
+        guild_id="1",
+        owner_user_id="42",
+        active_category_id="10",
+        completed_category_id="20",
+    )
+    adapter._allowed_user_ids = {"42"}
+    adapter._ready_event.set()
+    adapter.handle_message = AsyncMock()
+    adapter._handle_message = AsyncMock(return_value=True)
+    channel = _FakeThreadChannel(channel_id=201, parent_id=101)
+    channel.parent.category_id = 20
+    message = _fake_message(channel)
+    message.guild = channel.guild
+    message.type = _discord_mod.MessageType.default
+
+    handled = await adapter._dispatch_discord_message(message)
+
+    assert handled is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.thread_id == "201"
+    assert getattr(event, "_hermes_managed_project_candidate", False) is True
+    adapter._handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reserved_project_workspace_rejects_bot_before_all_dispatch(
+    adapter,
+    monkeypatch,
+):
+    from gateway.project_surfaces import DiscordProjectWorkspaceConfig
+
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    adapter.config.project_workspaces = DiscordProjectWorkspaceConfig(
+        enabled=True,
+        guild_id="1",
+        owner_user_id="42",
+        active_category_id="10",
+        completed_category_id="20",
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._handle_message = AsyncMock(return_value=True)
+    channel = _FakeTextChannel(channel_id=100)
+    channel.category_id = 10
+    message = _fake_message(channel)
+    message.author.bot = True
+    message.guild = channel.guild
+    message.type = _discord_mod.MessageType.default
+
+    handled = await adapter._dispatch_discord_message(message)
+
+    assert handled is False
+    adapter.handle_message.assert_not_awaited()
+    adapter._handle_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "topic",
+    (
+        None,
+        "foreign-project:v1:" + "a" * 64,
+        "hermes-project:v1:" + "a" * 63,
+        "hermes-project:v1:" + "a" * 64 + "-extra",
+    ),
+)
+@pytest.mark.asyncio
+async def test_channel_outside_reserved_categories_keeps_legacy_dispatch(
+    adapter,
+    topic,
+):
+    from gateway.project_surfaces import DiscordProjectWorkspaceConfig
+
+    adapter.config.project_workspaces = DiscordProjectWorkspaceConfig(
+        enabled=True,
+        guild_id="1",
+        owner_user_id="42",
+        active_category_id="10",
+        completed_category_id="20",
+    )
+    adapter._allowed_user_ids = {"42"}
+    adapter._ready_event.set()
+    adapter.handle_message = AsyncMock()
+    adapter._handle_message = AsyncMock(return_value=True)
+    channel = _FakeTextChannel(channel_id=100)
+    channel.category_id = 99
+    channel.topic = topic
+    message = _fake_message(channel)
+    message.guild = channel.guild
+    message.type = _discord_mod.MessageType.default
+
+    handled = await adapter._dispatch_discord_message(message)
+
+    assert handled is True
+    adapter.handle_message.assert_not_awaited()
+    adapter._handle_message.assert_awaited_once_with(
+        message,
+        role_authorized=False,
+    )
+
+
+def test_project_slash_event_keeps_guild_and_interaction_identity(adapter):
+    channel = _FakeTextChannel(channel_id=100)
+    interaction = SimpleNamespace(
+        channel=channel,
+        channel_id=100,
+        guild_id=1,
+        id=98765,
+        user=SimpleNamespace(id=42, display_name="Jezza"),
+    )
+
+    event = adapter._build_slash_event(interaction, "/project status")
+
+    assert event.source.scope_id == "1"
+    assert event.source.message_id == "98765"
+    assert event.message_id == "98765"
 
 
 @pytest.mark.asyncio

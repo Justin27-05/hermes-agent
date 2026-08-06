@@ -232,6 +232,13 @@ _LONG_HANDLERS = frozenset(
         "pet.thumb",
         "learning.frames",
         "plugins.manage",
+        # Opens/migrates projects.db and may wait behind another SQLite writer.
+        # CAS/idempotency keep concurrent calls deterministic while the pool
+        # keeps stdio interrupts and approval responses readable.
+        "project.command",
+        "project.runtime.snapshot",
+        "project.runtime.events",
+        "project.runtime.ack",
         # reload.mcp shuts down and rediscovers every MCP server — with a
         # flapping server (retry loops, connect timeouts up to 120s) that can
         # block for minutes. Inline it froze the reader thread: config.set,
@@ -1583,8 +1590,17 @@ def _ok(rid, result: dict) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "result": result}
 
 
-def _err(rid, code: int, msg: str) -> dict:
-    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}}
+def _err(
+    rid,
+    code: int,
+    msg: str,
+    *,
+    data: dict | None = None,
+) -> dict:
+    error = {"code": code, "message": msg}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": rid, "error": error}
 
 
 def method(name: str):
@@ -1604,6 +1620,16 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     method = req.get("method")
     if not isinstance(method, str) or not method:
         return _err(rid, -32600, "invalid request: method must be a non-empty string")
+    if method in {
+        "project.command",
+        "project.runtime.snapshot",
+        "project.runtime.events",
+        "project.runtime.ack",
+    } and (
+        req.get("jsonrpc") != "2.0"
+        or set(req) != {"jsonrpc", "id", "method", "params"}
+    ):
+        return _err(rid, -32600, "invalid request")
 
     params = req.get("params", {})
     if params is None:
@@ -13483,17 +13509,340 @@ def _(rid, params: dict) -> dict:
 _E_PROJECTS = 5061  # generic failure
 _E_NO_PROJECT = 5062  # id resolved to nothing
 _E_PROJECT_ARG = 5063  # invalid argument (e.g. bad name/slug)
+_E_PROJECT_MANAGED_DELETE = 5064
+_E_PROJECT_COMMAND = 5065
+_E_PROJECT_MANAGED_ARCHIVE = 5066
+_E_PROJECT_MANAGED_MUTATION = 5067
+_E_PROJECT_RUNTIME = 5068
 
 
 class _NoProject(Exception):
     """Raised inside a projects handler when ``params['id']`` resolves to None."""
 
 
+def _project_runtime_error(rid, code: str) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": rid,
+        "error": {
+            "code": _E_PROJECT_RUNTIME,
+            "message": "project runtime read rejected",
+            "data": {"code": code},
+        },
+    }
+
+
+def _trusted_desktop_project_actor(
+    conn,
+    *,
+    project_id: str,
+    requested_binding_id: str | None = None,
+):
+    """Resolve exactly one local Desktop owner without exposing its target."""
+    from hermes_cli import project_runtime_db as runtime_db
+    from hermes_cli.project_policy import ActorContext
+
+    bindings = tuple(
+        binding
+        for binding in runtime_db.bindings_for_project(
+            conn,
+            project_id=project_id,
+        )
+        if (
+            binding.surface == "desktop"
+            and binding.actor_id == "local-owner"
+        )
+    )
+    if (
+        len(bindings) != 1
+        or (
+            requested_binding_id is not None
+            and bindings[0].binding_id != requested_binding_id
+        )
+    ):
+        return None
+    binding = bindings[0]
+    return ActorContext(
+        binding.actor_id,
+        "desktop",
+        binding.binding_id,
+        True,
+    )
+
+
+@method("project.command")
+def _project_command(rid, params: dict) -> dict:
+    """Compose one ephemeral desktop command lane over the canonical runtime."""
+    from hermes_cli import project_runtime_db as runtime_db
+    from hermes_cli import projects_db as pdb
+    from hermes_cli.project_command_service import ProjectCommandService
+    from hermes_cli.project_operations import ProjectOperationGuard
+    from hermes_cli.project_policy import ActorContext
+    from hermes_cli.project_runtime import ProjectRuntime
+    from tui_gateway.project_runtime_rpc import (
+        ProjectRuntimeRpc,
+        StrictJsonError,
+        parse_project_command_params,
+    )
+
+    try:
+        parsed_command = parse_project_command_params(params)
+    except StrictJsonError:
+        return {
+            "jsonrpc": "2.0",
+            "id": rid,
+            "error": {
+                "code": _E_PROJECT_COMMAND,
+                "message": "project command rejected",
+                "data": {"code": "invalid_request"},
+            },
+        }
+    project_id = parsed_command.project_id
+    try:
+        with pdb.connect_closing() as conn:
+            if project_id is None:
+                binding_digest = hashlib.sha256(
+                    (
+                        "local-owner\0"
+                        f"{parsed_command.idempotency_key}"
+                    ).encode("utf-8")
+                ).hexdigest()[:24]
+                actor = ActorContext(
+                    "local-owner",
+                    "desktop",
+                    f"desktop-{binding_digest}",
+                    True,
+                )
+            else:
+                bindings = tuple(
+                    binding
+                    for binding in runtime_db.bindings_for_project(
+                        conn, project_id=str(project_id)
+                    )
+                    if (
+                        binding.surface == "desktop"
+                        and binding.actor_id == "local-owner"
+                    )
+                )
+                if len(bindings) != 1:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": rid,
+                        "error": {
+                            "code": _E_PROJECT_COMMAND,
+                            "message": "project command rejected",
+                            "data": {
+                                "code": "PROJECT_COMMAND_ACTOR_UNAVAILABLE"
+                            },
+                        },
+                    }
+                binding = bindings[0]
+                actor = ActorContext(
+                    binding.actor_id,
+                    "desktop",
+                    binding.binding_id,
+                    True,
+                )
+            runtime = ProjectRuntime(conn)
+            rpc = ProjectRuntimeRpc(
+                service=ProjectCommandService(
+                    runtime=runtime,
+                    operations=ProjectOperationGuard(runtime),
+                ),
+                actor_factory=lambda: actor,
+            )
+            raw = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "local-project-command",
+                    "method": "project.command",
+                    "params": params,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            result = json.loads(rpc.handle_raw(raw))
+    except (TypeError, ValueError):
+        result = {
+            "ok": False,
+            "error": {"code": "invalid_request"},
+        }
+    except Exception:
+        result = {
+            "ok": False,
+            "error": {"code": "internal_error"},
+        }
+    if result.get("ok") is True:
+        projection = result.get("result")
+        if isinstance(projection, dict):
+            hint_project_id = projection.get("project_id")
+            highest_sequence = projection.get(
+                "last_event_sequence"
+            )
+            if (
+                type(hint_project_id) is str
+                and hint_project_id
+                and type(highest_sequence) is int
+                and highest_sequence >= 0
+            ):
+                try:
+                    _broadcast_global_event(
+                        "project.event",
+                        {
+                            "project_id": hint_project_id,
+                            "highest_sequence": highest_sequence,
+                        },
+                    )
+                except Exception:
+                    logger.debug(
+                        "project event hint broadcast failed",
+                        exc_info=True,
+                    )
+        return _ok(rid, result["result"])
+    return {
+        "jsonrpc": "2.0",
+        "id": rid,
+        "error": {
+            "code": _E_PROJECT_COMMAND,
+            "message": "project command rejected",
+            "data": result.get(
+                "error", {"code": "internal_error"}
+            ),
+        },
+    }
+
+
+def _project_runtime_read(
+    rid,
+    method_name: str,
+    params: dict,
+) -> dict:
+    """Compose one ephemeral, exact-owner Desktop read lane."""
+    from hermes_cli import projects_db as pdb
+    from hermes_cli.project_command_service import ProjectCommandService
+    from hermes_cli.project_operations import ProjectOperationGuard
+    from hermes_cli.project_runtime import ProjectRuntime
+    from tui_gateway.project_runtime_rpc import (
+        ProjectRuntimeReadService,
+        ProjectRuntimeRpc,
+        StrictJsonError,
+        parse_project_runtime_read_params,
+    )
+
+    try:
+        parsed = parse_project_runtime_read_params(
+            method_name,
+            params,
+        )
+    except StrictJsonError:
+        return _project_runtime_error(rid, "invalid_request")
+    project_id = parsed[0]
+    requested_binding_id = (
+        parsed[1] if method_name == "project.runtime.ack" else None
+    )
+    try:
+        with pdb.connect_closing() as conn:
+            actor = _trusted_desktop_project_actor(
+                conn,
+                project_id=project_id,
+                requested_binding_id=requested_binding_id,
+            )
+            if actor is None:
+                return _project_runtime_error(
+                    rid,
+                    "PROJECT_RUNTIME_REJECTED",
+                )
+            runtime = ProjectRuntime(conn)
+            rpc = ProjectRuntimeRpc(
+                service=ProjectCommandService(
+                    runtime=runtime,
+                    operations=ProjectOperationGuard(runtime),
+                ),
+                read_service=ProjectRuntimeReadService(
+                    conn=conn,
+                    runtime=runtime,
+                    transcript_loader=lambda session_id: (
+                        _db._project_history_snapshot(session_id)
+                    ),
+                    clock=lambda: int(time.time()),
+                ),
+                actor_factory=lambda: actor,
+            )
+            raw = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "local-project-runtime-read",
+                    "method": method_name,
+                    "params": params,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            result = json.loads(rpc.handle_raw(raw))
+    except Exception:
+        result = {
+            "ok": False,
+            "error": {"code": "internal_error"},
+        }
+    if result.get("ok") is True:
+        return _ok(rid, result["result"])
+    error = result.get("error")
+    code = (
+        error.get("code")
+        if isinstance(error, dict)
+        and type(error.get("code")) is str
+        else "internal_error"
+    )
+    return _project_runtime_error(rid, code)
+
+
+@method("project.runtime.snapshot")
+def _project_runtime_snapshot(rid, params: dict) -> dict:
+    return _project_runtime_read(
+        rid,
+        "project.runtime.snapshot",
+        params,
+    )
+
+
+@method("project.runtime.events")
+def _project_runtime_events(rid, params: dict) -> dict:
+    return _project_runtime_read(
+        rid,
+        "project.runtime.events",
+        params,
+    )
+
+
+@method("project.runtime.ack")
+def _project_runtime_ack(rid, params: dict) -> dict:
+    return _project_runtime_read(
+        rid,
+        "project.runtime.ack",
+        params,
+    )
+
+
+def _project_payload(pdb, conn, project) -> dict:
+    payload = project.to_dict()
+    payload["managed"] = pdb.project_is_managed(
+        conn,
+        project.id,
+    )
+    return payload
+
+
 def _projects_payload(conn) -> dict:
     from hermes_cli import projects_db as pdb
 
     return {
-        "projects": [p.to_dict() for p in pdb.list_projects(conn, include_archived=True)],
+        "projects": [
+            _project_payload(pdb, conn, project)
+            for project in pdb.list_projects(
+                conn,
+                include_archived=True,
+            )
+        ],
         "active_id": pdb.get_active_id(conn),
     }
 
@@ -13516,6 +13865,39 @@ def _projects_method(name: str):
                     return fn(rid, params, pdb, conn)
             except _NoProject:
                 return _err(rid, _E_NO_PROJECT, "no such project")
+            except pdb.ManagedProjectDeleteError:
+                return _err(
+                    rid,
+                    _E_PROJECT_MANAGED_DELETE,
+                    "managed projects cannot be deleted; complete and archive the project instead",
+                    data={
+                        "code": pdb.PROJECT_MANAGED_DELETE_FORBIDDEN
+                    },
+                )
+            except pdb.ManagedProjectArchiveError:
+                return _err(
+                    rid,
+                    _E_PROJECT_MANAGED_ARCHIVE,
+                    "managed projects must be completed before archiving",
+                    data={
+                        "code": (
+                            pdb
+                            .PROJECT_MANAGED_ARCHIVE_REQUIRES_COMPLETION
+                        )
+                    },
+                )
+            except pdb.ManagedProjectMutationError:
+                return _err(
+                    rid,
+                    _E_PROJECT_MANAGED_MUTATION,
+                    "managed projects must be changed through the canonical project command",
+                    data={
+                        "code": (
+                            pdb
+                            .PROJECT_MANAGED_MUTATION_REQUIRES_COMMAND
+                        )
+                    },
+                )
             except ValueError as e:
                 return _err(rid, _E_PROJECT_ARG, str(e))
             except Exception as e:
@@ -13541,7 +13923,16 @@ def _(rid, params, pdb, conn) -> dict:
 
 @_projects_method("projects.get")
 def _(rid, params, pdb, conn) -> dict:
-    return _ok(rid, {"project": _require_project(pdb, conn, params).to_dict()})
+    return _ok(
+        rid,
+        {
+            "project": _project_payload(
+                pdb,
+                conn,
+                _require_project(pdb, conn, params),
+            )
+        },
+    )
 
 
 @_projects_method("projects.create")
@@ -13560,7 +13951,16 @@ def _(rid, params, pdb, conn) -> dict:
     if params.get("use"):
         pdb.set_active(conn, pid)
     proj = pdb.get_project(conn, pid)
-    return _ok(rid, {"project": proj.to_dict() if proj else None})
+    return _ok(
+        rid,
+        {
+            "project": (
+                _project_payload(pdb, conn, proj)
+                if proj
+                else None
+            )
+        },
+    )
 
 
 @_projects_method("projects.update")
@@ -13575,7 +13975,16 @@ def _(rid, params, pdb, conn) -> dict:
         color=params.get("color"),
         board_slug=params.get("board_slug"),
     )
-    return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+    return _ok(
+        rid,
+        {
+            "project": _project_payload(
+                pdb,
+                conn,
+                pdb.get_project(conn, proj.id),
+            )
+        },
+    )
 
 
 @_projects_method("projects.add_folder")
@@ -13588,21 +13997,48 @@ def _(rid, params, pdb, conn) -> dict:
         label=params.get("label"),
         is_primary=bool(params.get("is_primary")),
     )
-    return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+    return _ok(
+        rid,
+        {
+            "project": _project_payload(
+                pdb,
+                conn,
+                pdb.get_project(conn, proj.id),
+            )
+        },
+    )
 
 
 @_projects_method("projects.remove_folder")
 def _(rid, params, pdb, conn) -> dict:
     proj = _require_project(pdb, conn, params)
     pdb.remove_folder(conn, proj.id, str(params.get("path") or ""))
-    return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+    return _ok(
+        rid,
+        {
+            "project": _project_payload(
+                pdb,
+                conn,
+                pdb.get_project(conn, proj.id),
+            )
+        },
+    )
 
 
 @_projects_method("projects.set_primary")
 def _(rid, params, pdb, conn) -> dict:
     proj = _require_project(pdb, conn, params)
     pdb.set_primary(conn, proj.id, str(params.get("path") or ""))
-    return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+    return _ok(
+        rid,
+        {
+            "project": _project_payload(
+                pdb,
+                conn,
+                pdb.get_project(conn, proj.id),
+            )
+        },
+    )
 
 
 @_projects_method("projects.archive")
@@ -13629,7 +14065,18 @@ def _(rid, params, pdb, conn) -> dict:
 def _(rid, params, pdb, conn) -> dict:
     cwd = _completion_cwd({"cwd": str(params.get("cwd") or "").strip()} if params.get("cwd") else {})
     proj = pdb.project_for_path(conn, cwd)
-    return _ok(rid, {"project": proj.to_dict() if proj else None, "cwd": cwd, "branch": _git_branch_for_cwd(cwd)})
+    return _ok(
+        rid,
+        {
+            "project": (
+                _project_payload(pdb, conn, proj)
+                if proj
+                else None
+            ),
+            "cwd": cwd,
+            "branch": _git_branch_for_cwd(cwd),
+        },
+    )
 
 
 def _is_repo_junk(root: str) -> bool:

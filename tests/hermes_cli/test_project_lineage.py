@@ -286,10 +286,11 @@ def test_migration_fails_closed_on_a_disconnected_parent_cycle(tmp_path):
         ) VALUES ('cycle-b', 'p_one', 'cycle-a', 'root', 3);
         INSERT INTO project_runtime_state (
             project_id, lifecycle, current_phase, version,
-            conversation_root_id, conversation_tip_id, updated_at
+            conversation_root_id, conversation_tip_id,
+            dispatch_membership_sequence, updated_at
         ) VALUES (
             'p_one', 'active', 'implementation', 0,
-            'root', 'cycle-a', 4
+            'root', 'cycle-a', 1, 4
         );
         """
     )

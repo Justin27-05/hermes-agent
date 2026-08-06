@@ -82,3 +82,71 @@ def test_use_clear(tmp_path):
 def test_unknown_project_returns_error(capsys, tmp_path):
     assert _run(["show", "nope"]) == 1
     assert "no such project" in capsys.readouterr().err
+
+
+def test_delete_legacy_project_and_reject_managed_project(
+    capsys, tmp_path
+):
+    _run(["create", "Legacy", str(tmp_path / "legacy"), "--use"])
+    assert _run(["delete", "legacy"]) == 0
+    assert "Deleted legacy" in capsys.readouterr().out
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "legacy") is None
+        assert pdb.get_active_id(conn) is None
+
+    _run(["create", "Managed", str(tmp_path / "managed")])
+    with pdb.connect_closing() as conn:
+        from hermes_cli import project_runtime_db as prdb
+
+        project = pdb.get_project(conn, "managed")
+        prdb.bind_surface(
+            conn,
+            binding_id="desktop-managed",
+            project_id=project.id,
+            surface="desktop",
+            external_binding_id="window-managed",
+            actor_id="owner-1",
+            now=1,
+        )
+
+    assert _run(["delete", "managed"]) == 2
+    error = capsys.readouterr().err
+    assert "PROJECT_MANAGED_DELETE_FORBIDDEN" in error
+    assert "archive" in error.lower()
+    assert "sqlite" not in error.lower()
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "managed") is not None
+
+
+def test_managed_rename_and_active_archive_require_canonical_lifecycle(
+    capsys, tmp_path
+):
+    _run(["create", "Managed lifecycle", str(tmp_path / "managed")])
+    with pdb.connect_closing() as conn:
+        from hermes_cli import project_runtime_db as prdb
+
+        project = pdb.get_project(conn, "managed-lifecycle")
+        prdb.create_project_conversation(
+            conn,
+            project_id=project.id,
+            conversation_id="managed-cli-session",
+            current_phase="implementation",
+            now=1,
+        )
+
+    assert _run(
+        ["rename", "managed-lifecycle", "Bypassed"]
+    ) == 2
+    assert (
+        "PROJECT_MANAGED_MUTATION_REQUIRES_COMMAND"
+        in capsys.readouterr().err
+    )
+    assert _run(["archive", "managed-lifecycle"]) == 2
+    assert (
+        "PROJECT_MANAGED_ARCHIVE_REQUIRES_COMPLETION"
+        in capsys.readouterr().err
+    )
+    with pdb.connect_closing() as conn:
+        project = pdb.get_project(conn, "managed-lifecycle")
+        assert project.name == "Managed lifecycle"
+        assert project.archived is False

@@ -16,8 +16,10 @@ Key design decisions:
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -25,7 +27,21 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+)
 
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
@@ -38,7 +54,11 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from hermes_cli.project_runtime import (
+    TurnAttemptIdentity,
+    TurnClaim,
+    TurnReadbackRequest,
+)
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -260,9 +280,41 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
 
 T = TypeVar("T")
 
+
+@dataclass(frozen=True)
+class ProjectBatchCursor:
+    batch_creation_sequence: int
+    batch_id: str
+
+
+@dataclass(frozen=True)
+class PendingProjectBatch:
+    batch_id: str
+    batch_creation_sequence: int
+    kind: Literal["terminal_result", "approval_checkpoint"]
+    state: Literal["prepared", "conflict_pending", "published"]
+    attempt: TurnAttemptIdentity
+    terminal_status: Literal["succeeded", "failed"] | None
+    operation_id: str | None
+    approval_id: str | None
+    base_message_count: int
+    created_at: float
+
+
+@dataclass(frozen=True)
+class _ProjectBatchConflictReservation:
+    fingerprint: tuple[object, ...]
+    conflict_key: str
+    observed_message_count: int
+
+
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
+PROJECT_BATCH_SCAN_PROGRESS_CALLBACK_LIMIT = 2_000
+_SQLITE_INT_MAX = (1 << 63) - 1
+_MAX_PERSISTED_TIMESTAMP_INT = 253_402_300_799
+_MAX_PERSISTED_TIMESTAMP = 253_402_300_799.0
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
@@ -1269,6 +1321,217 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS project_batch_sequence_counter (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    last_sequence INTEGER NOT NULL
+                  CHECK (
+                      typeof(last_sequence) = 'integer'
+                      AND last_sequence >= 0
+                      AND last_sequence <= 9223372036854775807
+                  )
+);
+INSERT OR IGNORE INTO project_batch_sequence_counter(
+    singleton, last_sequence
+) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS project_turn_transcript_batches (
+    batch_id TEXT PRIMARY KEY,
+    batch_creation_sequence INTEGER NOT NULL
+        CHECK (
+            typeof(batch_creation_sequence) = 'integer'
+            AND batch_creation_sequence > 0
+        ),
+    kind TEXT NOT NULL
+        CHECK (
+            kind IN ('terminal_result', 'approval_checkpoint')
+        ),
+    session_id TEXT NOT NULL
+        REFERENCES sessions(id) ON DELETE RESTRICT,
+    project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+    turn_id TEXT NOT NULL CHECK (length(turn_id) > 0),
+    sequence INTEGER NOT NULL
+        CHECK (typeof(sequence) = 'integer' AND sequence > 0),
+    worker_id TEXT NOT NULL CHECK (length(worker_id) > 0),
+    attempt_id TEXT NOT NULL CHECK (length(attempt_id) > 0),
+    lease_generation INTEGER NOT NULL
+        CHECK (
+            typeof(lease_generation) = 'integer'
+            AND lease_generation > 0
+        ),
+    fencing_token INTEGER NOT NULL
+        CHECK (
+            typeof(fencing_token) = 'integer'
+            AND fencing_token > 0
+        ),
+    lease_expires_at INTEGER NOT NULL
+        CHECK (
+            typeof(lease_expires_at) = 'integer'
+            AND lease_expires_at >= 0
+        ),
+    terminal_status TEXT
+        CHECK (
+            terminal_status IS NULL
+            OR terminal_status IN ('succeeded', 'failed')
+        ),
+    operation_id TEXT,
+    approval_id TEXT,
+    base_message_count INTEGER NOT NULL
+        CHECK (
+            typeof(base_message_count) = 'integer'
+            AND base_message_count >= 0
+        ),
+    transcript_json TEXT NOT NULL,
+    transcript_sha256 TEXT NOT NULL
+        CHECK (length(transcript_sha256) = 64),
+    state TEXT NOT NULL
+        CHECK (
+            state IN (
+                'prepared',
+                'published',
+                'discarded',
+                'conflict_pending',
+                'conflicted'
+            )
+        ),
+    created_at REAL NOT NULL
+        CHECK (
+            created_at >= 0
+            AND created_at <= 253402300799.0
+        ),
+    published_at REAL,
+    projects_acknowledged_at REAL,
+    transcript_conflict_key TEXT,
+    observed_message_count INTEGER,
+    remediated_at REAL,
+    discard_authority TEXT,
+    CHECK (
+        (
+            kind = 'terminal_result'
+            AND terminal_status IS NOT NULL
+            AND operation_id IS NULL
+            AND approval_id IS NULL
+        )
+        OR (
+            kind = 'approval_checkpoint'
+            AND terminal_status IS NULL
+            AND typeof(operation_id) = 'text'
+            AND length(operation_id) > 0
+            AND typeof(approval_id) = 'text'
+            AND length(approval_id) > 0
+        )
+    ),
+    CHECK (
+        (
+            state = 'published'
+            AND published_at IS NOT NULL
+        )
+        OR (
+            state != 'published'
+            AND published_at IS NULL
+        )
+    ),
+    CHECK (
+        published_at IS NULL
+        OR (
+            published_at >= 0
+            AND published_at <= 253402300799.0
+        )
+    ),
+    CHECK (
+        projects_acknowledged_at IS NULL
+        OR (
+            kind = 'terminal_result'
+            AND state = 'published'
+            AND projects_acknowledged_at >= 0
+            AND projects_acknowledged_at <= 253402300799.0
+        )
+    ),
+    CHECK (
+        kind != 'approval_checkpoint'
+        OR projects_acknowledged_at IS NULL
+    ),
+    CHECK (
+        (
+            state = 'discarded'
+            AND discard_authority IN (
+                'stop_requested',
+                'cancelled',
+                'superseded_attempt',
+                'superseded_terminal',
+                'recovery_blocked'
+            )
+        )
+        OR (
+            state != 'discarded'
+            AND discard_authority IS NULL
+        )
+    ),
+    CHECK (
+        (
+            state IN ('prepared', 'published', 'discarded')
+            AND transcript_conflict_key IS NULL
+            AND observed_message_count IS NULL
+            AND remediated_at IS NULL
+        )
+        OR (
+            state = 'conflict_pending'
+            AND kind = 'terminal_result'
+            AND typeof(transcript_conflict_key) = 'text'
+            AND length(transcript_conflict_key) > 0
+            AND typeof(observed_message_count) = 'integer'
+            AND observed_message_count >= 0
+            AND published_at IS NULL
+            AND projects_acknowledged_at IS NULL
+            AND remediated_at IS NULL
+        )
+        OR (
+            state = 'conflicted'
+            AND kind = 'terminal_result'
+            AND typeof(transcript_conflict_key) = 'text'
+            AND length(transcript_conflict_key) > 0
+            AND typeof(observed_message_count) = 'integer'
+            AND observed_message_count >= 0
+            AND published_at IS NULL
+            AND projects_acknowledged_at IS NULL
+            AND remediated_at IS NOT NULL
+            AND remediated_at >= 0
+            AND remediated_at <= 253402300799.0
+        )
+        OR (
+            state = 'conflicted'
+            AND kind = 'approval_checkpoint'
+            AND published_at IS NULL
+            AND projects_acknowledged_at IS NULL
+            AND transcript_conflict_key IS NULL
+            AND observed_message_count IS NULL
+            AND remediated_at IS NULL
+            AND discard_authority IS NULL
+        )
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+idx_project_batches_one_terminal_attempt
+ON project_turn_transcript_batches(
+    project_id,
+    turn_id,
+    attempt_id,
+    lease_generation,
+    fencing_token
+)
+WHERE kind = 'terminal_result';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_batches_one_approval
+ON project_turn_transcript_batches(
+    project_id,
+    operation_id,
+    approval_id
+)
+WHERE kind = 'approval_checkpoint';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_batches_creation
+ON project_turn_transcript_batches(batch_creation_sequence);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -1285,6 +1548,869 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
 # created AFTER _reconcile_columns() has had a chance to ADD them on
 # existing databases. SCHEMA_SQL above is run by sqlite executescript
 # which would otherwise fail on legacy DBs ("no such column: active").
+PROJECT_BATCH_ACTIONABLE_SETTLEMENT_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_project_batches_actionable_settlement
+    ON project_turn_transcript_batches(
+        batch_creation_sequence, batch_id
+    )
+    WHERE state = 'prepared'
+       OR state = 'conflict_pending'
+       OR (
+           kind = 'terminal_result'
+           AND state = 'published'
+           AND projects_acknowledged_at IS NULL
+       );
+"""
+
+_PROJECT_BATCH_C8_GUARD_SQL = (
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c8_discard_insert
+    BEFORE INSERT ON project_turn_transcript_batches
+    WHEN NOT (
+        (
+            NEW.state = 'discarded'
+            AND typeof(NEW.discard_authority) = 'text'
+            AND NEW.discard_authority IN (
+                'stop_requested',
+                'cancelled',
+                'superseded_attempt',
+                'superseded_terminal',
+                'recovery_blocked'
+            )
+        )
+        OR (
+            NEW.state != 'discarded'
+            AND NEW.discard_authority IS NULL
+        )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid project batch discard authority');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c8_discard_update
+    BEFORE UPDATE ON project_turn_transcript_batches
+    WHEN NOT (
+        (
+            NEW.state = 'discarded'
+            AND typeof(NEW.discard_authority) = 'text'
+            AND NEW.discard_authority IN (
+                'stop_requested',
+                'cancelled',
+                'superseded_attempt',
+                'superseded_terminal',
+                'recovery_blocked'
+            )
+        )
+        OR (
+            NEW.state != 'discarded'
+            AND NEW.discard_authority IS NULL
+        )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid project batch discard authority');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c8_discard_immutable
+    BEFORE UPDATE OF discard_authority
+    ON project_turn_transcript_batches
+    WHEN OLD.discard_authority IS NOT NULL
+     AND NEW.discard_authority IS NOT OLD.discard_authority
+    BEGIN
+        SELECT RAISE(ABORT, 'project batch discard authority is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c8_projects_ack_insert
+    BEFORE INSERT ON project_turn_transcript_batches
+    WHEN NEW.projects_acknowledged_at IS NOT NULL
+     AND NOT (
+        NEW.kind = 'terminal_result'
+        AND NEW.state = 'published'
+        AND typeof(NEW.projects_acknowledged_at) IN ('integer', 'real')
+        AND NEW.projects_acknowledged_at >= 0
+        AND NEW.projects_acknowledged_at <= 253402300799.0
+     )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid project batch projects acknowledgement');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c8_projects_ack_update
+    BEFORE UPDATE ON project_turn_transcript_batches
+    WHEN NEW.projects_acknowledged_at IS NOT NULL
+     AND NOT (
+        NEW.kind = 'terminal_result'
+        AND NEW.state = 'published'
+        AND typeof(NEW.projects_acknowledged_at) IN ('integer', 'real')
+        AND NEW.projects_acknowledged_at >= 0
+        AND NEW.projects_acknowledged_at <= 253402300799.0
+     )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid project batch projects acknowledgement');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c8_projects_ack_immutable
+    BEFORE UPDATE OF projects_acknowledged_at
+    ON project_turn_transcript_batches
+    WHEN OLD.projects_acknowledged_at IS NOT NULL
+     AND NEW.projects_acknowledged_at IS NOT OLD.projects_acknowledged_at
+    BEGIN
+        SELECT RAISE(ABORT, 'project batch projects acknowledgement is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c8_lease_horizon_insert
+    BEFORE INSERT ON project_turn_transcript_batches
+    WHEN NOT (
+        typeof(NEW.lease_expires_at) = 'integer'
+        AND NEW.lease_expires_at >= 0
+        AND NEW.lease_expires_at <= 253402300799
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid project batch lease horizon');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c8_lease_horizon_update
+    BEFORE UPDATE OF lease_expires_at
+    ON project_turn_transcript_batches
+    WHEN NOT (
+        typeof(NEW.lease_expires_at) = 'integer'
+        AND NEW.lease_expires_at >= 0
+        AND NEW.lease_expires_at <= 253402300799
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid project batch lease horizon');
+    END
+    """,
+)
+
+_PROJECT_BATCH_C8_GUARD_NAMES = (
+    "trg_project_batches_c8_discard_insert",
+    "trg_project_batches_c8_discard_update",
+    "trg_project_batches_c8_discard_immutable",
+    "trg_project_batches_c8_projects_ack_insert",
+    "trg_project_batches_c8_projects_ack_update",
+    "trg_project_batches_c8_projects_ack_immutable",
+    "trg_project_batches_c8_lease_horizon_insert",
+    "trg_project_batches_c8_lease_horizon_update",
+)
+
+_PROJECT_BATCH_C9_GUARD_SQL = (
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c9_conflict_insert
+    BEFORE INSERT ON project_turn_transcript_batches
+    WHEN NEW.state IN ('conflict_pending', 'conflicted')
+      OR NEW.transcript_conflict_key IS NOT NULL
+      OR NEW.observed_message_count IS NOT NULL
+      OR NEW.remediated_at IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'project batch conflict must be reserved');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c9_conflict_shape
+    BEFORE UPDATE ON project_turn_transcript_batches
+    WHEN NOT (
+        (
+            NEW.state NOT IN ('conflict_pending', 'conflicted')
+            AND NEW.transcript_conflict_key IS NULL
+            AND NEW.observed_message_count IS NULL
+            AND NEW.remediated_at IS NULL
+        )
+        OR (
+            NEW.state = 'conflict_pending'
+            AND NEW.kind = 'terminal_result'
+            AND NEW.published_at IS NULL
+            AND NEW.projects_acknowledged_at IS NULL
+            AND NEW.discard_authority IS NULL
+            AND typeof(NEW.transcript_conflict_key) = 'text'
+            AND length(NEW.transcript_conflict_key) = 84
+            AND substr(NEW.transcript_conflict_key, 1, 20)
+                = 'transcript-conflict-'
+            AND substr(NEW.transcript_conflict_key, 21)
+                NOT GLOB '*[^0-9a-f]*'
+            AND typeof(NEW.observed_message_count) = 'integer'
+            AND NEW.observed_message_count >= 0
+            AND NEW.observed_message_count <= 9223372036854775807
+            AND NEW.remediated_at IS NULL
+        )
+        OR (
+            NEW.state = 'conflicted'
+            AND NEW.kind = 'terminal_result'
+            AND NEW.published_at IS NULL
+            AND NEW.projects_acknowledged_at IS NULL
+            AND NEW.discard_authority IS NULL
+            AND typeof(NEW.transcript_conflict_key) = 'text'
+            AND length(NEW.transcript_conflict_key) = 84
+            AND substr(NEW.transcript_conflict_key, 1, 20)
+                = 'transcript-conflict-'
+            AND substr(NEW.transcript_conflict_key, 21)
+                NOT GLOB '*[^0-9a-f]*'
+            AND typeof(NEW.observed_message_count) = 'integer'
+            AND NEW.observed_message_count >= 0
+            AND NEW.observed_message_count <= 9223372036854775807
+            AND typeof(NEW.remediated_at) IN ('integer', 'real')
+            AND NEW.remediated_at >= 0
+            AND NEW.remediated_at <= 253402300799.0
+        )
+        OR (
+            NEW.state = 'conflicted'
+            AND NEW.kind = 'approval_checkpoint'
+            AND NEW.published_at IS NULL
+            AND NEW.projects_acknowledged_at IS NULL
+            AND NEW.transcript_conflict_key IS NULL
+            AND NEW.observed_message_count IS NULL
+            AND NEW.remediated_at IS NULL
+            AND NEW.discard_authority IS NULL
+        )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid project batch conflict proof');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c9_conflict_transition
+    BEFORE UPDATE OF state ON project_turn_transcript_batches
+    WHEN (
+        OLD.state IN ('conflict_pending', 'conflicted')
+        OR NEW.state IN ('conflict_pending', 'conflicted')
+    )
+    AND NOT (
+        OLD.state = NEW.state
+        OR (
+            OLD.state = 'prepared'
+            AND NEW.state = 'conflict_pending'
+        )
+        OR (
+            OLD.state = 'conflict_pending'
+            AND NEW.state = 'conflicted'
+        )
+        OR (
+            OLD.state = 'prepared'
+            AND NEW.state = 'conflicted'
+            AND NEW.kind = 'approval_checkpoint'
+        )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid project batch conflict transition');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+    trg_project_batches_c9_conflict_immutable
+    BEFORE UPDATE OF
+        transcript_conflict_key,
+        observed_message_count,
+        remediated_at
+    ON project_turn_transcript_batches
+    WHEN (
+        OLD.state IN ('conflict_pending', 'conflicted')
+        AND (
+            NEW.transcript_conflict_key
+                IS NOT OLD.transcript_conflict_key
+            OR NEW.observed_message_count
+                IS NOT OLD.observed_message_count
+        )
+    )
+    OR (
+        OLD.state = 'conflicted'
+        AND NEW.remediated_at IS NOT OLD.remediated_at
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'project batch conflict proof is immutable');
+    END
+    """,
+)
+
+_PROJECT_BATCH_C9_GUARD_NAMES = (
+    "trg_project_batches_c9_conflict_insert",
+    "trg_project_batches_c9_conflict_shape",
+    "trg_project_batches_c9_conflict_transition",
+    "trg_project_batches_c9_conflict_immutable",
+)
+
+_PROJECT_BATCH_STORAGE_COLUMNS = (
+    "batch_id",
+    "batch_creation_sequence",
+    "kind",
+    "session_id",
+    "project_id",
+    "turn_id",
+    "sequence",
+    "worker_id",
+    "attempt_id",
+    "lease_generation",
+    "fencing_token",
+    "lease_expires_at",
+    "terminal_status",
+    "operation_id",
+    "approval_id",
+    "base_message_count",
+    "transcript_json",
+    "transcript_sha256",
+    "state",
+    "created_at",
+    "published_at",
+    "projects_acknowledged_at",
+    "transcript_conflict_key",
+    "observed_message_count",
+    "remediated_at",
+    "discard_authority",
+)
+
+_PROJECT_BATCH_DURABLE_INDEX_SQL = (
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS
+    idx_project_batches_one_terminal_attempt
+    ON project_turn_transcript_batches(
+        project_id,
+        turn_id,
+        attempt_id,
+        lease_generation,
+        fencing_token
+    )
+    WHERE kind = 'terminal_result'
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_project_batches_one_approval
+    ON project_turn_transcript_batches(
+        project_id,
+        operation_id,
+        approval_id
+    )
+    WHERE kind = 'approval_checkpoint'
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_project_batches_creation
+    ON project_turn_transcript_batches(batch_creation_sequence)
+    """,
+    PROJECT_BATCH_ACTIONABLE_SETTLEMENT_INDEX_SQL,
+)
+
+_PROJECT_BATCH_ACTIONABLE_COLUMNS = """
+batch_id, batch_creation_sequence, kind, state, session_id,
+project_id, turn_id, sequence, worker_id, attempt_id,
+lease_generation, fencing_token, lease_expires_at,
+terminal_status, operation_id, approval_id, base_message_count,
+created_at
+"""
+
+_PROJECT_BATCH_ACTIONABLE_UPPER_SQL = """
+SELECT batch_creation_sequence, batch_id
+FROM project_turn_transcript_batches
+     INDEXED BY idx_project_batches_actionable_settlement
+WHERE state = 'prepared'
+   OR state = 'conflict_pending'
+   OR (
+       kind = 'terminal_result'
+       AND state = 'published'
+       AND projects_acknowledged_at IS NULL
+   )
+ORDER BY batch_creation_sequence DESC, batch_id DESC
+LIMIT 1
+"""
+
+_PROJECT_BATCH_ACTIONABLE_PAGE_START_SQL = f"""
+SELECT {_PROJECT_BATCH_ACTIONABLE_COLUMNS}
+FROM project_turn_transcript_batches
+     INDEXED BY idx_project_batches_actionable_settlement
+WHERE (
+       state = 'prepared'
+    OR state = 'conflict_pending'
+    OR (
+        kind = 'terminal_result'
+        AND state = 'published'
+        AND projects_acknowledged_at IS NULL
+    )
+)
+  AND (batch_creation_sequence, batch_id) <= (?, ?)
+ORDER BY batch_creation_sequence, batch_id
+LIMIT ?
+"""
+
+_PROJECT_BATCH_ACTIONABLE_PAGE_AFTER_SQL = f"""
+SELECT {_PROJECT_BATCH_ACTIONABLE_COLUMNS}
+FROM project_turn_transcript_batches
+     INDEXED BY idx_project_batches_actionable_settlement
+WHERE (
+       state = 'prepared'
+    OR state = 'conflict_pending'
+    OR (
+        kind = 'terminal_result'
+        AND state = 'published'
+        AND projects_acknowledged_at IS NULL
+    )
+)
+  AND (batch_creation_sequence, batch_id) > (?, ?)
+  AND (batch_creation_sequence, batch_id) <= (?, ?)
+ORDER BY batch_creation_sequence, batch_id
+LIMIT ?
+"""
+
+_PROJECT_BATCH_ACTIONABLE_REMAINING_SQL = """
+SELECT 1
+FROM project_turn_transcript_batches
+     INDEXED BY idx_project_batches_actionable_settlement
+WHERE (
+       state = 'prepared'
+    OR state = 'conflict_pending'
+    OR (
+        kind = 'terminal_result'
+        AND state = 'published'
+        AND projects_acknowledged_at IS NULL
+    )
+)
+  AND (batch_creation_sequence, batch_id) > (?, ?)
+  AND (batch_creation_sequence, batch_id) <= (?, ?)
+LIMIT 1
+"""
+
+
+def _is_canonical_uuid4(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return parsed.version == 4 and str(parsed) == value
+
+
+def _require_project_batch_cursor(
+    value: object,
+) -> ProjectBatchCursor:
+    if type(value) is not ProjectBatchCursor or not (
+        type(value.batch_creation_sequence) is int
+        and 1
+        <= value.batch_creation_sequence
+        <= _SQLITE_INT_MAX
+        and _is_canonical_uuid4(value.batch_id)
+    ):
+        raise ValueError("invalid project batch cursor")
+    return value
+
+
+def _pending_project_batch_from_row(
+    row: sqlite3.Row,
+) -> PendingProjectBatch:
+    batch_id = row["batch_id"]
+    batch_creation_sequence = row["batch_creation_sequence"]
+    kind = row["kind"]
+    state = row["state"]
+    session_id = row["session_id"]
+    project_id = row["project_id"]
+    turn_id = row["turn_id"]
+    sequence = row["sequence"]
+    worker_id = row["worker_id"]
+    attempt_id = row["attempt_id"]
+    lease_generation = row["lease_generation"]
+    fencing_token = row["fencing_token"]
+    lease_expires_at = row["lease_expires_at"]
+    terminal_status = row["terminal_status"]
+    operation_id = row["operation_id"]
+    approval_id = row["approval_id"]
+    base_message_count = row["base_message_count"]
+    created_at = row["created_at"]
+
+    nonempty_text = (
+        session_id,
+        project_id,
+        turn_id,
+        worker_id,
+        attempt_id,
+    )
+    if not (
+        _is_canonical_uuid4(batch_id)
+        and type(batch_creation_sequence) is int
+        and 1 <= batch_creation_sequence <= _SQLITE_INT_MAX
+        and kind in {"terminal_result", "approval_checkpoint"}
+        and type(kind) is str
+        and state in {"prepared", "conflict_pending", "published"}
+        and type(state) is str
+        and all(type(value) is str and value for value in nonempty_text)
+        and type(sequence) is int
+        and 1 <= sequence <= _SQLITE_INT_MAX
+        and type(lease_generation) is int
+        and 1 <= lease_generation <= _SQLITE_INT_MAX
+        and type(fencing_token) is int
+        and 1 <= fencing_token <= _SQLITE_INT_MAX
+        and type(lease_expires_at) is int
+        and 0
+        <= lease_expires_at
+        <= _MAX_PERSISTED_TIMESTAMP_INT
+        and type(base_message_count) is int
+        and 0 <= base_message_count <= _SQLITE_INT_MAX
+        and type(created_at) in {int, float}
+        and math.isfinite(created_at)
+        and 0 <= created_at <= _MAX_PERSISTED_TIMESTAMP
+        and (
+            (
+                kind == "terminal_result"
+                and terminal_status in {"succeeded", "failed"}
+                and type(terminal_status) is str
+                and operation_id is None
+                and approval_id is None
+            )
+            or (
+                kind == "approval_checkpoint"
+                and terminal_status is None
+                and type(operation_id) is str
+                and bool(operation_id)
+                and type(approval_id) is str
+                and bool(approval_id)
+            )
+        )
+    ):
+        raise RuntimeError("malformed pending project batch")
+
+    return PendingProjectBatch(
+        batch_id=batch_id,
+        batch_creation_sequence=batch_creation_sequence,
+        kind=kind,
+        state=state,
+        attempt=TurnAttemptIdentity(
+            project_id=project_id,
+            turn_id=turn_id,
+            sequence=sequence,
+            worker_id=worker_id,
+            attempt_id=attempt_id,
+            lease_generation=lease_generation,
+            fencing_token=fencing_token,
+            canonical_session_id=session_id,
+            lease_expires_at=lease_expires_at,
+        ),
+        terminal_status=terminal_status,
+        operation_id=operation_id,
+        approval_id=approval_id,
+        base_message_count=base_message_count,
+        created_at=float(created_at),
+    )
+
+
+_PROJECT_BATCH_IMMUTABLE_COLUMNS = (
+    "batch_id",
+    "batch_creation_sequence",
+    "kind",
+    "session_id",
+    "project_id",
+    "turn_id",
+    "sequence",
+    "worker_id",
+    "attempt_id",
+    "lease_generation",
+    "fencing_token",
+    "lease_expires_at",
+    "terminal_status",
+    "operation_id",
+    "approval_id",
+    "base_message_count",
+    "transcript_json",
+    "transcript_sha256",
+    "created_at",
+)
+
+_PROJECT_BATCH_MESSAGE_FIELDS = frozenset(
+    {
+        "role",
+        "content",
+        "tool_name",
+        "tool_calls",
+        "tool_call_id",
+        "token_count",
+        "finish_reason",
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+        "platform_message_id",
+        "observed",
+        "effect_disposition",
+        "timestamp",
+        "api_content",
+        "display_kind",
+        "display_metadata",
+    }
+)
+
+_PROJECT_BATCH_TEXT_FIELDS = frozenset(
+    {
+        "tool_name",
+        "tool_call_id",
+        "finish_reason",
+        "reasoning",
+        "reasoning_content",
+        "platform_message_id",
+        "effect_disposition",
+        "api_content",
+        "display_kind",
+    }
+)
+
+
+def _project_batch_json_copy(
+    value: object,
+    seen: set[int] | None = None,
+) -> object:
+    """Copy exact finite JSON into built-in containers."""
+    if seen is None:
+        seen = set()
+    value_type = type(value)
+    if value is None or value_type in {str, bool}:
+        return value
+    if value_type is int:
+        if not -_SQLITE_INT_MAX - 1 <= value <= _SQLITE_INT_MAX:
+            raise ValueError("project batch JSON integer is out of range")
+        return value
+    if value_type is float:
+        if not math.isfinite(value):
+            raise ValueError("non-finite project batch JSON")
+        return value
+    if isinstance(value, Mapping):
+        object_id = id(value)
+        if object_id in seen:
+            raise ValueError("cyclic project batch JSON")
+        seen.add(object_id)
+        copied: dict[str, object] = {}
+        try:
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ValueError(
+                        "project batch JSON keys must be strings"
+                    )
+                copied[key] = _project_batch_json_copy(item, seen)
+            return copied
+        finally:
+            seen.remove(object_id)
+    if type(value) is list:
+        object_id = id(value)
+        if object_id in seen:
+            raise ValueError("cyclic project batch JSON")
+        seen.add(object_id)
+        try:
+            return [
+                _project_batch_json_copy(item, seen)
+                for item in value
+            ]
+        finally:
+            seen.remove(object_id)
+    raise ValueError("project batch value is not JSON")
+
+
+def _canonical_terminal_transcript(
+    messages: Sequence[Mapping[str, object]],
+) -> str:
+    if isinstance(messages, (str, bytes)) or not isinstance(
+        messages,
+        Sequence,
+    ):
+        raise ValueError("invalid terminal transcript")
+    copied: list[dict[str, object]] = []
+    expected_role = "user"
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise ValueError("invalid terminal transcript message")
+        if set(message) - _PROJECT_BATCH_MESSAGE_FIELDS:
+            raise ValueError("unsupported terminal transcript field")
+        role = message.get("role")
+        if type(role) is not str or role != expected_role:
+            raise ValueError("invalid terminal transcript role sequence")
+        copied_message = _project_batch_json_copy(message)
+        if type(copied_message) is not dict:
+            raise ValueError("invalid terminal transcript message")
+        if type(copied_message.get("content")) is not str:
+            raise ValueError("invalid terminal transcript content")
+        for field in _PROJECT_BATCH_TEXT_FIELDS:
+            value = copied_message.get(field)
+            if value is not None and type(value) is not str:
+                raise ValueError("invalid terminal transcript text field")
+        timestamp = copied_message.get("timestamp")
+        if timestamp is not None and not (
+            type(timestamp) in {int, float}
+            and math.isfinite(timestamp)
+            and 0
+            <= timestamp
+            <= _MAX_PERSISTED_TIMESTAMP_INT
+        ):
+            raise ValueError("invalid terminal transcript timestamp")
+        token_count = copied_message.get("token_count")
+        if token_count is not None and not (
+            type(token_count) is int
+            and 0 <= token_count <= _SQLITE_INT_MAX
+        ):
+            raise ValueError("invalid terminal transcript token count")
+        observed = copied_message.get("observed")
+        if observed is not None and type(observed) is not bool:
+            raise ValueError("invalid terminal transcript observed flag")
+        for field in (
+            "tool_calls",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+        ):
+            value = copied_message.get(field)
+            if value is not None and type(value) is not list:
+                raise ValueError(
+                    "invalid terminal transcript structured field"
+                )
+        display_metadata = copied_message.get("display_metadata")
+        if display_metadata is not None and type(display_metadata) is not dict:
+            raise ValueError("invalid terminal transcript display metadata")
+        if (
+            (
+                role != "assistant"
+                and any(
+                    copied_message.get(field) is not None
+                    for field in (
+                        "reasoning",
+                        "reasoning_content",
+                        "reasoning_details",
+                        "codex_reasoning_items",
+                        "codex_message_items",
+                    )
+                )
+            )
+        ):
+            raise ValueError(
+                "terminal transcript field would not persist exactly"
+            )
+        copied.append(copied_message)
+        expected_role = (
+            "assistant" if expected_role == "user" else "user"
+        )
+    if not copied:
+        raise ValueError("terminal transcript is empty")
+    try:
+        return json.dumps(
+            copied,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ValueError("invalid terminal transcript") from exc
+
+
+def _project_batch_fingerprint(
+    row: Mapping[str, object],
+) -> tuple[object, ...]:
+    return tuple(row[column] for column in _PROJECT_BATCH_IMMUTABLE_COLUMNS)
+
+
+def _project_batch_fingerprint_predicate() -> str:
+    return " AND ".join(
+        f"{column} IS ?"
+        for column in _PROJECT_BATCH_IMMUTABLE_COLUMNS
+    )
+
+
+def _project_batch_conflict_key(
+    row: Mapping[str, object],
+    observed_message_count: int,
+) -> str | None:
+    identity = {
+        "attempt_id": row["attempt_id"],
+        "batch_id": row["batch_id"],
+        "canonical_session_id": row["session_id"],
+        "fencing_token": row["fencing_token"],
+        "lease_expires_at": row["lease_expires_at"],
+        "lease_generation": row["lease_generation"],
+        "observed_message_count": observed_message_count,
+        "project_id": row["project_id"],
+        "result_id": row["batch_id"],
+        "sequence": row["sequence"],
+        "status": row["terminal_status"],
+        "turn_id": row["turn_id"],
+        "worker_id": row["worker_id"],
+    }
+    try:
+        identity_json = json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        identity_bytes = identity_json.encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    return "transcript-conflict-" + hashlib.sha256(
+        identity_bytes
+    ).hexdigest()
+
+
+def _project_batch_transcript_digest_matches(
+    row: Mapping[str, object],
+) -> bool:
+    transcript_json = row["transcript_json"]
+    transcript_sha256 = row["transcript_sha256"]
+    if not (
+        type(transcript_json) is str
+        and type(transcript_sha256) is str
+    ):
+        return False
+    try:
+        actual_sha256 = hashlib.sha256(
+            transcript_json.encode("utf-8")
+        ).hexdigest()
+    except UnicodeEncodeError:
+        return False
+    return actual_sha256 == transcript_sha256
+
+
+def _project_batch_conflict_reservation_from_row(
+    row: Mapping[str, object],
+    fingerprint: tuple[object, ...],
+) -> _ProjectBatchConflictReservation | None:
+    observed_message_count = row["observed_message_count"]
+    conflict_key = row["transcript_conflict_key"]
+    if not (
+        row["kind"] == "terminal_result"
+        and _project_batch_transcript_digest_matches(row)
+        and row["published_at"] is None
+        and row["projects_acknowledged_at"] is None
+        and row["discard_authority"] is None
+        and type(observed_message_count) is int
+        and 0 <= observed_message_count <= _SQLITE_INT_MAX
+        and type(conflict_key) is str
+    ):
+        return None
+    expected_conflict_key = _project_batch_conflict_key(
+        row,
+        observed_message_count,
+    )
+    if (
+        expected_conflict_key is None
+        or conflict_key != expected_conflict_key
+    ):
+        return None
+    return _ProjectBatchConflictReservation(
+        fingerprint=fingerprint,
+        conflict_key=conflict_key,
+        observed_message_count=observed_message_count,
+    )
+
+
+class _ProjectBatchStateConflict(RuntimeError):
+    pass
+
+
 DEFERRED_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
@@ -1297,6 +2423,76 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 """
+
+
+_SCHEMA_IDEMPOTENCY_CLAUSE = re.compile(
+    r"^(CREATE(?: UNIQUE)? INDEX|CREATE TRIGGER) IF NOT EXISTS "
+)
+
+
+def _normalized_named_schema_sql(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    normalized = " ".join(value.strip().rstrip(";").split())
+    return _SCHEMA_IDEMPOTENCY_CLAUSE.sub(r"\1 ", normalized)
+
+
+def _ensure_project_batch_actionable_settlement_index(
+    cursor: sqlite3.Cursor,
+) -> None:
+    """Replace a stale Task-7 settlement index as one rollback domain."""
+    savepoint = "task7_actionable_settlement_index"
+    expected_sql = _normalized_named_schema_sql(
+        PROJECT_BATCH_ACTIONABLE_SETTLEMENT_INDEX_SQL
+    )
+    cursor.execute(f"SAVEPOINT {savepoint}")
+    try:
+        actionable = cursor.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'index'
+              AND name =
+                  'idx_project_batches_actionable_settlement'
+            """
+        ).fetchone()
+        if (
+            actionable is not None
+            and _normalized_named_schema_sql(actionable["sql"])
+            != expected_sql
+        ):
+            cursor.execute(
+                """
+                DROP INDEX
+                idx_project_batches_actionable_settlement
+                """
+            )
+        cursor.execute(
+            PROJECT_BATCH_ACTIONABLE_SETTLEMENT_INDEX_SQL
+        )
+        installed = cursor.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'index'
+              AND name =
+                  'idx_project_batches_actionable_settlement'
+            """
+        ).fetchone()
+        if (
+            installed is None
+            or _normalized_named_schema_sql(installed["sql"])
+            != expected_sql
+        ):
+            raise RuntimeError(
+                "actionable settlement index did not converge"
+            )
+    except BaseException:
+        try:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        finally:
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+    else:
+        cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
 
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──
 # While a background index rebuild is pending, two state_meta keys define
@@ -2365,6 +3561,8 @@ class SessionDB:
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
+        *,
+        count_only_if_changed: bool = False,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -2384,6 +3582,7 @@ class SessionDB:
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
                 with self._lock:
+                    changes_before = self._conn.total_changes
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         result = fn(self._conn)
@@ -2394,12 +3593,27 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
+                    write_changed = (
+                        self._conn.total_changes != changes_before
+                    )
                 # Success — periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._OPTIMIZE_EVERY_N_WRITES == 0:
-                    self._try_optimize_fts()
+                if (
+                    not count_only_if_changed
+                    or write_changed
+                ):
+                    self._write_count += 1
+                    if (
+                        self._write_count
+                        % self._CHECKPOINT_EVERY_N_WRITES
+                        == 0
+                    ):
+                        self._try_wal_checkpoint()
+                    if (
+                        self._write_count
+                        % self._OPTIMIZE_EVERY_N_WRITES
+                        == 0
+                    ):
+                        self._try_optimize_fts()
                 return result
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
@@ -2556,7 +3770,1525 @@ class SessionDB:
                 except Exception as exc:
                     logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
                 self._conn.close()
-                self._conn = None
+
+    def _execute_project_batch_scan(
+        self,
+        sql: str,
+        parameters: tuple[object, ...],
+    ) -> tuple[sqlite3.Row, ...]:
+        """Execute one bounded settlement read under its VM budget."""
+        with self._lock:
+            callback_count = 0
+
+            def progress_budget_exhausted() -> int:
+                nonlocal callback_count
+                callback_count += 1
+                return int(
+                    callback_count
+                    >= PROJECT_BATCH_SCAN_PROGRESS_CALLBACK_LIMIT
+                )
+
+            self._conn.set_progress_handler(
+                progress_budget_exhausted,
+                1,
+            )
+            try:
+                return tuple(
+                    self._conn.execute(sql, parameters).fetchall()
+                )
+            finally:
+                self._conn.set_progress_handler(None, 0)
+
+    def _task7_terminal_batch_evidence_snapshots(
+        self,
+        request: TurnReadbackRequest,
+    ) -> tuple[dict[str, object], ...]:
+        """Return detached exact-attempt terminal rows for Task-7 recovery."""
+        if (
+            type(request) is not TurnReadbackRequest
+            or not all(
+                type(value) is str and bool(value)
+                for value in (
+                    request.project_id,
+                    request.turn_id,
+                    request.worker_id,
+                    request.attempt_id,
+                    request.canonical_session_id,
+                )
+            )
+            or not all(
+                type(value) is int
+                and 1 <= value <= _SQLITE_INT_MAX
+                for value in (
+                    request.sequence,
+                    request.lease_generation,
+                    request.fencing_token,
+                )
+            )
+            or not (
+                type(request.lease_expires_at) is int
+                and 0
+                <= request.lease_expires_at
+                <= _MAX_PERSISTED_TIMESTAMP_INT
+            )
+            or type(request.source_status) is not str
+            or request.source_status not in {
+                "claimed",
+                "stop_requested",
+            }
+            or request.execution_state not in {
+                None,
+                "not_started",
+                "started",
+            }
+            or (
+                request.execution_state is not None
+                and type(request.execution_state) is not str
+            )
+        ):
+            raise ValueError("invalid Task-7 terminal readback request")
+
+        with self._lock:
+            index_names = {
+                row["name"]
+                for row in self._conn.execute(
+                    "PRAGMA index_list("
+                    "'project_turn_transcript_batches'"
+                    ")"
+                )
+            }
+            if (
+                "idx_project_batches_one_terminal_attempt"
+                not in index_names
+            ):
+                raise sqlite3.DatabaseError(
+                    "required terminal-attempt index is missing"
+                )
+            rows = tuple(
+                self._conn.execute(
+                    """
+                    SELECT *
+                    FROM project_turn_transcript_batches
+                         INDEXED BY
+                         idx_project_batches_one_terminal_attempt
+                    WHERE project_id = ?
+                      AND turn_id = ?
+                      AND attempt_id = ?
+                      AND lease_generation = ?
+                      AND fencing_token = ?
+                      AND kind = 'terminal_result'
+                    LIMIT 2
+                    """,
+                    (
+                        request.project_id,
+                        request.turn_id,
+                        request.attempt_id,
+                        request.lease_generation,
+                        request.fencing_token,
+                    ),
+                ).fetchall()
+            )
+        if len(rows) > 1:
+            raise RuntimeError(
+                "multiple terminal batches for one Task-7 attempt"
+            )
+        return tuple(dict(row) for row in rows)
+
+    def prepare_terminal_result(
+        self,
+        claim: TurnClaim,
+        *,
+        batch_id: str,
+        status: Literal["succeeded", "failed"],
+        base_message_count: int,
+        messages: Sequence[Mapping[str, object]],
+    ) -> PendingProjectBatch:
+        """Persist one immutable terminal transcript before Projects commits."""
+        if not (
+            type(claim) is TurnClaim
+            and all(
+                type(value) is str and bool(value)
+                for value in (
+                    claim.project_id,
+                    claim.turn_id,
+                    claim.worker_id,
+                    claim.attempt_id,
+                    claim.canonical_session_id,
+                )
+            )
+            and all(
+                type(value) is int
+                and 1 <= value <= _SQLITE_INT_MAX
+                for value in (
+                    claim.sequence,
+                    claim.lease_generation,
+                    claim.fencing_token,
+                )
+            )
+            and type(claim.lease_expires_at) is int
+            and 0
+            <= claim.lease_expires_at
+            <= _MAX_PERSISTED_TIMESTAMP_INT
+            and _is_canonical_uuid4(batch_id)
+            and type(status) is str
+            and status in {"succeeded", "failed"}
+            and type(base_message_count) is int
+            and 0 <= base_message_count <= _SQLITE_INT_MAX
+        ):
+            raise ValueError("invalid terminal result preparation")
+
+        transcript_json = _canonical_terminal_transcript(messages)
+        try:
+            transcript_bytes = transcript_json.encode("utf-8")
+            transcript_sha256 = hashlib.sha256(
+                transcript_bytes
+            ).hexdigest()
+        except UnicodeEncodeError as exc:
+            raise ValueError("invalid terminal transcript text") from exc
+
+        expected = {
+            "batch_id": batch_id,
+            "kind": "terminal_result",
+            "session_id": claim.canonical_session_id,
+            "project_id": claim.project_id,
+            "turn_id": claim.turn_id,
+            "sequence": claim.sequence,
+            "worker_id": claim.worker_id,
+            "attempt_id": claim.attempt_id,
+            "lease_generation": claim.lease_generation,
+            "fencing_token": claim.fencing_token,
+            "lease_expires_at": claim.lease_expires_at,
+            "terminal_status": status,
+            "operation_id": None,
+            "approval_id": None,
+            "base_message_count": base_message_count,
+            "transcript_json": transcript_json,
+            "transcript_sha256": transcript_sha256,
+        }
+
+        def replay(
+            rows: Sequence[sqlite3.Row],
+        ) -> PendingProjectBatch | None:
+            if not rows:
+                return None
+            if len(rows) != 1 or any(
+                rows[0][column] != value
+                for column, value in expected.items()
+            ):
+                raise ValueError(
+                    "terminal result preparation collides with "
+                    "immutable authority"
+                )
+            return _pending_project_batch_from_row(rows[0])
+
+        with self._lock:
+            if self._conn.in_transaction:
+                raise ValueError(
+                    "caller-owned transaction is not allowed"
+                )
+            bind_limit = self._conn.getlimit(
+                sqlite3.SQLITE_LIMIT_LENGTH
+            )
+            try:
+                bound_text = (
+                    batch_id,
+                    claim.canonical_session_id,
+                    claim.project_id,
+                    claim.turn_id,
+                    claim.worker_id,
+                    claim.attempt_id,
+                    status,
+                    transcript_sha256,
+                )
+                if (
+                    len(transcript_bytes) >= bind_limit
+                    or any(
+                        len(value.encode("utf-8")) >= bind_limit
+                        for value in bound_text
+                    )
+                ):
+                    raise ValueError(
+                        "terminal result preparation exceeds "
+                        "SQLite bind limit"
+                    )
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    "invalid terminal result preparation text"
+                ) from exc
+            preflight = replay(
+                self._conn.execute(
+                    """
+                    SELECT *
+                    FROM project_turn_transcript_batches
+                    WHERE batch_id = ?
+                    """,
+                    (batch_id,),
+                ).fetchall()
+            )
+            if preflight is not None:
+                return preflight
+
+        def prepare(conn: sqlite3.Connection) -> PendingProjectBatch:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchall()
+            transactional_replay = replay(rows)
+            if transactional_replay is not None:
+                return transactional_replay
+
+            counter = conn.execute(
+                """
+                SELECT last_sequence
+                FROM project_batch_sequence_counter
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            if counter is None or type(counter[0]) is not int:
+                raise RuntimeError("malformed project batch counter")
+            if counter[0] >= _SQLITE_INT_MAX:
+                raise RuntimeError("BATCH_SEQUENCE_EXHAUSTED")
+            batch_creation_sequence = counter[0] + 1
+            if conn.execute(
+                """
+                UPDATE project_batch_sequence_counter
+                SET last_sequence = ?
+                WHERE singleton = 1 AND last_sequence = ?
+                """,
+                (batch_creation_sequence, counter[0]),
+            ).rowcount != 1:
+                raise RuntimeError("project batch counter changed")
+            created_at = time.time()
+            if not (
+                type(created_at) in {int, float}
+                and math.isfinite(created_at)
+                and 0 <= created_at <= _MAX_PERSISTED_TIMESTAMP
+            ):
+                raise RuntimeError("invalid project batch timestamp")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO project_turn_transcript_batches (
+                        batch_id, batch_creation_sequence, kind, session_id,
+                        project_id, turn_id, sequence, worker_id, attempt_id,
+                        lease_generation, fencing_token, lease_expires_at,
+                        terminal_status, operation_id, approval_id,
+                        base_message_count, transcript_json,
+                        transcript_sha256, state, created_at, published_at,
+                        projects_acknowledged_at, transcript_conflict_key,
+                        observed_message_count, remediated_at,
+                        discard_authority
+                    ) VALUES (
+                        ?, ?, 'terminal_result', ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, NULL, NULL, ?, ?, ?, 'prepared', ?, NULL, NULL,
+                        NULL, NULL, NULL, NULL
+                    )
+                    """,
+                    (
+                        batch_id,
+                        batch_creation_sequence,
+                        claim.canonical_session_id,
+                        claim.project_id,
+                        claim.turn_id,
+                        claim.sequence,
+                        claim.worker_id,
+                        claim.attempt_id,
+                        claim.lease_generation,
+                        claim.fencing_token,
+                        claim.lease_expires_at,
+                        status,
+                        base_message_count,
+                        transcript_json,
+                        transcript_sha256,
+                        created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "unique constraint failed" in str(exc).lower():
+                    raise ValueError(
+                        "terminal result preparation collides with "
+                        "immutable authority"
+                    ) from exc
+                raise
+            stored = conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+            if stored is None:
+                raise RuntimeError("prepared project batch disappeared")
+            return _pending_project_batch_from_row(stored)
+
+        return self._execute_write(
+            prepare,
+            count_only_if_changed=True,
+        )
+
+    def prepare_approval_checkpoint(
+        self,
+        claim: TurnClaim,
+        *,
+        batch_id: str,
+        operation_id: str,
+        approval_id: str,
+        base_message_count: int,
+        messages: Sequence[Mapping[str, object]],
+    ) -> PendingProjectBatch:
+        """Persist immutable approval context before Projects intent commit."""
+        if not (
+            type(claim) is TurnClaim
+            and all(
+                type(value) is str and bool(value)
+                for value in (
+                    claim.project_id,
+                    claim.turn_id,
+                    claim.worker_id,
+                    claim.attempt_id,
+                    claim.canonical_session_id,
+                    operation_id,
+                    approval_id,
+                )
+            )
+            and all(
+                type(value) is int
+                and 1 <= value <= _SQLITE_INT_MAX
+                for value in (
+                    claim.sequence,
+                    claim.lease_generation,
+                    claim.fencing_token,
+                )
+            )
+            and type(claim.lease_expires_at) is int
+            and 0
+            <= claim.lease_expires_at
+            <= _MAX_PERSISTED_TIMESTAMP_INT
+            and _is_canonical_uuid4(batch_id)
+            and type(base_message_count) is int
+            and 0 <= base_message_count <= _SQLITE_INT_MAX
+        ):
+            raise ValueError("invalid approval checkpoint preparation")
+
+        transcript_json = _canonical_terminal_transcript(messages)
+        try:
+            transcript_bytes = transcript_json.encode("utf-8")
+            transcript_sha256 = hashlib.sha256(
+                transcript_bytes
+            ).hexdigest()
+        except UnicodeEncodeError as exc:
+            raise ValueError("invalid approval transcript text") from exc
+
+        expected = {
+            "batch_id": batch_id,
+            "kind": "approval_checkpoint",
+            "session_id": claim.canonical_session_id,
+            "project_id": claim.project_id,
+            "turn_id": claim.turn_id,
+            "sequence": claim.sequence,
+            "worker_id": claim.worker_id,
+            "attempt_id": claim.attempt_id,
+            "lease_generation": claim.lease_generation,
+            "fencing_token": claim.fencing_token,
+            "lease_expires_at": claim.lease_expires_at,
+            "terminal_status": None,
+            "operation_id": operation_id,
+            "approval_id": approval_id,
+            "base_message_count": base_message_count,
+            "transcript_json": transcript_json,
+            "transcript_sha256": transcript_sha256,
+        }
+
+        def replay(
+            rows: Sequence[sqlite3.Row],
+        ) -> PendingProjectBatch | None:
+            if not rows:
+                return None
+            if len(rows) != 1 or any(
+                rows[0][column] != value
+                for column, value in expected.items()
+            ):
+                raise ValueError(
+                    "approval checkpoint preparation collides with "
+                    "immutable authority"
+                )
+            return _pending_project_batch_from_row(rows[0])
+
+        with self._lock:
+            if self._conn.in_transaction:
+                raise ValueError(
+                    "caller-owned transaction is not allowed"
+                )
+            bind_limit = self._conn.getlimit(
+                sqlite3.SQLITE_LIMIT_LENGTH
+            )
+            try:
+                bound_text = (
+                    batch_id,
+                    claim.canonical_session_id,
+                    claim.project_id,
+                    claim.turn_id,
+                    claim.worker_id,
+                    claim.attempt_id,
+                    operation_id,
+                    approval_id,
+                    transcript_sha256,
+                )
+                if (
+                    len(transcript_bytes) >= bind_limit
+                    or any(
+                        len(value.encode("utf-8")) >= bind_limit
+                        for value in bound_text
+                    )
+                ):
+                    raise ValueError(
+                        "approval checkpoint preparation exceeds "
+                        "SQLite bind limit"
+                    )
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    "invalid approval checkpoint preparation text"
+                ) from exc
+            preflight = replay(
+                self._conn.execute(
+                    """
+                    SELECT *
+                    FROM project_turn_transcript_batches
+                    WHERE batch_id = ?
+                    """,
+                    (batch_id,),
+                ).fetchall()
+            )
+            if preflight is not None:
+                return preflight
+
+        def prepare(conn: sqlite3.Connection) -> PendingProjectBatch:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchall()
+            transactional_replay = replay(rows)
+            if transactional_replay is not None:
+                return transactional_replay
+
+            counter = conn.execute(
+                """
+                SELECT last_sequence
+                FROM project_batch_sequence_counter
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            if counter is None or type(counter[0]) is not int:
+                raise RuntimeError("malformed project batch counter")
+            if counter[0] >= _SQLITE_INT_MAX:
+                raise RuntimeError("BATCH_SEQUENCE_EXHAUSTED")
+            batch_creation_sequence = counter[0] + 1
+            if conn.execute(
+                """
+                UPDATE project_batch_sequence_counter
+                SET last_sequence = ?
+                WHERE singleton = 1 AND last_sequence = ?
+                """,
+                (batch_creation_sequence, counter[0]),
+            ).rowcount != 1:
+                raise RuntimeError("project batch counter changed")
+            created_at = time.time()
+            if not (
+                type(created_at) in {int, float}
+                and math.isfinite(created_at)
+                and 0 <= created_at <= _MAX_PERSISTED_TIMESTAMP
+            ):
+                raise RuntimeError("invalid project batch timestamp")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO project_turn_transcript_batches (
+                        batch_id, batch_creation_sequence, kind, session_id,
+                        project_id, turn_id, sequence, worker_id, attempt_id,
+                        lease_generation, fencing_token, lease_expires_at,
+                        terminal_status, operation_id, approval_id,
+                        base_message_count, transcript_json,
+                        transcript_sha256, state, created_at, published_at,
+                        projects_acknowledged_at, transcript_conflict_key,
+                        observed_message_count, remediated_at,
+                        discard_authority
+                    ) VALUES (
+                        ?, ?, 'approval_checkpoint', ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, NULL, ?, ?, ?, ?, ?, 'prepared', ?, NULL, NULL,
+                        NULL, NULL, NULL, NULL
+                    )
+                    """,
+                    (
+                        batch_id,
+                        batch_creation_sequence,
+                        claim.canonical_session_id,
+                        claim.project_id,
+                        claim.turn_id,
+                        claim.sequence,
+                        claim.worker_id,
+                        claim.attempt_id,
+                        claim.lease_generation,
+                        claim.fencing_token,
+                        claim.lease_expires_at,
+                        operation_id,
+                        approval_id,
+                        base_message_count,
+                        transcript_json,
+                        transcript_sha256,
+                        created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "unique constraint failed" in str(exc).lower():
+                    raise ValueError(
+                        "approval checkpoint preparation collides with "
+                        "immutable authority"
+                    ) from exc
+                raise
+            stored = conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+            if stored is None:
+                raise RuntimeError("prepared project batch disappeared")
+            return _pending_project_batch_from_row(stored)
+
+        return self._execute_write(
+            prepare,
+            count_only_if_changed=True,
+        )
+
+    def _project_batch_settlement_snapshot(
+        self,
+        batch_id: str,
+    ) -> dict[str, object] | None:
+        if not _is_canonical_uuid4(batch_id):
+            raise ValueError("invalid project batch id")
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def publication_state(
+        self,
+        checkpoint: object,
+    ) -> Literal["published", "waiting", "permanent_conflict"]:
+        """Read one exact immutable approval checkpoint proof."""
+        from hermes_cli.project_operations import (
+            ApprovalCheckpointIdentity,
+        )
+
+        if (
+            type(checkpoint) is not ApprovalCheckpointIdentity
+            or type(checkpoint.attempt) is not TurnAttemptIdentity
+            or not _is_canonical_uuid4(checkpoint.checkpoint_id)
+            or not all(
+                type(value) is str and bool(value)
+                for value in (
+                    checkpoint.operation_id,
+                    checkpoint.approval_id,
+                    checkpoint.attempt.project_id,
+                    checkpoint.attempt.turn_id,
+                    checkpoint.attempt.worker_id,
+                    checkpoint.attempt.attempt_id,
+                    checkpoint.attempt.canonical_session_id,
+                )
+            )
+            or not all(
+                type(value) is int
+                and 1 <= value <= _SQLITE_INT_MAX
+                for value in (
+                    checkpoint.attempt.sequence,
+                    checkpoint.attempt.lease_generation,
+                    checkpoint.attempt.fencing_token,
+                )
+            )
+            or type(checkpoint.attempt.lease_expires_at) is not int
+            or not (
+                0
+                <= checkpoint.attempt.lease_expires_at
+                <= _MAX_PERSISTED_TIMESTAMP_INT
+            )
+        ):
+            return "permanent_conflict"
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (checkpoint.checkpoint_id,),
+            ).fetchone()
+        if row is None or not (
+            row["kind"] == "approval_checkpoint"
+            and row["terminal_status"] is None
+            and row["operation_id"] == checkpoint.operation_id
+            and row["approval_id"] == checkpoint.approval_id
+            and row["project_id"] == checkpoint.attempt.project_id
+            and row["turn_id"] == checkpoint.attempt.turn_id
+            and row["sequence"] == checkpoint.attempt.sequence
+            and row["worker_id"] == checkpoint.attempt.worker_id
+            and row["attempt_id"] == checkpoint.attempt.attempt_id
+            and row["lease_generation"]
+                == checkpoint.attempt.lease_generation
+            and row["fencing_token"]
+                == checkpoint.attempt.fencing_token
+            and row["session_id"]
+                == checkpoint.attempt.canonical_session_id
+            and row["lease_expires_at"]
+                == checkpoint.attempt.lease_expires_at
+            and _project_batch_transcript_digest_matches(row)
+            and row["projects_acknowledged_at"] is None
+            and row["transcript_conflict_key"] is None
+            and row["observed_message_count"] is None
+            and row["remediated_at"] is None
+            and row["discard_authority"] is None
+        ):
+            return "permanent_conflict"
+        if (
+            row["state"] == "prepared"
+            and row["published_at"] is None
+        ):
+            return "waiting"
+        published_at = row["published_at"]
+        if (
+            row["state"] == "published"
+            and type(published_at) in {int, float}
+            and math.isfinite(published_at)
+            and 0 <= published_at <= _MAX_PERSISTED_TIMESTAMP
+        ):
+            return "published"
+        return "permanent_conflict"
+
+    @staticmethod
+    def _require_project_batch_fingerprint(
+        fingerprint: tuple[object, ...],
+    ) -> tuple[object, ...]:
+        if not (
+            type(fingerprint) is tuple
+            and len(fingerprint) == len(
+                _PROJECT_BATCH_IMMUTABLE_COLUMNS
+            )
+            and _is_canonical_uuid4(fingerprint[0])
+        ):
+            raise ValueError("invalid project batch fingerprint")
+        return fingerprint
+
+    def _publish_approval_project_batch(
+        self,
+        fingerprint: tuple[object, ...],
+    ) -> str:
+        """Publish or permanently conflict one approval checkpoint."""
+        fingerprint = self._require_project_batch_fingerprint(
+            fingerprint
+        )
+        batch_id = fingerprint[0]
+
+        def publish(conn: sqlite3.Connection) -> str:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+            if row is None or (
+                _project_batch_fingerprint(row) != fingerprint
+            ):
+                return "state_conflict"
+            if row["kind"] != "approval_checkpoint":
+                return "state_conflict"
+            if row["state"] == "published":
+                published_at = row["published_at"]
+                if not (
+                    type(published_at) in {int, float}
+                    and math.isfinite(published_at)
+                    and 0
+                    <= published_at
+                    <= _MAX_PERSISTED_TIMESTAMP
+                    and row["projects_acknowledged_at"] is None
+                    and row["transcript_conflict_key"] is None
+                    and row["observed_message_count"] is None
+                    and row["remediated_at"] is None
+                    and row["discard_authority"] is None
+                    and _project_batch_transcript_digest_matches(
+                        row
+                    )
+                ):
+                    return "state_conflict"
+                return "already_published"
+            if row["state"] == "discarded":
+                return "already_discarded"
+            if row["state"] == "conflicted":
+                if not (
+                    row["published_at"] is None
+                    and row["projects_acknowledged_at"] is None
+                    and row["transcript_conflict_key"] is None
+                    and row["observed_message_count"] is None
+                    and row["remediated_at"] is None
+                    and row["discard_authority"] is None
+                ):
+                    return "state_conflict"
+                return "already_conflicted"
+            if (
+                row["state"] != "prepared"
+                or row["terminal_status"] is not None
+                or type(row["operation_id"]) is not str
+                or not row["operation_id"]
+                or type(row["approval_id"]) is not str
+                or not row["approval_id"]
+                or not _project_batch_transcript_digest_matches(row)
+                or row["published_at"] is not None
+                or row["projects_acknowledged_at"] is not None
+                or row["transcript_conflict_key"] is not None
+                or row["observed_message_count"] is not None
+                or row["remediated_at"] is not None
+                or row["discard_authority"] is not None
+            ):
+                return "state_conflict"
+            session = conn.execute(
+                """
+                SELECT message_count, tool_call_count,
+                       typeof(message_count) AS message_count_type,
+                       typeof(tool_call_count) AS tool_call_count_type
+                FROM sessions
+                WHERE id = ?
+                """,
+                (row["session_id"],),
+            ).fetchone()
+            if (
+                session is None
+                or type(session["message_count"]) is not int
+                or type(session["tool_call_count"]) is not int
+                or session["message_count_type"] != "integer"
+                or session["tool_call_count_type"] != "integer"
+                or not (
+                    0
+                    <= session["message_count"]
+                    <= _SQLITE_INT_MAX
+                )
+                or not (
+                    0
+                    <= session["tool_call_count"]
+                    <= _SQLITE_INT_MAX
+                )
+            ):
+                return "state_conflict"
+            if session["message_count"] != row["base_message_count"]:
+                if conn.execute(
+                    f"""
+                    UPDATE project_turn_transcript_batches
+                    SET state = 'conflicted'
+                    WHERE kind = 'approval_checkpoint'
+                      AND state = 'prepared'
+                      AND published_at IS NULL
+                      AND projects_acknowledged_at IS NULL
+                      AND transcript_conflict_key IS NULL
+                      AND observed_message_count IS NULL
+                      AND remediated_at IS NULL
+                      AND discard_authority IS NULL
+                      AND {_project_batch_fingerprint_predicate()}
+                    """,
+                    fingerprint,
+                ).rowcount != 1:
+                    raise _ProjectBatchStateConflict
+                return "conflicted"
+            try:
+                transcript = json.loads(
+                    row["transcript_json"],
+                    parse_constant=lambda _value: (_ for _ in ()).throw(
+                        ValueError()
+                    ),
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "malformed project batch transcript"
+                ) from exc
+            if (
+                type(transcript) is not list
+                or type(row["transcript_json"]) is not str
+                or type(row["transcript_sha256"]) is not str
+                or hashlib.sha256(
+                    row["transcript_json"].encode("utf-8")
+                ).hexdigest()
+                != row["transcript_sha256"]
+            ):
+                raise RuntimeError("malformed project batch transcript")
+            try:
+                canonical_transcript = (
+                    _canonical_terminal_transcript(transcript)
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "malformed project batch transcript"
+                ) from exc
+            if canonical_transcript != row["transcript_json"]:
+                raise RuntimeError("malformed project batch transcript")
+            inserted = len(transcript)
+            tool_calls = sum(
+                len(message["tool_calls"])
+                for message in transcript
+                if message.get("tool_calls") is not None
+            )
+            if (
+                inserted > _SQLITE_INT_MAX
+                or tool_calls > _SQLITE_INT_MAX
+                or session["message_count"]
+                > _SQLITE_INT_MAX - inserted
+                or session["tool_call_count"]
+                > _SQLITE_INT_MAX - tool_calls
+            ):
+                return "state_conflict"
+            next_message_count = (
+                session["message_count"] + inserted
+            )
+            next_tool_call_count = (
+                session["tool_call_count"] + tool_calls
+            )
+            persisted_inserted, persisted_tool_calls = (
+                self._insert_message_rows(
+                    conn,
+                    row["session_id"],
+                    transcript,
+                )
+            )
+            if (
+                persisted_inserted != inserted
+                or persisted_tool_calls != tool_calls
+            ):
+                raise RuntimeError(
+                    "project batch transcript count changed"
+                )
+            if conn.execute(
+                """
+                UPDATE sessions
+                SET message_count = ?, tool_call_count = ?
+                WHERE id = ?
+                  AND message_count IS ?
+                  AND tool_call_count IS ?
+                  AND typeof(message_count) = 'integer'
+                  AND typeof(tool_call_count) = 'integer'
+                """,
+                (
+                    next_message_count,
+                    next_tool_call_count,
+                    row["session_id"],
+                    session["message_count"],
+                    session["tool_call_count"],
+                ),
+            ).rowcount != 1:
+                raise _ProjectBatchStateConflict
+            published_at = time.time()
+            if not (
+                math.isfinite(published_at)
+                and 0 <= published_at <= _MAX_PERSISTED_TIMESTAMP
+            ):
+                raise RuntimeError("invalid project batch timestamp")
+            if conn.execute(
+                f"""
+                UPDATE project_turn_transcript_batches
+                SET state = 'published', published_at = ?
+                WHERE kind = 'approval_checkpoint'
+                  AND state = 'prepared'
+                  AND published_at IS NULL
+                  AND projects_acknowledged_at IS NULL
+                  AND transcript_conflict_key IS NULL
+                  AND observed_message_count IS NULL
+                  AND remediated_at IS NULL
+                  AND discard_authority IS NULL
+                  AND {_project_batch_fingerprint_predicate()}
+                """,
+                (published_at, *fingerprint),
+            ).rowcount != 1:
+                raise _ProjectBatchStateConflict
+            return "published"
+
+        try:
+            return self._execute_write(
+                publish,
+                count_only_if_changed=True,
+            )
+        except _ProjectBatchStateConflict:
+            return "state_conflict"
+
+    def _publish_project_batch(
+        self,
+        fingerprint: tuple[object, ...],
+    ) -> str | _ProjectBatchConflictReservation:
+        fingerprint = self._require_project_batch_fingerprint(
+            fingerprint
+        )
+        batch_id = fingerprint[0]
+
+        def publish(
+            conn: sqlite3.Connection,
+        ) -> str | _ProjectBatchConflictReservation:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+            if row is None or (
+                _project_batch_fingerprint(row) != fingerprint
+            ):
+                return "state_conflict"
+            if row["state"] == "published":
+                return "already_published"
+            if row["state"] == "discarded":
+                return "already_discarded"
+            if row["state"] == "conflicted":
+                reservation = (
+                    _project_batch_conflict_reservation_from_row(
+                        row,
+                        fingerprint,
+                    )
+                )
+                remediated_at = row["remediated_at"]
+                if not (
+                    reservation is not None
+                    and type(remediated_at) in {int, float}
+                    and math.isfinite(remediated_at)
+                    and 0
+                    <= remediated_at
+                    <= _MAX_PERSISTED_TIMESTAMP
+                ):
+                    return "state_conflict"
+                return "already_conflicted"
+            if row["state"] == "conflict_pending":
+                reservation = (
+                    _project_batch_conflict_reservation_from_row(
+                        row,
+                        fingerprint,
+                    )
+                )
+                if (
+                    reservation is None
+                    or row["remediated_at"] is not None
+                ):
+                    return "state_conflict"
+                return reservation
+            if (
+                row["state"] != "prepared"
+                or row["kind"] != "terminal_result"
+                or not _project_batch_transcript_digest_matches(row)
+                or row["published_at"] is not None
+                or row["projects_acknowledged_at"] is not None
+                or row["transcript_conflict_key"] is not None
+                or row["observed_message_count"] is not None
+                or row["remediated_at"] is not None
+                or row["discard_authority"] is not None
+            ):
+                return "state_conflict"
+            session = conn.execute(
+                """
+                SELECT message_count, tool_call_count,
+                       typeof(message_count) AS message_count_type,
+                       typeof(tool_call_count) AS tool_call_count_type
+                FROM sessions
+                WHERE id = ?
+                """,
+                (row["session_id"],),
+            ).fetchone()
+            if (
+                session is None
+                or type(session["message_count"]) is not int
+                or type(session["tool_call_count"]) is not int
+                or session["message_count_type"] != "integer"
+                or session["tool_call_count_type"] != "integer"
+                or not (
+                    0
+                    <= session["message_count"]
+                    <= _SQLITE_INT_MAX
+                )
+                or not (
+                    0
+                    <= session["tool_call_count"]
+                    <= _SQLITE_INT_MAX
+                )
+            ):
+                return "state_conflict"
+            if session["message_count"] != row["base_message_count"]:
+                observed_message_count = session["message_count"]
+                conflict_key = _project_batch_conflict_key(
+                    row,
+                    observed_message_count,
+                )
+                if conflict_key is None:
+                    return "state_conflict"
+                if conn.execute(
+                    f"""
+                    UPDATE project_turn_transcript_batches
+                    SET state = 'conflict_pending',
+                        transcript_conflict_key = ?,
+                        observed_message_count = ?
+                    WHERE state = 'prepared'
+                      AND published_at IS NULL
+                      AND projects_acknowledged_at IS NULL
+                      AND transcript_conflict_key IS NULL
+                      AND observed_message_count IS NULL
+                      AND remediated_at IS NULL
+                      AND discard_authority IS NULL
+                      AND {_project_batch_fingerprint_predicate()}
+                    """,
+                    (
+                        conflict_key,
+                        observed_message_count,
+                        *fingerprint,
+                    ),
+                ).rowcount != 1:
+                    raise _ProjectBatchStateConflict
+                return _ProjectBatchConflictReservation(
+                    fingerprint=fingerprint,
+                    conflict_key=conflict_key,
+                    observed_message_count=observed_message_count,
+                )
+            try:
+                transcript = json.loads(
+                    row["transcript_json"],
+                    parse_constant=lambda _value: (_ for _ in ()).throw(
+                        ValueError()
+                    ),
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "malformed project batch transcript"
+                ) from exc
+            if (
+                type(transcript) is not list
+                or type(row["transcript_json"]) is not str
+                or type(row["transcript_sha256"]) is not str
+                or hashlib.sha256(
+                    row["transcript_json"].encode("utf-8")
+                ).hexdigest()
+                != row["transcript_sha256"]
+            ):
+                raise RuntimeError("malformed project batch transcript")
+            try:
+                canonical_transcript = (
+                    _canonical_terminal_transcript(transcript)
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "malformed project batch transcript"
+                ) from exc
+            if canonical_transcript != row["transcript_json"]:
+                raise RuntimeError("malformed project batch transcript")
+            inserted = len(transcript)
+            tool_calls = sum(
+                len(message["tool_calls"])
+                for message in transcript
+                if message.get("tool_calls") is not None
+            )
+            if (
+                inserted > _SQLITE_INT_MAX
+                or tool_calls > _SQLITE_INT_MAX
+                or session["message_count"]
+                > _SQLITE_INT_MAX - inserted
+                or session["tool_call_count"]
+                > _SQLITE_INT_MAX - tool_calls
+            ):
+                return "state_conflict"
+            next_message_count = (
+                session["message_count"] + inserted
+            )
+            next_tool_call_count = (
+                session["tool_call_count"] + tool_calls
+            )
+            persisted_inserted, persisted_tool_calls = (
+                self._insert_message_rows(
+                    conn,
+                    row["session_id"],
+                    transcript,
+                )
+            )
+            if (
+                persisted_inserted != inserted
+                or persisted_tool_calls != tool_calls
+            ):
+                raise RuntimeError(
+                    "project batch transcript count changed"
+                )
+            if conn.execute(
+                """
+                UPDATE sessions
+                SET message_count = ?, tool_call_count = ?
+                WHERE id = ?
+                  AND message_count IS ?
+                  AND tool_call_count IS ?
+                  AND typeof(message_count) = 'integer'
+                  AND typeof(tool_call_count) = 'integer'
+                """,
+                (
+                    next_message_count,
+                    next_tool_call_count,
+                    row["session_id"],
+                    session["message_count"],
+                    session["tool_call_count"],
+                ),
+            ).rowcount != 1:
+                raise _ProjectBatchStateConflict
+            published_at = time.time()
+            if not (
+                math.isfinite(published_at)
+                and 0 <= published_at <= _MAX_PERSISTED_TIMESTAMP
+            ):
+                raise RuntimeError("invalid project batch timestamp")
+            if conn.execute(
+                f"""
+                UPDATE project_turn_transcript_batches
+                SET state = 'published', published_at = ?
+                WHERE state = 'prepared'
+                  AND {_project_batch_fingerprint_predicate()}
+                """,
+                (published_at, *fingerprint),
+            ).rowcount != 1:
+                raise _ProjectBatchStateConflict
+            return "published"
+
+        try:
+            return self._execute_write(
+                publish,
+                count_only_if_changed=True,
+            )
+        except _ProjectBatchStateConflict:
+            return "state_conflict"
+
+    def _finalize_project_batch_conflict(
+        self,
+        reservation: _ProjectBatchConflictReservation,
+    ) -> str:
+        if type(reservation) is not _ProjectBatchConflictReservation:
+            raise ValueError("invalid project batch conflict reservation")
+        fingerprint = self._require_project_batch_fingerprint(
+            reservation.fingerprint
+        )
+        if not (
+            type(reservation.conflict_key) is str
+            and len(reservation.conflict_key) == 84
+            and type(reservation.observed_message_count) is int
+            and 0
+            <= reservation.observed_message_count
+            <= _SQLITE_INT_MAX
+        ):
+            raise ValueError("invalid project batch conflict reservation")
+        batch_id = fingerprint[0]
+
+        def finalize(conn: sqlite3.Connection) -> str:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+            if row is None or (
+                _project_batch_fingerprint(row) != fingerprint
+            ):
+                return "state_conflict"
+            current = _project_batch_conflict_reservation_from_row(
+                row,
+                fingerprint,
+            )
+            if current != reservation:
+                return "state_conflict"
+            if row["state"] == "conflicted":
+                remediated_at = row["remediated_at"]
+                if not (
+                    type(remediated_at) in {int, float}
+                    and math.isfinite(remediated_at)
+                    and 0
+                    <= remediated_at
+                    <= _MAX_PERSISTED_TIMESTAMP
+                ):
+                    return "state_conflict"
+                return "already_conflicted"
+            if (
+                row["state"] != "conflict_pending"
+                or row["remediated_at"] is not None
+            ):
+                return "state_conflict"
+            remediated_at = time.time()
+            if not (
+                type(remediated_at) in {int, float}
+                and math.isfinite(remediated_at)
+                and 0
+                <= remediated_at
+                <= _MAX_PERSISTED_TIMESTAMP
+            ):
+                raise RuntimeError("invalid project batch timestamp")
+            if conn.execute(
+                f"""
+                UPDATE project_turn_transcript_batches
+                SET state = 'conflicted', remediated_at = ?
+                WHERE state = 'conflict_' || 'pending'
+                  AND published_at IS NULL
+                  AND projects_acknowledged_at IS NULL
+                  AND transcript_conflict_key IS ?
+                  AND observed_message_count IS ?
+                  AND remediated_at IS NULL
+                  AND discard_authority IS NULL
+                  AND {_project_batch_fingerprint_predicate()}
+                """,
+                (
+                    remediated_at,
+                    reservation.conflict_key,
+                    reservation.observed_message_count,
+                    *fingerprint,
+                ),
+            ).rowcount != 1:
+                raise _ProjectBatchStateConflict
+            return "conflicted"
+
+        try:
+            return self._execute_write(
+                finalize,
+                count_only_if_changed=True,
+            )
+        except _ProjectBatchStateConflict:
+            return "state_conflict"
+
+    def _discard_project_batch(
+        self,
+        fingerprint: tuple[object, ...],
+        discard_authority: Literal[
+            "stop_requested",
+            "cancelled",
+            "superseded_attempt",
+            "superseded_terminal",
+            "recovery_blocked",
+        ],
+    ) -> str:
+        fingerprint = self._require_project_batch_fingerprint(
+            fingerprint
+        )
+        if (
+            type(discard_authority) is not str
+            or discard_authority not in {
+                "stop_requested",
+                "cancelled",
+                "superseded_attempt",
+                "superseded_terminal",
+                "recovery_blocked",
+            }
+        ):
+            raise ValueError("invalid project batch discard authority")
+        batch_id = fingerprint[0]
+
+        def discard(conn: sqlite3.Connection) -> str:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+            if row is None or (
+                _project_batch_fingerprint(row) != fingerprint
+            ):
+                return "state_conflict"
+            if row["state"] == "discarded":
+                if row["discard_authority"] == discard_authority:
+                    return "already_discarded"
+                return "state_conflict"
+            if row["state"] != "prepared":
+                return "state_conflict"
+            if conn.execute(
+                f"""
+                UPDATE project_turn_transcript_batches
+                SET state = 'discarded', discard_authority = ?
+                WHERE state = 'prepared'
+                  AND {_project_batch_fingerprint_predicate()}
+                """,
+                (discard_authority, *fingerprint),
+            ).rowcount != 1:
+                raise _ProjectBatchStateConflict
+            return "discarded"
+
+        try:
+            return self._execute_write(
+                discard,
+                count_only_if_changed=True,
+            )
+        except _ProjectBatchStateConflict:
+            return "state_conflict"
+
+    def _acknowledge_project_batch(
+        self,
+        fingerprint: tuple[object, ...],
+    ) -> str:
+        fingerprint = self._require_project_batch_fingerprint(
+            fingerprint
+        )
+        batch_id = fingerprint[0]
+
+        def acknowledge(conn: sqlite3.Connection) -> str:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM project_turn_transcript_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+            if row is None or (
+                _project_batch_fingerprint(row) != fingerprint
+            ):
+                return "state_conflict"
+            if row["projects_acknowledged_at"] is not None:
+                return "already_acknowledged"
+            if (
+                row["kind"] != "terminal_result"
+                or row["state"] != "published"
+            ):
+                return "state_conflict"
+            acknowledged_at = time.time()
+            if not (
+                math.isfinite(acknowledged_at)
+                and 0 <= acknowledged_at <= _MAX_PERSISTED_TIMESTAMP
+            ):
+                raise RuntimeError("invalid project batch timestamp")
+            if conn.execute(
+                f"""
+                UPDATE project_turn_transcript_batches
+                SET projects_acknowledged_at = ?
+                WHERE state = 'published'
+                  AND projects_acknowledged_at IS NULL
+                  AND {_project_batch_fingerprint_predicate()}
+                """,
+                (acknowledged_at, *fingerprint),
+            ).rowcount != 1:
+                raise _ProjectBatchStateConflict
+            return "acknowledged"
+
+        try:
+            return self._execute_write(acknowledge)
+        except _ProjectBatchStateConflict:
+            return "state_conflict"
+
+    def pending_project_batch_upper_watermark(
+        self,
+    ) -> ProjectBatchCursor | None:
+        """Read the inclusive upper bound for one settlement epoch."""
+        rows = self._execute_project_batch_scan(
+            _PROJECT_BATCH_ACTIONABLE_UPPER_SQL,
+            (),
+        )
+        if not rows:
+            return None
+        cursor = ProjectBatchCursor(
+            rows[0]["batch_creation_sequence"],
+            rows[0]["batch_id"],
+        )
+        try:
+            return _require_project_batch_cursor(cursor)
+        except ValueError as exc:
+            raise RuntimeError(
+                "malformed project batch upper watermark"
+            ) from exc
+
+    def list_pending_project_batches(
+        self,
+        *,
+        after: ProjectBatchCursor | None,
+        through: ProjectBatchCursor,
+        limit: int,
+    ) -> tuple[PendingProjectBatch, ...]:
+        """Read one fixed-upper actionable settlement page."""
+        through = _require_project_batch_cursor(through)
+        if after is not None:
+            after = _require_project_batch_cursor(after)
+        if not (
+            type(limit) is int
+            and 1 <= limit <= 100
+        ):
+            raise ValueError("invalid project batch page limit")
+        if after is not None and (
+            after.batch_creation_sequence,
+            after.batch_id,
+        ) > (
+            through.batch_creation_sequence,
+            through.batch_id,
+        ):
+            raise ValueError("project batch cursor exceeds upper")
+
+        if after is None:
+            sql = _PROJECT_BATCH_ACTIONABLE_PAGE_START_SQL
+            parameters = (
+                through.batch_creation_sequence,
+                through.batch_id,
+                limit,
+            )
+        else:
+            sql = _PROJECT_BATCH_ACTIONABLE_PAGE_AFTER_SQL
+            parameters = (
+                after.batch_creation_sequence,
+                after.batch_id,
+                through.batch_creation_sequence,
+                through.batch_id,
+                limit,
+            )
+        return tuple(
+            _pending_project_batch_from_row(row)
+            for row in self._execute_project_batch_scan(
+                sql,
+                parameters,
+            )
+        )
+
+    def _pending_project_batches_remaining(
+        self,
+        *,
+        after: ProjectBatchCursor,
+        through: ProjectBatchCursor,
+    ) -> bool:
+        """Return whether the fixed settlement epoch has another member."""
+        after = _require_project_batch_cursor(after)
+        through = _require_project_batch_cursor(through)
+        if (
+            after.batch_creation_sequence,
+            after.batch_id,
+        ) > (
+            through.batch_creation_sequence,
+            through.batch_id,
+        ):
+            raise ValueError("project batch cursor exceeds upper")
+        return bool(
+            self._execute_project_batch_scan(
+                _PROJECT_BATCH_ACTIONABLE_REMAINING_SQL,
+                (
+                    after.batch_creation_sequence,
+                    after.batch_id,
+                    through.batch_creation_sequence,
+                    through.batch_id,
+                ),
+            )
+        )
 
     # ── Chunked FTS rebuild engine (v23 opt-in optimize) ──
     #
@@ -3236,6 +5968,342 @@ class SessionDB:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    def _converge_project_batch_c8_schema(
+        self,
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """Install C8's additive column and guards as one rollback domain."""
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                (
+                    row[1]
+                    if isinstance(row, (tuple, list))
+                    else row["name"]
+                )
+                for row in cursor.execute(
+                    "PRAGMA table_info(project_turn_transcript_batches)"
+                ).fetchall()
+            }
+            if "discard_authority" not in columns:
+                cursor.execute(
+                    "ALTER TABLE project_turn_transcript_batches "
+                    "ADD COLUMN discard_authority TEXT"
+                )
+            canonical_guards = dict(
+                zip(
+                    _PROJECT_BATCH_C8_GUARD_NAMES,
+                    _PROJECT_BATCH_C8_GUARD_SQL,
+                    strict=True,
+                )
+            )
+            for name, statement in canonical_guards.items():
+                installed = cursor.execute(
+                    """
+                    SELECT sql
+                    FROM sqlite_master
+                    WHERE type = 'trigger' AND name = ?
+                    """,
+                    (name,),
+                ).fetchone()
+                installed_sql = (
+                    installed[0]
+                    if isinstance(installed, (tuple, list))
+                    else installed["sql"]
+                    if installed is not None
+                    else None
+                )
+                if (
+                    _normalized_named_schema_sql(installed_sql)
+                    == _normalized_named_schema_sql(statement)
+                ):
+                    continue
+                quoted_name = name.replace('"', '""')
+                cursor.execute(
+                    f'DROP TRIGGER IF EXISTS "{quoted_name}"'
+                )
+                cursor.execute(statement)
+            for name, statement in canonical_guards.items():
+                installed = cursor.execute(
+                    """
+                    SELECT sql
+                    FROM sqlite_master
+                    WHERE type = 'trigger' AND name = ?
+                    """,
+                    (name,),
+                ).fetchone()
+                installed_sql = (
+                    installed[0]
+                    if isinstance(installed, (tuple, list))
+                    else installed["sql"]
+                    if installed is not None
+                    else None
+                )
+                if (
+                    _normalized_named_schema_sql(installed_sql)
+                    != _normalized_named_schema_sql(statement)
+                ):
+                    raise RuntimeError(
+                        f"failed to converge C8 guard {name}"
+                    )
+            cursor.execute("COMMIT")
+        except BaseException:
+            if self._conn.in_transaction:
+                cursor.execute("ROLLBACK")
+            raise
+
+    def _converge_project_batch_c10_schema(
+        self,
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """Rebuild C9's table CHECK and converge the closed named objects."""
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            installed = cursor.execute(
+                """
+                SELECT sql
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'project_turn_transcript_batches'
+                """
+            ).fetchone()
+            installed_sql = (
+                installed[0]
+                if isinstance(installed, (tuple, list))
+                else installed["sql"]
+                if installed is not None
+                else None
+            )
+            normalized_table_sql = (
+                " ".join(installed_sql.split()).lower()
+                if type(installed_sql) is str
+                else ""
+            )
+            approval_conflict_shape = (
+                "state = 'conflicted' "
+                "and kind = 'approval_checkpoint'"
+            )
+            if approval_conflict_shape not in normalized_table_sql:
+                old_columns = {
+                    (
+                        row[1]
+                        if isinstance(row, (tuple, list))
+                        else row["name"]
+                    )
+                    for row in cursor.execute(
+                        "PRAGMA table_info("
+                        "project_turn_transcript_batches)"
+                    ).fetchall()
+                }
+                required_columns = set(
+                    _PROJECT_BATCH_STORAGE_COLUMNS[:20]
+                )
+                if not required_columns <= old_columns:
+                    raise RuntimeError(
+                        "project batch table is missing durable columns"
+                    )
+
+                cursor.execute(
+                    "ALTER TABLE project_turn_transcript_batches "
+                    "RENAME TO project_turn_transcript_batches_c9_legacy"
+                )
+                table_start = SCHEMA_SQL.index(
+                    "CREATE TABLE IF NOT EXISTS "
+                    "project_turn_transcript_batches"
+                )
+                table_end = SCHEMA_SQL.index(
+                    "\n\nCREATE UNIQUE INDEX IF NOT EXISTS",
+                    table_start,
+                )
+                create_table_sql = SCHEMA_SQL[
+                    table_start:table_end
+                ].replace(
+                    "CREATE TABLE IF NOT EXISTS "
+                    "project_turn_transcript_batches",
+                    "CREATE TABLE project_turn_transcript_batches",
+                    1,
+                )
+                cursor.execute(create_table_sql)
+                copied_columns = tuple(
+                    column
+                    for column in _PROJECT_BATCH_STORAGE_COLUMNS
+                    if column in old_columns
+                )
+                quoted_columns = ", ".join(
+                    f'"{column}"' for column in copied_columns
+                )
+                cursor.execute(
+                    "INSERT INTO project_turn_transcript_batches "
+                    f"({quoted_columns}) SELECT {quoted_columns} "
+                    "FROM project_turn_transcript_batches_c9_legacy"
+                )
+                cursor.execute(
+                    "DROP TABLE "
+                    "project_turn_transcript_batches_c9_legacy"
+                )
+
+            for statement in _PROJECT_BATCH_DURABLE_INDEX_SQL:
+                cursor.execute(statement)
+
+            canonical_guards = dict(
+                zip(
+                    (
+                        *_PROJECT_BATCH_C8_GUARD_NAMES,
+                        *_PROJECT_BATCH_C9_GUARD_NAMES,
+                    ),
+                    (
+                        *_PROJECT_BATCH_C8_GUARD_SQL,
+                        *_PROJECT_BATCH_C9_GUARD_SQL,
+                    ),
+                    strict=True,
+                )
+            )
+            for name, statement in canonical_guards.items():
+                installed = cursor.execute(
+                    """
+                    SELECT sql
+                    FROM sqlite_master
+                    WHERE type = 'trigger' AND name = ?
+                    """,
+                    (name,),
+                ).fetchone()
+                installed_sql = (
+                    installed[0]
+                    if isinstance(installed, (tuple, list))
+                    else installed["sql"]
+                    if installed is not None
+                    else None
+                )
+                if (
+                    _normalized_named_schema_sql(installed_sql)
+                    == _normalized_named_schema_sql(statement)
+                ):
+                    continue
+                quoted_name = name.replace('"', '""')
+                cursor.execute(
+                    f'DROP TRIGGER IF EXISTS "{quoted_name}"'
+                )
+                cursor.execute(statement)
+            for name, statement in canonical_guards.items():
+                installed = cursor.execute(
+                    """
+                    SELECT sql
+                    FROM sqlite_master
+                    WHERE type = 'trigger' AND name = ?
+                    """,
+                    (name,),
+                ).fetchone()
+                installed_sql = (
+                    installed[0]
+                    if isinstance(installed, (tuple, list))
+                    else installed["sql"]
+                    if installed is not None
+                    else None
+                )
+                if (
+                    _normalized_named_schema_sql(installed_sql)
+                    != _normalized_named_schema_sql(statement)
+                ):
+                    raise RuntimeError(
+                        f"failed to converge project batch guard {name}"
+                    )
+            cursor.execute("COMMIT")
+        except BaseException:
+            if self._conn.in_transaction:
+                cursor.execute("ROLLBACK")
+            raise
+
+    def _converge_project_batch_c9_schema(
+        self,
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """Install C9's columns and canonical guards atomically."""
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                (
+                    row[1]
+                    if isinstance(row, (tuple, list))
+                    else row["name"]
+                )
+                for row in cursor.execute(
+                    "PRAGMA table_info(project_turn_transcript_batches)"
+                ).fetchall()
+            }
+            additions = (
+                ("transcript_conflict_key", "TEXT"),
+                ("observed_message_count", "INTEGER"),
+                ("remediated_at", "REAL"),
+            )
+            for name, declaration in additions:
+                if name not in columns:
+                    quoted_name = name.replace('"', '""')
+                    cursor.execute(
+                        "ALTER TABLE project_turn_transcript_batches "
+                        f'ADD COLUMN "{quoted_name}" {declaration}'
+                    )
+            canonical_guards = dict(
+                zip(
+                    _PROJECT_BATCH_C9_GUARD_NAMES,
+                    _PROJECT_BATCH_C9_GUARD_SQL,
+                    strict=True,
+                )
+            )
+            for name, statement in canonical_guards.items():
+                installed = cursor.execute(
+                    """
+                    SELECT sql
+                    FROM sqlite_master
+                    WHERE type = 'trigger' AND name = ?
+                    """,
+                    (name,),
+                ).fetchone()
+                installed_sql = (
+                    installed[0]
+                    if isinstance(installed, (tuple, list))
+                    else installed["sql"]
+                    if installed is not None
+                    else None
+                )
+                if (
+                    _normalized_named_schema_sql(installed_sql)
+                    == _normalized_named_schema_sql(statement)
+                ):
+                    continue
+                quoted_name = name.replace('"', '""')
+                cursor.execute(
+                    f'DROP TRIGGER IF EXISTS "{quoted_name}"'
+                )
+                cursor.execute(statement)
+            for name, statement in canonical_guards.items():
+                installed = cursor.execute(
+                    """
+                    SELECT sql
+                    FROM sqlite_master
+                    WHERE type = 'trigger' AND name = ?
+                    """,
+                    (name,),
+                ).fetchone()
+                installed_sql = (
+                    installed[0]
+                    if isinstance(installed, (tuple, list))
+                    else installed["sql"]
+                    if installed is not None
+                    else None
+                )
+                if (
+                    _normalized_named_schema_sql(installed_sql)
+                    != _normalized_named_schema_sql(statement)
+                ):
+                    raise RuntimeError(
+                        f"failed to converge C9 guard {name}"
+                    )
+            cursor.execute("COMMIT")
+        except BaseException:
+            if self._conn.in_transaction:
+                cursor.execute("ROLLBACK")
+            raise
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -3252,6 +6320,13 @@ class SessionDB:
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
+        # C10 must own the first post-schema transaction: its table rebuild,
+        # four indexes and twelve same-name guards are one rollback domain.
+        self._converge_project_batch_c10_schema(cursor)
+        # The older additive convergence remains idempotent for partially
+        # upgraded databases and uses the same final canonical definitions.
+        self._converge_project_batch_c8_schema(cursor)
+        self._converge_project_batch_c9_schema(cursor)
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
@@ -3275,7 +6350,11 @@ class SessionDB:
 
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
+        cursor.execute(
+            "DROP INDEX IF EXISTS idx_project_batches_pending"
+        )
         cursor.executescript(DEFERRED_INDEX_SQL)
+        _ensure_project_batch_actionable_settlement_index(cursor)
 
         # Heal NULL ``active`` rows unconditionally on every startup.
         # On real-world DBs the reconciler-added ``active`` column can lack
@@ -6387,7 +9466,7 @@ class SessionDB:
         string would store a quoted JSON string, and the single ``json.loads``
         on read then yields a ``str`` instead of a dict.
         """
-        if not display_metadata:
+        if display_metadata is None:
             return None
         if isinstance(display_metadata, str):
             try:
@@ -6656,13 +9735,19 @@ class SessionDB:
                 msg.get("codex_message_items") if role == "assistant" else None
             )
             reasoning_details_json = (
-                json.dumps(reasoning_details) if reasoning_details else None
+                json.dumps(reasoning_details)
+                if reasoning_details is not None
+                else None
             )
             codex_items_json = (
-                json.dumps(codex_reasoning_items) if codex_reasoning_items else None
+                json.dumps(codex_reasoning_items)
+                if codex_reasoning_items is not None
+                else None
             )
             codex_message_items_json = (
-                json.dumps(codex_message_items) if codex_message_items else None
+                json.dumps(codex_message_items)
+                if codex_message_items is not None
+                else None
             )
             # tool_calls may arrive as a Python list (from the live agent)
             # or as a JSON string (from import_sessions / export_session,
@@ -6673,12 +9758,16 @@ class SessionDB:
                     tool_calls = json.loads(tool_calls)
                 except (json.JSONDecodeError, TypeError):
                     tool_calls = []
-            tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+            tool_calls_json = (
+                json.dumps(tool_calls)
+                if tool_calls is not None
+                else None
+            )
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
-            platform_msg_id = (
-                msg.get("platform_message_id") or msg.get("message_id")
-            )
+            platform_msg_id = msg.get("platform_message_id")
+            if platform_msg_id is None:
+                platform_msg_id = msg.get("message_id")
 
             api_content = msg.get("api_content")
 
@@ -7285,6 +10374,99 @@ class SessionDB:
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"
     )
+
+    def _project_history_snapshot(
+        self,
+        session_id: str,
+    ) -> tuple[tuple[Mapping[str, object], ...], int]:
+        """Read the strict live lineage and canonical tip counter atomically."""
+        if type(session_id) is not str or not session_id:
+            raise ValueError("invalid project history session")
+        with self._lock:
+            if self._conn.in_transaction:
+                raise ValueError("caller-owned transaction is not allowed")
+            self._conn.execute("BEGIN")
+            try:
+                chain_tip_to_root: list[str] = []
+                seen: set[str] = set()
+                current: str | None = session_id
+                tip_count: int | None = None
+                for _ in range(100):
+                    if current is None:
+                        break
+                    if (
+                        type(current) is not str
+                        or not current
+                        or current in seen
+                    ):
+                        raise RuntimeError("malformed project session lineage")
+                    seen.add(current)
+                    row = self._conn.execute(
+                        """
+                        SELECT parent_session_id, message_count,
+                               typeof(message_count) AS message_count_type
+                        FROM sessions WHERE id = ?
+                        """,
+                        (current,),
+                    ).fetchone()
+                    if row is None:
+                        raise RuntimeError("missing project session lineage")
+                    if tip_count is None:
+                        value = row["message_count"]
+                        if not (
+                            row["message_count_type"] == "integer"
+                            and type(value) is int
+                            and 0 <= value <= _SQLITE_INT_MAX
+                        ):
+                            raise RuntimeError(
+                                "malformed project session counter"
+                            )
+                        tip_count = value
+                    chain_tip_to_root.append(current)
+                    parent = row["parent_session_id"]
+                    if parent is not None and (
+                        type(parent) is not str or not parent
+                    ):
+                        raise RuntimeError("malformed project session lineage")
+                    current = parent
+                else:
+                    raise RuntimeError("project session lineage is too deep")
+                lineage = tuple(reversed(chain_tip_to_root))
+                placeholders = ",".join("?" for _ in lineage)
+                rows = self._conn.execute(
+                    f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                    f"FROM messages WHERE session_id IN ({placeholders}) "
+                    "AND active = 1 ORDER BY id",
+                    lineage,
+                ).fetchall()
+                messages = self._rows_to_conversation(
+                    rows,
+                    session_id=session_id,
+                    include_ancestors=True,
+                    repair_alternation=True,
+                )
+                for message in messages:
+                    message.pop("timestamp", None)
+                detached = json.loads(
+                    json.dumps(
+                        messages,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                )
+                if type(detached) is not list or not all(
+                    type(message) is dict for message in detached
+                ):
+                    raise RuntimeError("malformed project history")
+                assert tip_count is not None
+                result = (tuple(detached), tip_count)
+                self._conn.commit()
+                return result
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
     def _rows_to_conversation(
         self,

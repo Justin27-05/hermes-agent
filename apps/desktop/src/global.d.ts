@@ -1,5 +1,6 @@
 import type { GatewayWsUrlResult } from '@hermes/shared'
 
+import type { NativeApprovalNotificationContext } from './store/native-notifications'
 import type {
   PetOverlayBounds,
   PetOverlayControl,
@@ -202,7 +203,13 @@ declare global {
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
-      onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
+      onNotificationAction?: (
+        callback: (payload: {
+          actionId: string
+          approvalContext?: NativeApprovalNotificationContext
+          sessionId?: string
+        }) => void
+      ) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
       // Soft gateway-mode apply: primary backend was torn down without a window
@@ -695,6 +702,7 @@ export interface HermesNotification {
   kind?: string
   sessionId?: string
   actions?: { id: string; text: string }[]
+  approvalContext?: NativeApprovalNotificationContext
 }
 
 export interface HermesPreviewTarget {

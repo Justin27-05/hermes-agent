@@ -7,6 +7,8 @@ break them.
 
 from __future__ import annotations
 
+import pytest
+
 from tui_gateway import project_tree as pt
 
 _SID = 0
@@ -294,6 +296,107 @@ def test_explicit_project_claims_sessions_and_beats_auto():
     assert explicit["sessionCount"] == 1
     # The unowned /www/other session becomes its own auto project.
     assert any(p["id"] == "/www/other" and p["isAuto"] for p in tree["projects"])
+
+
+def test_exact_session_project_id_wins_over_cwd_match():
+    project_a = _project("p_a", "A", ["/work/a"])
+    project_b = _project("p_b", "B", ["/work/b"])
+    session = _session(
+        "/work/b/src",
+        project_id="p_a",
+        title="Canonical A context",
+    )
+
+    tree = pt.build_tree(
+        [project_a, project_b],
+        [session],
+        [],
+        resolve=lambda _cwd: None,
+        hydrate=True,
+    )
+    by_id = {project["id"]: project for project in tree["projects"]}
+
+    assert by_id["p_a"]["sessionCount"] == 1
+    assert by_id["p_b"]["sessionCount"] == 0
+    assert tree["blockedSessions"] == []
+
+
+def test_legacy_session_without_project_id_keeps_longest_path_match():
+    outer = _project("p_outer", "Outer", ["/work"])
+    inner = _project("p_inner", "Inner", ["/work/app"])
+    legacy = _session("/work/app/src", project_id=None)
+
+    tree = pt.build_tree(
+        [outer, inner],
+        [legacy],
+        [],
+        resolve=lambda _cwd: None,
+        hydrate=True,
+    )
+    by_id = {project["id"]: project for project in tree["projects"]}
+
+    assert by_id["p_inner"]["sessionCount"] == 1
+    assert by_id["p_outer"]["sessionCount"] == 0
+    assert tree["blockedSessions"] == []
+
+
+def test_unknown_exact_project_id_is_blocked_without_cwd_fallback():
+    project_b = _project("p_b", "B", ["/work/b"])
+    session = _session(
+        "/work/b/src",
+        project_id="p_missing",
+        title="Must not leak into B",
+    )
+
+    tree = pt.build_tree(
+        [project_b],
+        [session],
+        [],
+        resolve=lambda _cwd: None,
+        hydrate=True,
+    )
+
+    assert tree["projects"][0]["id"] == "p_b"
+    assert tree["projects"][0]["sessionCount"] == 0
+    assert session["id"] not in tree["scoped_session_ids"]
+    assert tree["blockedSessions"] == [
+        {
+            "sessionId": session["id"],
+            "projectId": "p_missing",
+            "reason": "project_not_found",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("outer_root", "inner_root", "cwd"),
+    (
+        ("C:/Work", "C:/Work/App", r"c:\work\APP\src"),
+        (
+            r"\\Server\Share",
+            r"\\Server\Share\Team",
+            "//server/share/team/src",
+        ),
+    ),
+)
+def test_legacy_windows_fallback_normalizes_case_separators_and_nested_roots(
+    outer_root, inner_root, cwd
+):
+    outer = _project("p_outer", "Outer", [outer_root])
+    inner = _project("p_inner", "Inner", [inner_root])
+    legacy = _session(cwd, project_id=None)
+
+    tree = pt.build_tree(
+        [outer, inner],
+        [legacy],
+        [],
+        resolve=lambda _cwd: None,
+        hydrate=True,
+    )
+    by_id = {project["id"]: project for project in tree["projects"]}
+
+    assert by_id["p_inner"]["sessionCount"] == 1
+    assert by_id["p_outer"]["sessionCount"] == 0
 
 
 def test_scoped_session_ids_is_union_of_placed_sessions():

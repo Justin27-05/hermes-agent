@@ -32,6 +32,10 @@ import threading
 from typing import Any
 
 from tui_gateway import server
+from tui_gateway.project_runtime_rpc import (
+    StrictJsonError,
+    strict_json_loads,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -39,7 +43,6 @@ _log = logging.getLogger(__name__)
 # to flush a WS frame before we mark the transport dead. Protects handler
 # threads from a wedged socket.
 _WS_WRITE_TIMEOUT_S = 10.0
-_WS_LOG_PAYLOAD_PREVIEW = 240
 
 # Per-token streaming frames are coalesced: buffered and flushed as a batch on
 # a short timer instead of waking the event loop once per token. A model reply
@@ -362,20 +365,22 @@ async def handle_ws(ws: Any) -> None:
             messages += 1
 
             try:
-                req = json.loads(line)
-            except json.JSONDecodeError as exc:
+                req = strict_json_loads(line)
+            except StrictJsonError as exc:
                 parse_errors += 1
+                syntax_error = isinstance(exc.__cause__, ValueError)
+                code = -32700 if syntax_error else -32600
+                message = "parse error" if syntax_error else "invalid request"
                 _log.warning(
-                    "ws parse error peer=%s index=%d error=%s payload=%r",
+                    "ws rejected JSON peer=%s index=%d kind=%s",
                     peer,
                     messages,
-                    exc,
-                    line[:_WS_LOG_PAYLOAD_PREVIEW],
+                    message,
                 )
                 ok = await transport.write_async(
                     {
                         "jsonrpc": "2.0",
-                        "error": {"code": -32700, "message": "parse error"},
+                        "error": {"code": code, "message": message},
                         "id": None,
                     }
                 )

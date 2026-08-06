@@ -14,6 +14,10 @@ import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { Archive, ArchiveOff, FolderOpen, Loader2, Trash2 } from '@/lib/icons'
+import {
+  captureExactLegacySessionAuthority,
+  validateExactLegacySessionAuthority
+} from '@/store/legacy-session-authority'
 import { notify, notifyError } from '@/store/notifications'
 import { untombstoneSessions } from '@/store/projects'
 import { applyConfiguredDefaultProjectDir, ensureDefaultWorkspaceCwd, setSessions } from '@/store/session'
@@ -25,6 +29,30 @@ import { useDeepLinkHighlight } from './use-deep-link-highlight'
 const DEFAULT_AUTO_ARCHIVE_DAYS = 3
 
 const ARCHIVED_FETCH_LIMIT = 200
+
+export async function unarchiveSessionWithAuthority(session: SessionInfo): Promise<boolean> {
+  const authority = captureExactLegacySessionAuthority({ storedSession: session })
+
+  if (!authority || !validateExactLegacySessionAuthority(authority)) {
+    return false
+  }
+
+  await setSessionArchived(session.id, false, authority.targetProfile)
+
+  return validateExactLegacySessionAuthority(authority)
+}
+
+export async function deleteArchivedSessionWithAuthority(session: SessionInfo): Promise<boolean> {
+  const authority = captureExactLegacySessionAuthority({ storedSession: session })
+
+  if (!authority || !validateExactLegacySessionAuthority(authority)) {
+    return false
+  }
+
+  await deleteSession(session.id, authority.targetProfile)
+
+  return validateExactLegacySessionAuthority(authority)
+}
 
 function workspaceLabel(cwd: null | string | undefined): string {
   const path = cwd?.trim()
@@ -71,7 +99,10 @@ export function SessionsSettings() {
       setBusyId(session.id)
 
       try {
-        await setSessionArchived(session.id, false, session.profile)
+        if (!(await unarchiveSessionWithAuthority(session))) {
+          return
+        }
+
         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
         // Surface it again in the sidebar without waiting for a full refresh, and
         // lift any optimistic eviction so the grouped tree shows it again too.
@@ -97,7 +128,10 @@ export function SessionsSettings() {
       setBusyId(session.id)
 
       try {
-        await deleteSession(session.id, session.profile)
+        if (!(await deleteArchivedSessionWithAuthority(session))) {
+          return
+        }
+
         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
         triggerHaptic('warning')
       } catch (err) {

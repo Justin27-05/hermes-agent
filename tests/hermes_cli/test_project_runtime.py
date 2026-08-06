@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import inspect
+import json
 import math
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import fields, replace
+from dataclasses import FrozenInstanceError, fields, replace
+from pathlib import Path
 from typing import Literal, Mapping, get_type_hints
 
 import pytest
@@ -22,6 +25,38 @@ def _event_count(conn, project_id):
     return conn.execute(
         "SELECT COUNT(*) FROM project_events WHERE project_id = ?", (project_id,)
     ).fetchone()[0]
+
+
+def _dispatcher_lease_snapshot(conn):
+    row = conn.execute(
+        """
+        SELECT lease_name, instance_id, generation, fencing_token,
+               expires_at, updated_at
+        FROM project_dispatcher_leases
+        WHERE lease_name = 'core'
+        """
+    ).fetchone()
+    return tuple(row) if row is not None else None
+
+
+@contextlib.contextmanager
+def _assert_dispatcher_write_free(conn):
+    before_changes = conn.total_changes
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        yield
+    finally:
+        conn.set_trace_callback(None)
+        mutations = [
+            statement
+            for statement in statements
+            if statement.lstrip().upper().startswith(
+                ("INSERT", "UPDATE", "DELETE", "REPLACE")
+            )
+        ]
+        assert conn.total_changes == before_changes
+        assert mutations == []
 
 
 def _runtime_mutation_snapshot(conn, project_id, turn_id):
@@ -43,6 +78,17 @@ def _runtime_mutation_snapshot(conn, project_id, turn_id):
         tuple(conn.execute(
             "SELECT * FROM project_run_controls WHERE turn_id = ?", (turn_id,)
         ).fetchone()),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_worker_leases
+                WHERE project_id = ? AND turn_id = ?
+                ORDER BY lease_id
+                """,
+                (project_id, turn_id),
+            )
+        ),
         prdb.runtime_state_for_project(conn, project_id),
         tuple(
             tuple(row)
@@ -193,6 +239,36 @@ def test_public_values_and_control_method_signatures_match_the_task4_contract():
     assert tuple(inspect.signature(module.ProjectRuntime.request_turn_approval).parameters) == (
         "self", "turn_id", "request", "actor", "expected_control_version",
     )
+    assert tuple(
+        inspect.signature(
+            module.ProjectRuntime.renew_delivery
+        ).parameters
+    ) == ("self", "claim", "lease_seconds")
+    assert tuple(
+        inspect.signature(
+            module.ProjectRuntime.complete_delivery
+        ).parameters
+    ) == ("self", "claim", "remote_message_ids")
+    assert tuple(
+        inspect.signature(
+            module.ProjectRuntime.defer_delivery
+        ).parameters
+    ) == (
+        "self",
+        "claim",
+        "error_code",
+        "delay_seconds",
+    )
+    assert tuple(
+        inspect.signature(
+            module.ProjectRuntime.block_delivery
+        ).parameters
+    ) == ("self", "claim", "error_code")
+    assert tuple(
+        inspect.signature(
+            module.ProjectRuntime.suppress_origin_delivery
+        ).parameters
+    ) == ("self", "claim")
     turn_hints = get_type_hints(module.ProjectTurn)
     control_hints = get_type_hints(module.RunControl)
     approval_hints = get_type_hints(module.TurnApproval)
@@ -206,6 +282,1119 @@ def test_public_values_and_control_method_signatures_match_the_task4_contract():
     assert approval_hints["approval"] is module.ApprovalRequest
     assert request_hints["request"] is module.ApprovalRequest
     assert request_hints["return"] is module.TurnApproval
+
+
+def test_rename_event_persists_its_immutable_surface_snapshot(runtime_env):
+    """Later projection must not need the mutable project row for a rename."""
+    runtime = runtime_env["runtime"]
+    project_id = runtime_env["project_id"]
+    first = runtime.rename_project(
+        project_id,
+        "Immutable Rename",
+        runtime_env["desktop"],
+        idempotency_key="immutable-rename",
+        expected_version=0,
+    )
+
+    row = runtime_env["conn"].execute(
+        """
+        SELECT payload_json FROM project_events
+        WHERE project_id = ? AND kind = 'project.renamed'
+        """,
+        (project_id,),
+    ).fetchone()
+
+    assert row is not None
+    assert json.loads(row["payload_json"])["surface"] == {
+        "lifecycle": "active",
+        "name": "Immutable Rename",
+    }
+
+    changes = runtime_env["conn"].total_changes
+    replay = runtime.rename_project(
+        project_id,
+        "Immutable Rename",
+        runtime_env["discord"],
+        idempotency_key="immutable-rename",
+        expected_version=0,
+    )
+
+    assert replay == first
+    assert runtime_env["conn"].total_changes == changes
+    assert runtime_env["conn"].execute(
+        """
+        SELECT COUNT(*) FROM project_events
+        WHERE project_id = ? AND kind = 'project.renamed'
+        """,
+        (project_id,),
+    ).fetchone()[0] == 1
+    assert runtime_env["conn"].execute(
+        """
+        SELECT payload_json FROM project_events
+        WHERE project_id = ? AND kind = 'project.renamed'
+        """,
+        (project_id,),
+    ).fetchone()["payload_json"] == row["payload_json"]
+
+
+def test_rename_replay_rejects_changed_command_fingerprint(runtime_env):
+    runtime = runtime_env["runtime"]
+    project_id = runtime_env["project_id"]
+    runtime.rename_project(
+        project_id,
+        "First Rename",
+        runtime_env["desktop"],
+        idempotency_key="rename-fingerprint",
+        expected_version=0,
+    )
+    changes = runtime_env["conn"].total_changes
+
+    with pytest.raises(runtime_env["module"].ProjectRuntimeError) as conflict:
+        runtime.rename_project(
+            project_id,
+            "Different Rename",
+            runtime_env["discord"],
+            idempotency_key="rename-fingerprint",
+            expected_version=0,
+        )
+
+    assert conflict.value.code is (
+        runtime_env["module"].RuntimeErrorCode.IDEMPOTENCY_CONFLICT
+    )
+    assert runtime_env["conn"].total_changes == changes
+    assert projects_db.get_project(
+        runtime_env["conn"], project_id
+    ).name == "First Rename"
+
+
+@pytest.mark.parametrize(
+    "payload_variant",
+    ("malformed", "noncanonical", "missing", "mismatch"),
+)
+def test_rename_replay_fails_closed_for_untrusted_stored_fingerprint(
+    runtime_env,
+    payload_variant,
+):
+    runtime = runtime_env["runtime"]
+    conn = runtime_env["conn"]
+    project_id = runtime_env["project_id"]
+    runtime.rename_project(
+        project_id,
+        "Trusted Rename",
+        runtime_env["desktop"],
+        idempotency_key="rename-stored-fingerprint",
+        expected_version=0,
+    )
+    row = conn.execute(
+        """
+        SELECT event_id, payload_json FROM project_events
+        WHERE project_id = ? AND kind = 'project.renamed'
+        """,
+        (project_id,),
+    ).fetchone()
+    assert row is not None
+    original = json.loads(row["payload_json"])
+    if payload_variant == "malformed":
+        stored_payload = '{"command_fingerprint":'
+    elif payload_variant == "noncanonical":
+        stored_payload = json.dumps(original, ensure_ascii=False)
+    elif payload_variant == "missing":
+        stored_payload = json.dumps(
+            {"surface": original["surface"]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    else:
+        stored_payload = json.dumps(
+            {
+                **original,
+                "command_fingerprint": "0" * 64,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    conn.execute(
+        "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+        (stored_payload, row["event_id"]),
+    )
+    conn.commit()
+    changes = conn.total_changes
+
+    with pytest.raises(runtime_env["module"].ProjectRuntimeError) as conflict:
+        runtime.rename_project(
+            project_id,
+            "Trusted Rename",
+            runtime_env["discord"],
+            idempotency_key="rename-stored-fingerprint",
+            expected_version=0,
+        )
+
+    assert conflict.value.code is (
+        runtime_env["module"].RuntimeErrorCode.IDEMPOTENCY_CONFLICT
+    )
+    assert conn.total_changes == changes
+    assert _event_count(conn, project_id) == 1
+
+
+def test_dispatcher_lease_public_contract_is_frozen_and_explicit():
+    module = importlib.import_module("hermes_cli.project_runtime")
+
+    assert tuple(field.name for field in fields(module.DispatcherLease)) == (
+        "instance_id",
+        "generation",
+        "fencing_token",
+        "expires_at",
+    )
+    assert tuple(
+        inspect.signature(
+            module.ProjectRuntime.acquire_dispatcher_lease
+        ).parameters
+    ) == ("self", "instance_id", "lease_seconds")
+    assert tuple(
+        inspect.signature(
+            module.ProjectRuntime.renew_dispatcher_lease
+        ).parameters
+    ) == ("self", "lease", "lease_seconds")
+    assert tuple(
+        inspect.signature(
+            module.ProjectRuntime.release_dispatcher_lease
+        ).parameters
+    ) == ("self", "lease")
+    assert (
+        inspect.signature(
+            module.ProjectRuntime.acquire_dispatcher_lease
+        ).parameters["lease_seconds"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert (
+        inspect.signature(
+            module.ProjectRuntime.renew_dispatcher_lease
+        ).parameters["lease_seconds"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert (
+        module.RuntimeErrorCode.STALE_DISPATCHER_LEASE.value
+        == "stale_dispatcher_lease"
+    )
+    lease = module.DispatcherLease(
+        "11111111-1111-4111-8111-111111111111",
+        1,
+        1,
+        130,
+    )
+    with pytest.raises(FrozenInstanceError):
+        lease.expires_at = 131
+
+
+def test_core_dispatcher_lease_acquire_is_sticky_and_profile_wide(
+    runtime_env
+):
+    now = [100]
+    module = runtime_env["module"]
+    runtime = module.ProjectRuntime(
+        runtime_env["conn"], clock=lambda: now[0]
+    )
+    leader_id = "11111111-1111-4111-8111-111111111111"
+    standby_id = "22222222-2222-4222-8222-222222222222"
+
+    acquired = runtime.acquire_dispatcher_lease(
+        leader_id, lease_seconds=30
+    )
+    assert acquired == module.DispatcherLease(
+        leader_id, 1, 1, 130
+    )
+    stored = _dispatcher_lease_snapshot(runtime_env["conn"])
+
+    now[0] = 101
+    with _assert_dispatcher_write_free(runtime_env["conn"]):
+        assert runtime.acquire_dispatcher_lease(
+            leader_id, lease_seconds=300
+        ) == acquired
+    with _assert_dispatcher_write_free(runtime_env["conn"]):
+        assert runtime.acquire_dispatcher_lease(
+            standby_id, lease_seconds=30
+        ) is None
+    assert _dispatcher_lease_snapshot(runtime_env["conn"]) == stored
+
+
+def test_core_dispatcher_lease_scope_isolated_by_projects_database(
+    tmp_path,
+):
+    module = importlib.import_module("hermes_cli.project_runtime")
+    first_conn = projects_db.connect(tmp_path / "profile-a" / "projects.db")
+    second_conn = projects_db.connect(
+        tmp_path / "profile-b" / "projects.db"
+    )
+    try:
+        first = module.ProjectRuntime(
+            first_conn, clock=lambda: 100
+        ).acquire_dispatcher_lease(
+            "11111111-1111-4111-8111-111111111111",
+            lease_seconds=30,
+        )
+        second = module.ProjectRuntime(
+            second_conn, clock=lambda: 100
+        ).acquire_dispatcher_lease(
+            "22222222-2222-4222-8222-222222222222",
+            lease_seconds=30,
+        )
+
+        assert first == module.DispatcherLease(
+            "11111111-1111-4111-8111-111111111111",
+            1,
+            1,
+            130,
+        )
+        assert second == module.DispatcherLease(
+            "22222222-2222-4222-8222-222222222222",
+            1,
+            1,
+            130,
+        )
+    finally:
+        first_conn.close()
+        second_conn.close()
+
+
+def test_core_dispatcher_lease_boundary_takeover_fences_stale_owner(
+    runtime_env
+):
+    now = [100]
+    module = runtime_env["module"]
+    runtime = module.ProjectRuntime(
+        runtime_env["conn"], clock=lambda: now[0]
+    )
+    old = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert old is not None
+
+    now[0] = 129
+    with _assert_dispatcher_write_free(runtime_env["conn"]):
+        assert runtime.acquire_dispatcher_lease(
+            "22222222-2222-4222-8222-222222222222",
+            lease_seconds=30,
+        ) is None
+    before_takeover = _dispatcher_lease_snapshot(
+        runtime_env["conn"]
+    )
+    assert before_takeover[-2:] == (130, 100)
+
+    now[0] = 130
+    takeover = runtime.acquire_dispatcher_lease(
+        "22222222-2222-4222-8222-222222222222",
+        lease_seconds=30,
+    )
+    assert takeover == module.DispatcherLease(
+        "22222222-2222-4222-8222-222222222222",
+        2,
+        2,
+        160,
+    )
+    after_takeover = _dispatcher_lease_snapshot(runtime_env["conn"])
+
+    now[0] = 131
+    with pytest.raises(module.ProjectRuntimeError) as stale_renew:
+        with _assert_dispatcher_write_free(runtime_env["conn"]):
+            runtime.renew_dispatcher_lease(
+                old, lease_seconds=30
+            )
+    assert (
+        stale_renew.value.code
+        is module.RuntimeErrorCode.STALE_DISPATCHER_LEASE
+    )
+    with _assert_dispatcher_write_free(runtime_env["conn"]):
+        assert runtime.release_dispatcher_lease(old) is False
+    assert _dispatcher_lease_snapshot(
+        runtime_env["conn"]
+    ) == after_takeover
+
+
+def test_core_dispatcher_renew_rechecks_expiry_after_lock_wait(
+    runtime_env,
+    monkeypatch,
+):
+    now = [100]
+    module = runtime_env["module"]
+    conn = runtime_env["conn"]
+    runtime = module.ProjectRuntime(
+        conn,
+        clock=lambda: now[0],
+    )
+    lease = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert lease is not None
+    before = _dispatcher_lease_snapshot(conn)
+    before_changes = conn.total_changes
+    original_write_transaction = prdb.write_transaction
+    crossed_boundary = False
+
+    @contextlib.contextmanager
+    def expire_before_begin(connection):
+        nonlocal crossed_boundary
+        if connection is conn and not crossed_boundary:
+            crossed_boundary = True
+            now[0] = lease.expires_at
+        with original_write_transaction(connection):
+            yield
+
+    now[0] = lease.expires_at - 1
+    monkeypatch.setattr(
+        prdb,
+        "write_transaction",
+        expire_before_begin,
+    )
+    caught = None
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        runtime.renew_dispatcher_lease(
+            lease,
+            lease_seconds=30,
+        )
+    except module.ProjectRuntimeError as exc:
+        caught = exc
+    finally:
+        conn.set_trace_callback(None)
+    mutations = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+    ]
+
+    assert crossed_boundary
+    assert _dispatcher_lease_snapshot(conn) == before
+    assert conn.total_changes == before_changes
+    assert mutations == []
+    assert type(caught) is module.ProjectRuntimeError
+    assert (
+        caught.code
+        is module.RuntimeErrorCode.STALE_DISPATCHER_LEASE
+    )
+
+
+def test_core_dispatcher_acquire_rechecks_expiry_after_lock_wait(
+    runtime_env,
+    monkeypatch,
+):
+    now = [100]
+    module = runtime_env["module"]
+    conn = runtime_env["conn"]
+    runtime = module.ProjectRuntime(
+        conn,
+        clock=lambda: now[0],
+    )
+    lease = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert lease is not None
+    original_write_transaction = prdb.write_transaction
+    crossed_boundary = False
+
+    @contextlib.contextmanager
+    def expire_before_begin(connection):
+        nonlocal crossed_boundary
+        if connection is conn and not crossed_boundary:
+            crossed_boundary = True
+            now[0] = lease.expires_at
+        with original_write_transaction(connection):
+            yield
+
+    now[0] = lease.expires_at - 1
+    monkeypatch.setattr(
+        prdb,
+        "write_transaction",
+        expire_before_begin,
+    )
+    takeover = runtime.acquire_dispatcher_lease(
+        "22222222-2222-4222-8222-222222222222",
+        lease_seconds=30,
+    )
+
+    assert crossed_boundary
+    assert takeover == module.DispatcherLease(
+        "22222222-2222-4222-8222-222222222222",
+        2,
+        2,
+        160,
+    )
+    assert _dispatcher_lease_snapshot(conn) == (
+        "core",
+        "22222222-2222-4222-8222-222222222222",
+        2,
+        2,
+        160,
+        130,
+    )
+
+
+def test_core_dispatcher_renew_release_and_reacquire_preserve_epoch_counters(
+    runtime_env
+):
+    now = [100]
+    module = runtime_env["module"]
+    runtime = module.ProjectRuntime(
+        runtime_env["conn"], clock=lambda: now[0]
+    )
+    first = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert first is not None
+
+    now[0] = 110
+    renewed = runtime.renew_dispatcher_lease(
+        first, lease_seconds=50
+    )
+    assert renewed == replace(first, expires_at=160)
+    with _assert_dispatcher_write_free(runtime_env["conn"]):
+        assert runtime.release_dispatcher_lease(first) is False
+    now[0] = 120
+    assert runtime.renew_dispatcher_lease(
+        renewed, lease_seconds=10
+    ) == renewed
+
+    now[0] = 121
+    assert runtime.release_dispatcher_lease(renewed) is True
+    released = _dispatcher_lease_snapshot(runtime_env["conn"])
+    assert released == ("core", None, 1, 1, 121, 121)
+    with _assert_dispatcher_write_free(runtime_env["conn"]):
+        assert runtime.release_dispatcher_lease(renewed) is False
+    assert _dispatcher_lease_snapshot(
+        runtime_env["conn"]
+    ) == released
+
+    reacquired = runtime.acquire_dispatcher_lease(
+        "22222222-2222-4222-8222-222222222222",
+        lease_seconds=30,
+    )
+    assert reacquired == module.DispatcherLease(
+        "22222222-2222-4222-8222-222222222222",
+        2,
+        2,
+        151,
+    )
+
+
+def test_same_instance_expired_reacquire_mints_a_new_fenced_epoch(
+    runtime_env
+):
+    now = [100]
+    module = runtime_env["module"]
+    runtime = module.ProjectRuntime(
+        runtime_env["conn"], clock=lambda: now[0]
+    )
+    instance_id = "11111111-1111-4111-8111-111111111111"
+    old = runtime.acquire_dispatcher_lease(
+        instance_id, lease_seconds=30
+    )
+    assert old is not None
+
+    now[0] = 130
+    current = runtime.acquire_dispatcher_lease(
+        instance_id, lease_seconds=30
+    )
+    assert current == module.DispatcherLease(
+        instance_id,
+        2,
+        2,
+        160,
+    )
+    after_reacquire = _dispatcher_lease_snapshot(runtime_env["conn"])
+
+    now[0] = 131
+    with pytest.raises(module.ProjectRuntimeError) as stale:
+        with _assert_dispatcher_write_free(runtime_env["conn"]):
+            runtime.renew_dispatcher_lease(
+                old, lease_seconds=30
+            )
+    assert (
+        stale.value.code
+        is module.RuntimeErrorCode.STALE_DISPATCHER_LEASE
+    )
+    with _assert_dispatcher_write_free(runtime_env["conn"]):
+        assert runtime.release_dispatcher_lease(old) is False
+    assert _dispatcher_lease_snapshot(
+        runtime_env["conn"]
+    ) == after_reacquire
+
+
+@pytest.mark.parametrize(
+    ("instance_id", "lease_seconds"),
+    (
+        pytest.param("not-a-uuid", 30, id="non-uuid"),
+        pytest.param(
+            "11111111-1111-3111-8111-111111111111",
+            30,
+            id="non-v4",
+        ),
+        pytest.param(
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            30,
+            id="non-canonical-case",
+        ),
+        pytest.param(
+            "11111111-1111-4111-8111-111111111111",
+            True,
+            id="boolean-ttl",
+        ),
+        pytest.param(
+            "11111111-1111-4111-8111-111111111111",
+            0,
+            id="zero-ttl",
+        ),
+    ),
+)
+def test_core_dispatcher_acquire_rejects_invalid_identity_or_ttl_write_free(
+    runtime_env, instance_id, lease_seconds
+):
+    module = runtime_env["module"]
+    before = _dispatcher_lease_snapshot(runtime_env["conn"])
+
+    with pytest.raises(module.ProjectRuntimeError) as invalid:
+        runtime_env["runtime"].acquire_dispatcher_lease(
+            instance_id, lease_seconds=lease_seconds
+        )
+
+    assert invalid.value.code is module.RuntimeErrorCode.INVALID_ARGUMENT
+    assert _dispatcher_lease_snapshot(runtime_env["conn"]) == before
+
+
+def test_core_dispatcher_takeover_counter_overflow_is_write_free(
+    runtime_env
+):
+    maximum = (1 << 63) - 1
+    module = runtime_env["module"]
+    runtime_env["conn"].execute(
+        """
+        INSERT INTO project_dispatcher_leases (
+            lease_name, instance_id, generation, fencing_token,
+            expires_at, updated_at
+        ) VALUES ('core', NULL, ?, ?, 100, 100)
+        """,
+        (maximum, maximum),
+    )
+    runtime_env["conn"].commit()
+    before = _dispatcher_lease_snapshot(runtime_env["conn"])
+
+    with pytest.raises(RuntimeError):
+        with _assert_dispatcher_write_free(runtime_env["conn"]):
+            runtime_env["runtime"].acquire_dispatcher_lease(
+                "11111111-1111-4111-8111-111111111111",
+                lease_seconds=30,
+            )
+
+    assert _dispatcher_lease_snapshot(runtime_env["conn"]) == before
+
+
+@pytest.mark.parametrize("transition", ("renew", "takeover"))
+def test_task7_c4_startauthority_queue_fences_at_write_boundary(
+    runtime_env,
+    monkeypatch,
+    transition,
+):
+    module = runtime_env["module"]
+    conn = runtime_env["conn"]
+    project_id = runtime_env["project_id"]
+    turn = runtime_env["runtime"].enqueue_turn(
+        project_id,
+        {"message": "Core-fenced queue start"},
+        runtime_env["desktop"],
+        idempotency_key=f"c4-queue-{transition}",
+        expected_version=0,
+    )
+    now = [100]
+    identity_counts = {}
+    attempt_observations = []
+    traced_statements = []
+
+    def identity(kind):
+        identity_counts[kind] = identity_counts.get(kind, 0) + 1
+        if kind == "attempt":
+            normalized = [
+                " ".join(statement.lower().split())
+                for statement in traced_statements
+            ]
+            attempt_observations.append(
+                (
+                    conn.in_transaction,
+                    any(
+                        statement.startswith(
+                            "select instance_id, generation, "
+                            "fencing_token, expires_at from "
+                            "project_dispatcher_leases "
+                            "where lease_name = 'core'"
+                        )
+                        for statement in normalized
+                    ),
+                    not any(
+                        statement.startswith(
+                            ("insert", "update", "delete", "replace")
+                        )
+                        for statement in normalized
+                    ),
+                )
+            )
+        return f"task7-c4-{kind}-{identity_counts[kind]}"
+
+    runtime = module.ProjectRuntime(
+        conn,
+        clock=lambda: now[0],
+        id_factory=identity,
+    )
+    old_lease = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert old_lease is not None
+    upper = runtime.runnable_project_membership_upper_watermark()
+    assert upper is not None
+    discovery = runtime.scan_runnable_projects(
+        after=None,
+        through_membership_sequence=upper,
+        limit=100,
+    )
+    assert [item.project_id for item in discovery.projects] == [
+        project_id
+    ]
+
+    database_path = Path(
+        conn.execute("PRAGMA database_list").fetchone()["file"]
+    )
+    contender_conn = projects_db.connect(database_path)
+    contender = module.ProjectRuntime(
+        contender_conn,
+        clock=lambda: now[0],
+    )
+    newest_lease = []
+    original_write_transaction = prdb.write_transaction
+    intercepted = False
+
+    @contextlib.contextmanager
+    def transition_before_begin(connection):
+        nonlocal intercepted
+        if connection is conn and not intercepted:
+            intercepted = True
+            prdb.write_transaction = original_write_transaction
+            try:
+                if transition == "renew":
+                    newest_lease.append(
+                        contender.renew_dispatcher_lease(
+                            old_lease,
+                            lease_seconds=50,
+                        )
+                    )
+                else:
+                    replacement = contender.acquire_dispatcher_lease(
+                        "22222222-2222-4222-8222-222222222222",
+                        lease_seconds=30,
+                    )
+                    assert replacement is not None
+                    newest_lease.append(replacement)
+            finally:
+                prdb.write_transaction = transition_before_begin
+        with original_write_transaction(connection):
+            yield
+
+    now[0] = 110 if transition == "renew" else 130
+    monkeypatch.setattr(
+        prdb,
+        "write_transaction",
+        transition_before_begin,
+    )
+    before = _runtime_mutation_snapshot(
+        conn,
+        project_id,
+        turn.turn_id,
+    )
+    try:
+        with pytest.raises(module.ProjectRuntimeError) as stale:
+            with _assert_dispatcher_write_free(conn):
+                runtime.claim_next_turn_for_dispatcher(
+                    project_id,
+                    "task7-c4-worker",
+                    lease_seconds=30,
+                    dispatcher_lease=old_lease,
+                )
+        assert (
+            stale.value.code
+            is module.RuntimeErrorCode.STALE_DISPATCHER_LEASE
+        )
+        assert intercepted
+        assert len(newest_lease) == 1
+        assert identity_counts.get("attempt", 0) == 0
+        assert before == _runtime_mutation_snapshot(
+            conn,
+            project_id,
+            turn.turn_id,
+        )
+
+        traced_statements.clear()
+        conn.set_trace_callback(traced_statements.append)
+        try:
+            start = runtime.claim_next_turn_for_dispatcher(
+                project_id,
+                "task7-c4-worker",
+                lease_seconds=30,
+                dispatcher_lease=newest_lease[0],
+            )
+        finally:
+            conn.set_trace_callback(None)
+        from hermes_cli.project_runtime import WorkerStart
+
+        assert type(start) is WorkerStart
+        assert tuple(field.name for field in fields(WorkerStart)) == (
+            "source",
+            "claim",
+            "operation",
+            "dispatcher_lease",
+        )
+        assert start.source == "queued_turn"
+        assert start.operation is None
+        assert start.dispatcher_lease is newest_lease[0]
+        assert start.claim.turn_id == turn.turn_id
+        assert start.claim.attempt_id.startswith(
+            "task7-c4-attempt-"
+        )
+        assert identity_counts["attempt"] == 1
+        assert attempt_observations == [(True, True, True)]
+        with pytest.raises(FrozenInstanceError):
+            start.source = "approved_operation"
+
+        with _assert_dispatcher_write_free(conn):
+            assert runtime.claim_next_turn_for_dispatcher(
+                project_id,
+                "task7-c4-worker",
+                lease_seconds=30,
+                dispatcher_lease=newest_lease[0],
+            ) is None
+        assert identity_counts["attempt"] == 1
+    finally:
+        contender_conn.close()
+
+
+def test_task7_c4_startauthority_queue_rechecks_expiry_after_lock_wait(
+    runtime_env,
+    monkeypatch,
+):
+    module = runtime_env["module"]
+    conn = runtime_env["conn"]
+    project_id = runtime_env["project_id"]
+    turn = runtime_env["runtime"].enqueue_turn(
+        project_id,
+        {"message": "Core expiry while waiting for write lock"},
+        runtime_env["desktop"],
+        idempotency_key="c4-queue-lock-expiry",
+        expected_version=0,
+    )
+    now = [100]
+    attempt_calls = []
+
+    def identity(kind):
+        if kind == "attempt":
+            attempt_calls.append(kind)
+            raise AssertionError(
+                "attempt factory reached after Core expiry"
+            )
+        return f"task7-c4-{kind}"
+
+    runtime = module.ProjectRuntime(
+        conn,
+        clock=lambda: now[0],
+        id_factory=identity,
+    )
+    lease = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert lease is not None
+    before_core = _dispatcher_lease_snapshot(conn)
+    before_runtime = _runtime_mutation_snapshot(
+        conn,
+        project_id,
+        turn.turn_id,
+    )
+    original_write_transaction = prdb.write_transaction
+    crossed_boundary = False
+
+    @contextlib.contextmanager
+    def expire_before_begin(connection):
+        nonlocal crossed_boundary
+        if connection is conn and not crossed_boundary:
+            crossed_boundary = True
+            now[0] = lease.expires_at
+        with original_write_transaction(connection):
+            yield
+
+    now[0] = lease.expires_at - 1
+    monkeypatch.setattr(
+        prdb,
+        "write_transaction",
+        expire_before_begin,
+    )
+    caught = None
+    try:
+        with _assert_dispatcher_write_free(conn):
+            runtime.claim_next_turn_for_dispatcher(
+                project_id,
+                "task7-c4-worker",
+                lease_seconds=30,
+                dispatcher_lease=lease,
+            )
+    except Exception as exc:
+        caught = exc
+
+    assert crossed_boundary
+    assert attempt_calls == []
+    assert _dispatcher_lease_snapshot(conn) == before_core
+    assert _runtime_mutation_snapshot(
+        conn,
+        project_id,
+        turn.turn_id,
+    ) == before_runtime
+    assert type(caught) is module.ProjectRuntimeError
+    assert (
+        caught.code
+        is module.RuntimeErrorCode.STALE_DISPATCHER_LEASE
+    )
+
+
+def test_task7_raw_epoch_runnable_pages_raw_members_before_eligibility(
+    runtime_env,
+):
+    module = runtime_env["module"]
+    cursor_type = module.RunnableProjectCursor
+    conn = runtime_env["conn"]
+    runtime = runtime_env["runtime"]
+    first_project_id = runtime_env["project_id"]
+
+    for ordinal in range(2, 101):
+        _adopt_bound_project(
+            conn,
+            name=f"Raw member {ordinal}",
+            root=f"raw-root-{ordinal}",
+            binding=f"raw-binding-{ordinal}",
+            external=f"raw-window-{ordinal}",
+        )
+    runnable_project_id, runnable_actor = _adopt_bound_project(
+        conn,
+        name="Raw member 101",
+        root="raw-root-101",
+        binding="raw-binding-101",
+        external="raw-window-101",
+    )
+    runnable_turn = runtime.enqueue_turn(
+        runnable_project_id,
+        {"message": "page two"},
+        runnable_actor,
+        idempotency_key="raw-page-two",
+        expected_version=0,
+    )
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        upper = runtime.runnable_project_membership_upper_watermark()
+        assert upper == 101
+        first = runtime.scan_runnable_projects(
+            after=None,
+            through_membership_sequence=upper,
+            limit=100,
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    assert first.projects == ()
+    assert first.scanned_through is not None
+    assert first.scanned_through.dispatch_membership_sequence == 100
+    assert first.reached_epoch_end is False
+    raw_scan_sql = [
+        statement
+        for statement in statements
+        if "from project_runtime_state indexed by "
+        "idx_project_runtime_dispatch_membership"
+        in " ".join(statement.lower().split())
+    ]
+    raw_statements = [
+        " ".join(statement.lower().split())
+        for statement in raw_scan_sql
+    ]
+    assert len(raw_statements) == 3
+    assert sum(
+        "order by dispatch_membership_sequence desc" in statement
+        for statement in raw_statements
+    ) == 1
+    assert sum(
+        "order by dispatch_membership_sequence, project_id limit 100"
+        in statement
+        for statement in raw_statements
+    ) == 1
+    assert sum(
+        statement.startswith("select 1 ")
+        for statement in raw_statements
+    ) == 1
+    assert all(
+        "dispatch_membership_sequence is not null" in statement
+        and "offset" not in statement
+        and "project_turns" not in statement
+        and "lifecycle" not in statement
+        for statement in raw_statements
+    )
+    for sql in raw_scan_sql:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN " + sql,
+        ).fetchall()
+        details = " ".join(row["detail"] for row in plan)
+        assert "idx_project_runtime_dispatch_membership" in details
+
+    first_turn = runtime.enqueue_turn(
+        first_project_id,
+        {"message": "queued behind the cursor"},
+        runtime_env["desktop"],
+        idempotency_key="raw-later-queued",
+        expected_version=0,
+    )
+    new_project_id, new_actor = _adopt_bound_project(
+        conn,
+        name="Raw member 102",
+        root="raw-root-102",
+        binding="raw-binding-102",
+        external="raw-window-102",
+    )
+    new_turn = runtime.enqueue_turn(
+        new_project_id,
+        {"message": "new epoch only"},
+        new_actor,
+        idempotency_key="raw-new-member",
+        expected_version=0,
+    )
+
+    second = runtime.scan_runnable_projects(
+        after=first.scanned_through,
+        through_membership_sequence=upper,
+        limit=100,
+    )
+    assert second.projects == (
+        module.RunnableProject(
+            runnable_project_id,
+            runnable_turn.turn_id,
+            runnable_turn.sequence,
+            101,
+        ),
+    )
+    assert second.scanned_through == cursor_type(
+        101, runnable_project_id
+    )
+    assert second.reached_epoch_end is True
+
+    fresh_upper = runtime.runnable_project_membership_upper_watermark()
+    assert fresh_upper == 102
+    fresh_first = runtime.scan_runnable_projects(
+        after=None,
+        through_membership_sequence=fresh_upper,
+        limit=100,
+    )
+    assert [project.project_id for project in fresh_first.projects] == [
+        first_project_id
+    ]
+    assert fresh_first.projects[0].head_turn_id == first_turn.turn_id
+    conn.execute(
+        """
+        UPDATE project_run_controls
+        SET control_state = 'stopped'
+        WHERE project_id = ? AND turn_id = ?
+        """,
+        (new_project_id, new_turn.turn_id),
+    )
+    conn.commit()
+    corrupted_control = tuple(
+        conn.execute(
+            """
+            SELECT * FROM project_run_controls
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (new_project_id, new_turn.turn_id),
+        ).fetchone()
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="runtime turn/control/lease pair is inconsistent",
+    ):
+        with _assert_dispatcher_write_free(conn):
+            runtime.scan_runnable_projects(
+                after=fresh_first.scanned_through,
+                through_membership_sequence=fresh_upper,
+                limit=100,
+            )
+    assert tuple(
+        conn.execute(
+            """
+            SELECT * FROM project_run_controls
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (new_project_id, new_turn.turn_id),
+        ).fetchone()
+    ) == corrupted_control
+    conn.execute(
+        """
+        UPDATE project_run_controls
+        SET control_state = 'running'
+        WHERE project_id = ? AND turn_id = ?
+        """,
+        (new_project_id, new_turn.turn_id),
+    )
+    conn.commit()
+    fresh_second = runtime.scan_runnable_projects(
+        after=fresh_first.scanned_through,
+        through_membership_sequence=fresh_upper,
+        limit=100,
+    )
+    assert [project.project_id for project in fresh_second.projects] == [
+        runnable_project_id,
+        new_project_id,
+    ]
+    assert fresh_second.projects[-1].head_turn_id == new_turn.turn_id
+    assert fresh_second.reached_epoch_end is True
+
+    invalid_calls = (
+        lambda: runtime.scan_runnable_projects(
+            after=None,
+            through_membership_sequence=upper,
+            limit=True,
+        ),
+        lambda: runtime.scan_runnable_projects(
+            after=None,
+            through_membership_sequence=upper,
+            limit=0,
+        ),
+        lambda: runtime.scan_runnable_projects(
+            after=None,
+            through_membership_sequence=upper,
+            limit=101,
+        ),
+        lambda: runtime.scan_runnable_projects(
+            after=cursor_type(upper + 1, "beyond"),
+            through_membership_sequence=upper,
+            limit=1,
+        ),
+    )
+    for invalid_call in invalid_calls:
+        invalid_statements = []
+        conn.set_trace_callback(invalid_statements.append)
+        try:
+            with pytest.raises(module.ProjectRuntimeError) as error:
+                invalid_call()
+        finally:
+            conn.set_trace_callback(None)
+        assert error.value.code is module.RuntimeErrorCode.INVALID_ARGUMENT
+        assert invalid_statements == []
 
 
 def test_claim_and_controls_expose_exact_creation_and_lease_identity(runtime_env):
@@ -1486,3 +2675,789 @@ def test_stop_request_survives_reopen_and_blocks_later_fifo_work(tmp_path):
         assert module.ProjectRuntime(reopened, clock=lambda: 101).claim_next_turn(project_id, "after-crash", lease_seconds=30) is None
     finally:
         reopened.close()
+
+
+def test_task7_c10_prepared_checkpoint_without_operation_waits_then_discards_only_on_persisted_stop(
+    runtime_env,
+    tmp_path,
+):
+    """A pre-operation approval batch stays pending until durable authority wins."""
+    module = runtime_env["module"]
+    decision_type = module.PreparedApprovalCheckpointDecision
+    assert tuple(field.name for field in fields(decision_type)) == ("action",)
+    assert decision_type.__dataclass_params__.frozen is True
+    assert get_type_hints(decision_type) == {
+        "action": Literal["wait", "discard"],
+    }
+    frozen_decision = decision_type("wait")
+    with pytest.raises(FrozenInstanceError):
+        frozen_decision.action = "discard"
+    resolver_signature = inspect.signature(
+        module.ProjectRuntime.resolve_prepared_approval_checkpoint
+    )
+    assert tuple(resolver_signature.parameters) == (
+        "self",
+        "attempt",
+        "operation_id",
+        "approval_id",
+    )
+    assert (
+        resolver_signature.parameters["operation_id"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert (
+        resolver_signature.parameters["approval_id"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    resolver_hints = get_type_hints(
+        module.ProjectRuntime.resolve_prepared_approval_checkpoint
+    )
+    assert resolver_hints == {
+        "attempt": module.TurnAttemptIdentity,
+        "operation_id": str,
+        "approval_id": str,
+        "return": decision_type,
+    }
+
+    case_connections = []
+
+    def attempt_for(claim):
+        return module.TurnAttemptIdentity(
+            claim.project_id,
+            claim.turn_id,
+            claim.sequence,
+            claim.worker_id,
+            claim.attempt_id,
+            claim.lease_generation,
+            claim.fencing_token,
+            claim.canonical_session_id,
+            claim.lease_expires_at,
+        )
+
+    def new_case(label, *, clock, started=True):
+        case_conn = projects_db.connect(tmp_path / f"c10-{label}.db")
+        case_connections.append(case_conn)
+        project_id = projects_db.create_project(
+            case_conn,
+            name=f"C10 {label}",
+            folders=(f"C:/work/c10/{label}",),
+        )
+        session_id = f"c10-{label}-session"
+        binding_id = f"c10-{label}-owner"
+        prdb.create_project_conversation(
+            case_conn,
+            project_id=project_id,
+            conversation_id=session_id,
+            current_phase="implementation",
+            now=1,
+        )
+        prdb.bind_surface(
+            case_conn,
+            binding_id=binding_id,
+            project_id=project_id,
+            surface="desktop",
+            external_binding_id=f"c10-{label}-window",
+            actor_id="owner",
+            now=1,
+        )
+        case_runtime = module.ProjectRuntime(case_conn, clock=clock)
+        actor = ActorContext("owner", "desktop", binding_id, True)
+        turn = case_runtime.enqueue_turn(
+            project_id,
+            {"message": label},
+            actor,
+            idempotency_key=f"c10-{label}-turn",
+            expected_version=0,
+        )
+        claim = case_runtime.claim_next_turn(
+            project_id,
+            f"c10-{label}-worker",
+            lease_seconds=30,
+        )
+        assert claim is not None
+        if started:
+            claim = case_runtime.mark_turn_started(claim)
+        return case_conn, case_runtime, project_id, turn, actor, claim
+
+    def authority_snapshot(case_conn, project_id, turn_id):
+        def rows(sql, parameters=()):
+            return tuple(tuple(row) for row in case_conn.execute(sql, parameters))
+
+        return {
+            "state": rows(
+                """
+                SELECT project_id, lifecycle, current_phase, version,
+                       conversation_root_id, conversation_tip_id,
+                       dispatch_membership_sequence,
+                       transcript_pending_batch_id,
+                       transcript_dispatch_block_key, updated_at
+                FROM project_runtime_state
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ),
+            "turn": rows(
+                """
+                SELECT turn_id, project_id, sequence, idempotency_key,
+                       payload_json, origin_binding_id, status, attempt_id,
+                       lease_generation, fencing_token, execution_state,
+                       terminal_result_id, recovery_block_key,
+                       transcript_applied_batch_id, created_at, updated_at
+                FROM project_turns
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (project_id, turn_id),
+            ),
+            "control": rows(
+                """
+                SELECT turn_id, project_id, control_state, control_version,
+                       idempotency_key, command_fingerprint, attempt_id,
+                       claim_worker_id, claim_lease_expires_at,
+                       claim_canonical_session_id, updated_at
+                FROM project_run_controls
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (project_id, turn_id),
+            ),
+            "leases": rows(
+                """
+                SELECT lease_id, project_id, turn_id, worker_id,
+                       lease_generation, fencing_token, expires_at, updated_at
+                FROM project_worker_leases
+                WHERE project_id = ? AND turn_id = ?
+                ORDER BY lease_id
+                """,
+                (project_id, turn_id),
+            ),
+            "events": rows(
+                """
+                SELECT event_id, project_id, sequence, kind, turn_id,
+                       payload_json, created_at
+                FROM project_events
+                WHERE project_id = ?
+                ORDER BY sequence, event_id
+                """,
+                (project_id,),
+            ),
+            "operations": rows(
+                """
+                SELECT operation_id, project_id, turn_id, idempotency_key,
+                       approval_id, command_revision, targets_json,
+                       payload_json, status, receipt_json, guard_revision,
+                       guard_validated, canonical_action, batch_items_json,
+                       readback_kind, attempt_id, lease_generation,
+                       fencing_token, receipt_id, readback_json, blocked_reason,
+                       remote_idempotency_supported,
+                       approval_fingerprint_json, approval_checkpoint_id,
+                       intent_event_id, recovery_membership_sequence,
+                       created_at, updated_at
+                FROM project_operations
+                WHERE project_id = ?
+                ORDER BY operation_id
+                """,
+                (project_id,),
+            ),
+            "approvals": rows(
+                """
+                SELECT approval_id, project_id, turn_id, operation_id,
+                       operation_maintenance_seq, actor_id,
+                       authorization_actor_id, canonical_action,
+                       approval_class, command_revision,
+                       expected_runtime_version, effective_runtime_version,
+                       turn_expected_control_version, expected_lifecycle,
+                       expected_phase, targets_json, batch_boundary_json,
+                       status, expires_at, resolved_at,
+                       resolved_by_actor_id, consumed_at, created_at
+                FROM project_approvals
+                WHERE project_id = ?
+                ORDER BY approval_id
+                """,
+                (project_id,),
+            ),
+            "membership": rows(
+                """
+                SELECT lane, last_sequence
+                FROM project_runtime_membership_counters
+                ORDER BY lane
+                """
+            ),
+            "total_changes": case_conn.total_changes,
+        }
+
+    def resolve_write_free(
+        case_runtime,
+        case_conn,
+        observed_attempt,
+        *,
+        operation_id="c10-operation",
+        approval_id="c10-approval",
+        expected_action=None,
+        expected_error=None,
+        expect_no_reads=False,
+    ):
+        before = authority_snapshot(
+            case_conn,
+            observed_attempt.project_id,
+            observed_attempt.turn_id,
+        )
+        statements = []
+        read_actions = []
+        case_conn.set_trace_callback(statements.append)
+        if expect_no_reads:
+            def authorizer(action, arg1, arg2, database, source):
+                if action == sqlite3.SQLITE_READ:
+                    read_actions.append(
+                        (action, arg1, arg2, database, source)
+                    )
+                return sqlite3.SQLITE_OK
+
+            case_conn.set_authorizer(authorizer)
+        try:
+            if expected_error is None:
+                actual = (
+                    case_runtime.resolve_prepared_approval_checkpoint(
+                        observed_attempt,
+                        operation_id=operation_id,
+                        approval_id=approval_id,
+                    )
+                )
+            else:
+                with pytest.raises(module.ProjectRuntimeError) as rejected:
+                    case_runtime.resolve_prepared_approval_checkpoint(
+                        observed_attempt,
+                        operation_id=operation_id,
+                        approval_id=approval_id,
+                    )
+                assert rejected.value.code is expected_error
+                actual = None
+        finally:
+            if expect_no_reads:
+                case_conn.set_authorizer(None)
+            case_conn.set_trace_callback(None)
+        assert authority_snapshot(
+            case_conn,
+            observed_attempt.project_id,
+            observed_attempt.turn_id,
+        ) == before
+        dml = tuple(
+            statement.split(None, 1)[0].upper()
+            for statement in statements
+            if statement.lstrip().upper().startswith(
+                ("INSERT", "UPDATE", "DELETE", "REPLACE")
+            )
+        )
+        assert dml == ()
+        if expect_no_reads:
+            assert read_actions == []
+        if expected_error is None:
+            assert actual == decision_type(expected_action)
+        return actual
+
+    try:
+        # The batch may carry the original horizon after a heartbeat; local
+        # expiry is advisory while the exact persisted claim remains live.
+        heartbeat_now = [100]
+        (
+            heartbeat_conn,
+            heartbeat_runtime,
+            _,
+            _,
+            _,
+            heartbeat_claim,
+        ) = new_case(
+            "heartbeat-live",
+            clock=lambda: heartbeat_now[0],
+        )
+        original_attempt = attempt_for(heartbeat_claim)
+        for empty_operation_id, empty_approval_id in (
+            ("", "c10-approval"),
+            ("c10-operation", ""),
+        ):
+            resolve_write_free(
+                heartbeat_runtime,
+                heartbeat_conn,
+                original_attempt,
+                operation_id=empty_operation_id,
+                approval_id=empty_approval_id,
+                expected_error=module.RuntimeErrorCode.INVALID_ARGUMENT,
+                expect_no_reads=True,
+            )
+        heartbeat_now[0] = 110
+        renewed_claim = heartbeat_runtime.heartbeat_turn(
+            heartbeat_claim,
+            lease_seconds=60,
+        )
+        assert renewed_claim.lease_expires_at > original_attempt.lease_expires_at
+        expired_runtime = module.ProjectRuntime(
+            heartbeat_conn,
+            clock=lambda: renewed_claim.lease_expires_at + 10_000,
+        )
+        resolve_write_free(
+            expired_runtime,
+            heartbeat_conn,
+            original_attempt,
+            expected_action="wait",
+        )
+
+        # A Task-5 lease-less parked attempt without a durable block is still
+        # the exact authority and therefore remains waiting.
+        parked_now = [100]
+        (
+            parked_conn,
+            parked_runtime,
+            parked_project,
+            parked_turn,
+            _,
+            parked_claim,
+        ) = new_case("parked", clock=lambda: parked_now[0])
+        parked_attempt = attempt_for(parked_claim)
+        parked_now[0] = parked_claim.lease_expires_at
+
+        class ParkedReadback:
+            calls = 0
+
+            def read_turn(self, request):
+                self.calls += 1
+                assert parked_conn.in_transaction is False
+                assert request == module.TurnReadbackRequest(
+                    project_id=parked_claim.project_id,
+                    turn_id=parked_claim.turn_id,
+                    sequence=parked_claim.sequence,
+                    worker_id=parked_claim.worker_id,
+                    attempt_id=parked_claim.attempt_id,
+                    lease_generation=parked_claim.lease_generation,
+                    fencing_token=parked_claim.fencing_token,
+                    lease_expires_at=parked_claim.lease_expires_at,
+                    canonical_session_id=(
+                        parked_claim.canonical_session_id
+                    ),
+                    source_status="claimed",
+                    execution_state="started",
+                )
+                parked_row = parked_conn.execute(
+                    """
+                    SELECT status, attempt_id, lease_generation,
+                           fencing_token, execution_state,
+                           recovery_block_key
+                    FROM project_turns
+                    WHERE project_id = ? AND turn_id = ?
+                    """,
+                    (parked_project, parked_turn.turn_id),
+                ).fetchone()
+                assert tuple(parked_row) == (
+                    "reconciling",
+                    parked_claim.attempt_id,
+                    parked_claim.lease_generation,
+                    parked_claim.fencing_token,
+                    "started",
+                    None,
+                )
+                assert parked_conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM project_worker_leases
+                    WHERE project_id = ? AND turn_id = ?
+                    """,
+                    (parked_project, parked_turn.turn_id),
+                ).fetchone()[0] == 0
+                assert tuple(
+                    parked_conn.execute(
+                        """
+                        SELECT control_state, attempt_id, claim_worker_id,
+                               claim_lease_expires_at,
+                               claim_canonical_session_id
+                        FROM project_run_controls
+                        WHERE project_id = ? AND turn_id = ?
+                        """,
+                        (parked_project, parked_turn.turn_id),
+                    ).fetchone()
+                ) == (
+                    "running",
+                    parked_claim.attempt_id,
+                    parked_claim.worker_id,
+                    parked_claim.lease_expires_at,
+                    parked_claim.canonical_session_id,
+                )
+                assert parked_conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM project_events
+                    WHERE project_id = ? AND turn_id = ?
+                      AND kind = 'turn.reconciling'
+                    """,
+                    (parked_project, parked_turn.turn_id),
+                ).fetchone()[0] == 1
+                resolve_write_free(
+                    parked_runtime,
+                    parked_conn,
+                    parked_attempt,
+                    expected_action="wait",
+                )
+                return module.TurnReadbackResult("unknown")
+
+        parked_port = ParkedReadback()
+        parked_result = parked_runtime.reconcile_inflight_turns(
+            parked_port,
+            limit=10,
+        )
+        assert parked_port.calls == 1
+        assert len(parked_result) == 1
+        assert parked_result[0].status == "reconciling"
+        assert parked_conn.execute(
+            """
+            SELECT recovery_block_key
+            FROM project_turns
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (parked_project, parked_turn.turn_id),
+        ).fetchone()[0]
+
+        # A persisted stop is sufficient discard authority.
+        (
+            stop_conn,
+            stop_runtime,
+            stop_project,
+            stop_turn,
+            stop_actor,
+            stop_claim,
+        ) = new_case("stop", clock=lambda: 100)
+        stop_attempt = attempt_for(stop_claim)
+        stop_state = stop_conn.execute(
+            """
+            SELECT version FROM project_runtime_state
+            WHERE project_id = ?
+            """,
+            (stop_project,),
+        ).fetchone()[0]
+        stop_control = stop_conn.execute(
+            """
+            SELECT control_version FROM project_run_controls
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (stop_project, stop_turn.turn_id),
+        ).fetchone()[0]
+        stop_runtime.request_stop(
+            stop_project,
+            stop_turn.turn_id,
+            stop_actor,
+            idempotency_key="c10-persisted-stop",
+            expected_version=stop_state,
+            expected_control_version=stop_control,
+        )
+        resolve_write_free(
+            stop_runtime,
+            stop_conn,
+            stop_attempt,
+            expected_action="discard",
+        )
+
+        # Public not-started recovery followed by a fresh claim installs a
+        # coherent newer attempt/generation/fence.
+        successor_now = [100]
+        (
+            successor_conn,
+            successor_runtime,
+            successor_project,
+            _,
+            _,
+            old_claim,
+        ) = new_case(
+            "successor",
+            clock=lambda: successor_now[0],
+            started=False,
+        )
+        old_attempt = attempt_for(old_claim)
+        successor_now[0] = old_claim.lease_expires_at
+
+        class NoReadbackForNotStarted:
+            def read_turn(self, request):
+                raise AssertionError("not-started recovery has no readback")
+
+        successor_runtime.reconcile_inflight_turns(
+            NoReadbackForNotStarted(),
+            limit=10,
+        )
+        replacement_claim = successor_runtime.claim_next_turn(
+            successor_project,
+            "c10-successor-worker-2",
+            lease_seconds=30,
+        )
+        assert replacement_claim is not None
+        assert replacement_claim.attempt_id != old_claim.attempt_id
+        assert (
+            replacement_claim.lease_generation
+            == old_claim.lease_generation + 1
+        )
+        assert replacement_claim.fencing_token == old_claim.fencing_token + 1
+        resolve_write_free(
+            successor_runtime,
+            successor_conn,
+            old_attempt,
+            expected_action="discard",
+        )
+
+        # Unknown readback creates one exact persisted recovery block.
+        blocked_now = [100]
+        (
+            blocked_conn,
+            blocked_runtime,
+            _,
+            _,
+            _,
+            blocked_claim,
+        ) = new_case("blocked", clock=lambda: blocked_now[0])
+        blocked_attempt = attempt_for(blocked_claim)
+        blocked_now[0] = blocked_claim.lease_expires_at
+
+        class UnknownReadback:
+            def read_turn(self, request):
+                return module.TurnReadbackResult("unknown")
+
+        blocked_runtime.reconcile_inflight_turns(
+            UnknownReadback(),
+            limit=10,
+        )
+        blocked_row = blocked_conn.execute(
+            """
+            SELECT status, recovery_block_key
+            FROM project_turns
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (blocked_attempt.project_id, blocked_attempt.turn_id),
+        ).fetchone()
+        assert tuple(blocked_row)[0] == "reconciling"
+        assert tuple(blocked_row)[1]
+        resolve_write_free(
+            blocked_runtime,
+            blocked_conn,
+            blocked_attempt,
+            expected_action="discard",
+        )
+
+        # Batch-side authority may never run ahead of the retained claim.
+        (
+            mismatch_conn,
+            mismatch_runtime,
+            _,
+            _,
+            _,
+            mismatch_claim,
+        ) = new_case("mismatch", clock=lambda: 100)
+        mismatch_attempt = attempt_for(mismatch_claim)
+        for malformed_attempt in (
+            replace(
+                mismatch_attempt,
+                lease_expires_at=mismatch_attempt.lease_expires_at + 1,
+            ),
+            replace(
+                mismatch_attempt,
+                lease_generation=mismatch_attempt.lease_generation + 1,
+            ),
+            replace(
+                mismatch_attempt,
+                fencing_token=mismatch_attempt.fencing_token + 1,
+            ),
+        ):
+            resolve_write_free(
+                mismatch_runtime,
+                mismatch_conn,
+                malformed_attempt,
+                expected_error=(
+                    module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+                ),
+            )
+
+        # Missing retained audit authority and an unexpected dispatch gate
+        # are storage conflicts, never opportunistic discard authority.
+        (
+            malformed_conn,
+            malformed_runtime,
+            malformed_project,
+            malformed_turn,
+            _,
+            malformed_claim,
+        ) = new_case("malformed", clock=lambda: 100)
+        malformed_attempt = attempt_for(malformed_claim)
+        malformed_conn.execute(
+            """
+            UPDATE project_run_controls
+            SET claim_worker_id = NULL
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (malformed_project, malformed_turn.turn_id),
+        )
+        malformed_conn.commit()
+        resolve_write_free(
+            malformed_runtime,
+            malformed_conn,
+            malformed_attempt,
+            expected_error=module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT,
+        )
+
+        (
+            gate_conn,
+            gate_runtime,
+            gate_project,
+            gate_turn,
+            _,
+            gate_claim,
+        ) = new_case("unexpected-gate", clock=lambda: 100)
+        gate_attempt = attempt_for(gate_claim)
+        gate_conn.execute(
+            """
+            UPDATE project_runtime_state
+            SET transcript_pending_batch_id =
+                '99999999-9999-4999-8999-999999999999'
+            WHERE project_id = ?
+            """,
+            (gate_project,),
+        )
+        gate_conn.commit()
+        resolve_write_free(
+            gate_runtime,
+            gate_conn,
+            gate_attempt,
+            expected_error=module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT,
+        )
+        assert gate_turn.turn_id == gate_attempt.turn_id
+    finally:
+        for case_conn in case_connections:
+            case_conn.close()
+
+
+def test_task7_c13_worker_context_execution_input_is_exact_started_snapshot_and_surface_origin(
+    runtime_env,
+):
+    """Started dispatcher claims expose one detached, origin-bound snapshot.
+
+    This catches a worker input bridge that reads before ``mark_turn_started``,
+    loses the immutable Desktop/Discord binding, or derives a gateway-specific
+    payload schema instead of returning the stored turn payload verbatim.
+    """
+    module = runtime_env["module"]
+    clock_samples: list[int] = []
+    runtime = module.ProjectRuntime(
+        runtime_env["conn"],
+        clock=lambda: (clock_samples.append(100) or 100),
+    )
+
+    assert hasattr(module, "TurnOrigin")
+    assert hasattr(module, "TurnExecutionInput")
+    assert tuple(field.name for field in fields(module.TurnOrigin)) == (
+        "binding_id",
+        "surface",
+        "external_binding_id",
+        "actor_id",
+    )
+    assert tuple(field.name for field in fields(module.TurnExecutionInput)) == (
+        "attempt",
+        "payload",
+        "origin",
+        "contract_revision",
+    )
+
+    turn = runtime.enqueue_turn(
+        runtime_env["project_id"],
+        {"message": "desktop-origin", "opaque": {"keep": True}},
+        runtime_env["desktop"],
+        idempotency_key="c13-desktop-input",
+        expected_version=0,
+    )
+    lease = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111", lease_seconds=30
+    )
+    assert lease is not None
+    start = runtime.claim_next_turn_for_dispatcher(
+        runtime_env["project_id"],
+        "c13-worker",
+        lease_seconds=30,
+        dispatcher_lease=lease,
+    )
+    assert start is not None
+    # A claimed-but-not-started attempt is not executable and the fresh input
+    # read is strictly read-only.  This is intentionally asserted before the
+    # successful snapshot so ``execution_input_for_claim`` cannot be a late
+    # convenience wrapper around the worker start path.
+    writes_before = runtime_env["conn"].total_changes
+    statements: list[str] = []
+    runtime_env["conn"].set_trace_callback(statements.append)
+    before_prestart_clock = len(clock_samples)
+    try:
+        with pytest.raises(module.ProjectRuntimeError) as not_started:
+            runtime.execution_input_for_claim(start.claim)
+    finally:
+        runtime_env["conn"].set_trace_callback(None)
+    assert not_started.value.code is module.RuntimeErrorCode.TURN_EXECUTION_NOT_STARTED
+    assert len(clock_samples) == before_prestart_clock + 1
+    assert runtime_env["conn"].total_changes == writes_before
+    assert not any(
+        statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+        for statement in statements
+    )
+
+    runtime_env["conn"].execute(
+        """
+        INSERT INTO project_contracts (
+            contract_id, project_id, revision, contract_json, status,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("c13-contract-7", runtime_env["project_id"], 7, "{}", "active", 1, 1),
+    )
+    runtime_env["conn"].commit()
+    claim = runtime.mark_turn_started(start.claim)
+
+    execution = runtime.execution_input_for_claim(claim)
+
+    assert execution.attempt == module.TurnAttemptIdentity(
+        project_id=runtime_env["project_id"],
+        turn_id=turn.turn_id,
+        sequence=turn.sequence,
+        worker_id="c13-worker",
+        attempt_id=claim.attempt_id,
+        lease_generation=claim.lease_generation,
+        fencing_token=claim.fencing_token,
+        canonical_session_id="session-root",
+        lease_expires_at=claim.lease_expires_at,
+    )
+    assert execution.payload == {
+        "message": "desktop-origin",
+        "opaque": {"keep": True},
+    }
+    assert execution.origin == module.TurnOrigin(
+        binding_id="desktop-owner",
+        surface="desktop",
+        external_binding_id="window-1",
+        actor_id="owner-1",
+    )
+    assert execution.contract_revision == 7
+
+    # One malformed persisted revision invalidates the complete fresh
+    # snapshot; it must not be silently ignored in favour of the valid max.
+    runtime_env["conn"].execute(
+        """
+        INSERT INTO project_contracts (
+            contract_id, project_id, revision, contract_json, status,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("c13-contract-bad", runtime_env["project_id"], "bad", "{}", "active", 1, 1),
+    )
+    runtime_env["conn"].commit()
+    writes_before = runtime_env["conn"].total_changes
+    statements = []
+    runtime_env["conn"].set_trace_callback(statements.append)
+    try:
+        with pytest.raises(module.ProjectRuntimeError):
+            runtime.execution_input_for_claim(claim)
+    finally:
+        runtime_env["conn"].set_trace_callback(None)
+    assert runtime_env["conn"].total_changes == writes_before
+    assert not any(
+        statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+        for statement in statements
+    )

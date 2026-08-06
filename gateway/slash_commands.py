@@ -56,6 +56,75 @@ logger = logging.getLogger("gateway.run")
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 
 
+@dataclasses.dataclass(frozen=True)
+class ProjectSlashCommand:
+    """One validated canonical command from an explicit `/project` phrase."""
+
+    name: str
+    payload: dict[str, object]
+
+
+def parse_project_slash_command(text: object) -> ProjectSlashCommand | None:
+    """Translate the narrow managed-project grammar without mutating state.
+
+    Legacy `/project use` and `/project clear` deliberately stay unclaimed so
+    their existing non-managed-channel handling remains intact.
+    """
+    if type(text) is not str:
+        return None
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        return None
+    if len(parts) < 2 or parts[0].lower() != "/project":
+        return None
+    verb = parts[1].lower()
+    arguments = parts[2:]
+    if verb == "create" and arguments:
+        return ProjectSlashCommand(
+            "project.create",
+            {"name": " ".join(arguments), "current_phase": "planning"},
+        )
+    if verb == "rename" and arguments:
+        return ProjectSlashCommand(
+            "project.rename", {"name": " ".join(arguments)}
+        )
+    if verb == "status" and not arguments:
+        return ProjectSlashCommand("project.status", {})
+    if verb == "queue" and not arguments:
+        return ProjectSlashCommand("queue.status", {})
+    if verb in {"stop", "resume"} and len(arguments) == 2:
+        turn_id, raw_control_version = arguments
+        if not raw_control_version.isdecimal():
+            return None
+        return ProjectSlashCommand(
+            "run.stop" if verb == "stop" else "run.resume",
+            {
+                "turn_id": turn_id,
+                "expected_control_version": int(raw_control_version),
+            },
+        )
+    if verb == "approval" and len(arguments) == 2:
+        approval_id, choice = arguments
+        outcome = {
+            "approve": "approved",
+            "deny": "denied",
+        }.get(choice.lower())
+        if approval_id and outcome is not None:
+            return ProjectSlashCommand(
+                "approval.resolve",
+                {
+                    "approval_id": approval_id,
+                    "outcome": outcome,
+                },
+            )
+    if verb == "complete" and arguments == ["confirm"]:
+        return ProjectSlashCommand("project.accept_completion", {})
+    if verb == "reopen" and not arguments:
+        return ProjectSlashCommand("project.reopen", {})
+    return None
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 

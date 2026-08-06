@@ -204,6 +204,53 @@ async def test_no_allowlist_denies_without_opt_in(adapter):
 
 
 @pytest.mark.asyncio
+async def test_rejected_project_slash_warning_contains_no_raw_context(
+    adapter,
+    caplog,
+):
+    raw_values = (
+        "sensitive-user-name",
+        "420000000000000001",
+        "420000000000000002",
+        "420000000000000003",
+        "/project",
+        "rename",
+        "private-project-name",
+    )
+    interaction = _make_interaction(
+        raw_values[1],
+        channel_id=int(raw_values[2]),
+        guild_id=int(raw_values[3]),
+    )
+    interaction.user.name = raw_values[0]
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="plugins.platforms.discord.adapter",
+    ):
+        await adapter._run_simple_slash(
+            interaction,
+            "/project rename private-project-name",
+        )
+        await asyncio.sleep(0)
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if (
+            record.levelno == logging.WARNING
+            and "Unauthorized slash attempt" in record.getMessage()
+        )
+    ]
+    assert len(warnings) == 1
+    assert all(value not in warnings[0] for value in raw_values)
+    interaction.response.send_message.assert_awaited_once_with(
+        "You're not authorized to use this command.",
+        ephemeral=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_no_allowlist_dm_denied_without_opt_in(adapter):
     """DM slash commands follow the same fail-closed default."""
     interaction = _make_interaction("999999999", in_dm=True)

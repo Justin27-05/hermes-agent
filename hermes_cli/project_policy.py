@@ -327,7 +327,10 @@ def _valid_command_shape(command: object) -> bool:
     ):
         return False
     if command.batch_id is None:
-        return command.batch_items == ()
+        return (
+            command.batch_items == ()
+            or _items_are_canonical(command.batch_items)
+        )
     return _is_text(command.batch_id) and _items_are_canonical(command.batch_items)
 
 

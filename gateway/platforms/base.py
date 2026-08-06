@@ -4909,7 +4909,32 @@ class BasePlatformAdapter(ABC):
             cmd = event.get_command()
             from hermes_cli.commands import should_bypass_active_session
 
-            if should_bypass_active_session(cmd):
+            # Managed project controls are deliberately not registered as
+            # generic Hermes commands: they are only meaningful after the
+            # gateway has proved the Discord binding, owner, and workspace.
+            # They still must reach that gateway check before this adapter
+            # queues a follow-up behind a running agent.
+            is_managed_project_control = False
+            if cmd == "project":
+                from gateway.slash_commands import parse_project_slash_command
+
+                is_managed_project_control = (
+                    parse_project_slash_command(event.text) is not None
+                )
+            is_managed_project_candidate = (
+                getattr(
+                    event,
+                    "_hermes_managed_project_candidate",
+                    False,
+                )
+                is True
+            )
+
+            if (
+                should_bypass_active_session(cmd)
+                or is_managed_project_control
+                or is_managed_project_candidate
+            ):
                 # /stop, /new, /reset must cancel the in-flight adapter task
                 # and preserve ordering of queued follow-ups.  Route those
                 # through the dedicated handoff path that serializes

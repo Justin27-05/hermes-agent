@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import inspect
 import json
@@ -10,11 +11,12 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, fields, replace
 from enum import Enum
 from types import MappingProxyType
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_type_hints
 
 import pytest
 
@@ -53,6 +55,17 @@ TASK6_INDEXES = {
     "idx_project_operations_approved_rehydrate",
     "idx_project_operations_turn_unresolved",
     "idx_project_operations_turn_unsafe",
+}
+
+TASK7_MEMBERSHIP_COLUMNS = {
+    "approval_checkpoint_id",
+    "intent_event_id",
+    "recovery_membership_sequence",
+}
+
+TASK7_MEMBERSHIP_INDEXES = {
+    "idx_project_operations_recovery_membership",
+    "idx_project_operations_task7_recovery_page",
 }
 
 OPERATION_PROBE = (
@@ -273,6 +286,7 @@ def test_public_operation_contract_is_exact_frozen_and_secret_safe():
         "fencing_token",
         "created_at",
         "updated_at",
+        "policy_authority_sha256",
     )
     assert tuple(field.name for field in fields(module.OperationReadbackRequest)) == (
         "operation_id",
@@ -295,7 +309,14 @@ def test_public_operation_contract_is_exact_frozen_and_secret_safe():
     )
     assert tuple(
         inspect.signature(module.ProjectOperationGuard.prepare).parameters
-    ) == ("self", "claim", "intent", "policy", "approval")
+    ) == (
+        "self",
+        "claim",
+        "intent",
+        "policy",
+        "approval",
+        "approval_checkpoint_id",
+    )
     assert tuple(
         inspect.signature(module.ProjectOperationGuard.resolve_operation_approval).parameters
     ) == ("self", "approval_id", "resolver", "outcome")
@@ -304,7 +325,7 @@ def test_public_operation_contract_is_exact_frozen_and_secret_safe():
     ) == ("self", "limit")
     assert tuple(
         inspect.signature(module.ProjectOperationGuard.mark_started).parameters
-    ) == ("self", "claim", "operation_id")
+    ) == ("self", "claim", "operation_id", "approval_checkpoints")
     assert tuple(
         inspect.signature(module.ProjectOperationGuard.record_receipt).parameters
     ) == ("self", "claim", "operation_id", "receipt")
@@ -1337,6 +1358,502 @@ def _operation_snapshot(operation_env):
             ).fetchone()
         ),
     )
+
+
+def _allow_local_policy():
+    return PolicyDecision(
+        Decision.ALLOW,
+        "policy.allow.local",
+        "inside the approved project plan",
+    )
+
+
+def _prepare_membership_operation(
+    operation_env,
+    *,
+    operation_id,
+):
+    return operation_env["guard"].prepare(
+        operation_env["claim"],
+        _intent(
+            operation_env,
+            operation_id=operation_id,
+            idempotency_key=f"remote-{operation_id}",
+            readback_kind=None,
+            remote_idempotency_supported=False,
+        ),
+        policy=_allow_local_policy(),
+        approval=None,
+    )
+
+
+def _task7_operation_membership_state(conn):
+    return tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT operation_id, guard_revision, guard_validated,
+                   recovery_membership_sequence
+            FROM project_operations
+            ORDER BY operation_id
+            """
+        )
+    )
+
+
+def test_task7_operation_membership_schema_is_certified_and_indexed(
+    operation_conn,
+):
+    columns = {
+        row["name"]
+        for row in operation_conn.execute(
+            "PRAGMA table_info(project_operations)"
+        )
+    }
+    indexes = {
+        row["name"]: " ".join(row["sql"].lower().split())
+        for row in operation_conn.execute(
+            """
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'index'
+              AND name IN (
+                  'idx_project_operations_recovery_membership',
+                  'idx_project_operations_task7_recovery_page'
+              )
+            """
+        )
+    }
+
+    assert TASK7_MEMBERSHIP_COLUMNS <= columns
+    assert set(indexes) == TASK7_MEMBERSHIP_INDEXES
+    for sql in indexes.values():
+        assert "guard_revision = 1" in sql
+        assert "guard_validated = 1" in sql
+        assert "recovery_membership_sequence is not null" in sql
+    assert "status in" in indexes[
+        "idx_project_operations_task7_recovery_page"
+    ]
+
+
+def test_task7_new_operation_membership_allocates_once_and_is_immutable(
+    operation_env,
+):
+    first = _prepare_membership_operation(
+        operation_env,
+        operation_id="operation-z",
+    )
+    second = _prepare_membership_operation(
+        operation_env,
+        operation_id="operation-a",
+    )
+    replay = _prepare_membership_operation(
+        operation_env,
+        operation_id="operation-z",
+    )
+
+    assert replay == first
+    assert second.operation_id == "operation-a"
+    assert tuple(
+        tuple(row)
+        for row in operation_env["conn"].execute(
+            """
+            SELECT operation_id, recovery_membership_sequence
+            FROM project_operations
+            ORDER BY recovery_membership_sequence
+            """
+        )
+    ) == (("operation-z", 1), ("operation-a", 2))
+    assert operation_env["conn"].execute(
+        """
+        SELECT last_sequence
+        FROM project_runtime_membership_counters
+        WHERE lane = 'operation_recovery'
+        """
+    ).fetchone()[0] == 2
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="recovery membership sequence is immutable",
+    ):
+        operation_env["conn"].execute(
+            """
+            UPDATE project_operations
+            SET recovery_membership_sequence = 3
+            WHERE operation_id = 'operation-z'
+            """
+        )
+    operation_env["conn"].rollback()
+
+
+def test_task7_operation_membership_migration_is_deterministic_and_marker_safe(
+    operation_env,
+):
+    _prepare_membership_operation(
+        operation_env,
+        operation_id="operation-z",
+    )
+    _prepare_membership_operation(
+        operation_env,
+        operation_id="operation-a",
+    )
+    conn = operation_env["conn"]
+    conn.executescript(
+        """
+        DROP TRIGGER trg_project_runtime_dispatch_membership_insert;
+        DROP TRIGGER trg_project_runtime_dispatch_membership_update;
+        DROP TRIGGER trg_project_operations_task6_insert;
+        DROP TRIGGER trg_project_operations_task6_update;
+        DROP TRIGGER trg_project_operations_guard_update;
+        DROP TRIGGER
+            trg_project_operations_task7_certification_insert;
+        DROP TRIGGER
+            trg_project_operations_task7_certification_update;
+        DROP TRIGGER
+            trg_project_operations_recovery_membership_update;
+        DROP TRIGGER
+            trg_project_operations_task7_certified_update;
+        DROP INDEX idx_project_operations_recovery_membership;
+        DROP INDEX idx_project_operations_task7_recovery_page;
+        UPDATE project_runtime_state
+        SET dispatch_membership_sequence = NULL;
+        UPDATE project_operations
+        SET recovery_membership_sequence = NULL;
+        UPDATE project_runtime_membership_counters
+        SET last_sequence = 0;
+        UPDATE project_operation_maintenance
+        SET task7_operation_migration_complete = 0
+        WHERE singleton = 1;
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, turn_id, idempotency_key,
+            command_revision, targets_json, payload_json, status,
+            created_at, updated_at, guard_revision, guard_validated
+        ) VALUES (
+            'marker-zero-malformed', ?, NULL, 'marker-zero-key',
+            1, '[', '{', 'malformed', 5, 6, 0, 0
+        )
+        """,
+        (operation_env["project_id"],),
+    )
+    marker_zero_before = tuple(
+        conn.execute(
+            """
+            SELECT operation_id, project_id, turn_id, idempotency_key,
+                   command_revision, targets_json, payload_json, status,
+                   created_at, updated_at, guard_revision, guard_validated,
+                   recovery_membership_sequence
+            FROM project_operations
+            WHERE operation_id = 'marker-zero-malformed'
+            """
+        ).fetchone()
+    )
+    conn.commit()
+
+    prdb.ensure_schema(conn)
+
+    assert _task7_operation_membership_state(conn) == (
+        ("marker-zero-malformed", 0, 0, None),
+        ("operation-a", 1, 1, 1),
+        ("operation-z", 1, 1, 2),
+    )
+    assert tuple(
+        conn.execute(
+            """
+            SELECT operation_id, project_id, turn_id, idempotency_key,
+                   command_revision, targets_json, payload_json, status,
+                   created_at, updated_at, guard_revision, guard_validated,
+                   recovery_membership_sequence
+            FROM project_operations
+            WHERE operation_id = 'marker-zero-malformed'
+            """
+        ).fetchone()
+    ) == marker_zero_before
+    assert conn.execute(
+        """
+        SELECT last_sequence
+        FROM project_runtime_membership_counters
+        WHERE lane = 'operation_recovery'
+        """
+    ).fetchone()[0] == 2
+    assert conn.execute(
+        """
+        SELECT task7_operation_migration_complete
+        FROM project_operation_maintenance
+        WHERE singleton = 1
+        """
+    ).fetchone()[0] == 1
+
+    before_repeat = _task7_operation_membership_state(conn)
+    prdb.ensure_schema(conn)
+    assert _task7_operation_membership_state(conn) == before_repeat
+
+
+def test_task7_operation_membership_overflow_rolls_back_prepare(
+    operation_env,
+):
+    conn = operation_env["conn"]
+    conn.execute(
+        """
+        UPDATE project_runtime_membership_counters
+        SET last_sequence = 9223372036854775807
+        WHERE lane = 'operation_recovery'
+        """
+    )
+    conn.commit()
+    before = _operation_snapshot(operation_env)
+
+    with pytest.raises(
+        prdb.MembershipSequenceExhaustedError,
+        match="MEMBERSHIP_SEQUENCE_EXHAUSTED",
+    ):
+        _prepare_membership_operation(
+            operation_env,
+            operation_id="operation-overflow",
+        )
+
+    assert _operation_snapshot(operation_env) == before
+    assert conn.execute(
+        """
+        SELECT last_sequence
+        FROM project_runtime_membership_counters
+        WHERE lane = 'operation_recovery'
+        """
+    ).fetchone()[0] == 9223372036854775807
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM project_operations
+        WHERE operation_id = 'operation-overflow'
+        """
+    ).fetchone()[0] == 0
+
+
+def test_task7_raw_epoch_recovery_pages_only_certified_members(
+    operation_conn,
+):
+    module = importlib.import_module("hermes_cli.project_operations")
+    cursor_type = module.OperationRecoveryCursor
+    raw_project_id = projects_db.create_project(
+        operation_conn,
+        name="Raw staging exclusions",
+        folders=("C:/work/raw-staging",),
+    )
+    operation_conn.executemany(
+        """
+        INSERT INTO project_operations (
+            operation_id, project_id, turn_id, idempotency_key,
+            command_revision, targets_json, payload_json, status,
+            created_at, updated_at, guard_revision, guard_validated,
+            recovery_membership_sequence
+        ) VALUES (?, ?, NULL, ?, 1, ?, ?, ?, 1, 1, ?, ?, ?)
+        """,
+        (
+            (
+                "raw-marker-zero",
+                raw_project_id,
+                    "raw-marker-zero-key",
+                    "[",
+                    "{",
+                    "approved",
+                    1,
+                    0,
+                1,
+            ),
+            (
+                "raw-revision-zero",
+                raw_project_id,
+                "raw-revision-zero-key",
+                "[]",
+                "{}",
+                "approved",
+                0,
+                1,
+                2,
+            ),
+        ),
+    )
+    operation_conn.execute(
+        """
+        UPDATE project_runtime_membership_counters
+        SET last_sequence = 2
+        WHERE lane = 'operation_recovery'
+        """
+    )
+    operation_conn.commit()
+
+    for ordinal in range(1, 102):
+        _add_parked_operation_candidate(
+            operation_conn,
+            ordinal=ordinal,
+            status="approved",
+            updated_at=102 - ordinal,
+        )
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    guard = module.ProjectOperationGuard(
+        runtime_module.ProjectRuntime(
+            operation_conn,
+            clock=lambda: 500,
+        )
+    )
+    assert operation_conn.execute(
+        """
+        SELECT COUNT(*) FROM project_operations
+        WHERE guard_revision = 1
+          AND guard_validated = 1
+          AND recovery_membership_sequence IS NOT NULL
+          AND status IN (
+              'approved', 'effect_started',
+              'receipt_recorded', 'unknown'
+          )
+        """
+    ).fetchone()[0] == 101
+
+    before_changes = operation_conn.total_changes
+    before_rows = tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT operation_id, status, guard_revision, guard_validated,
+                   recovery_membership_sequence
+            FROM project_operations
+            ORDER BY operation_id
+            """
+        )
+    )
+    statements = []
+    operation_conn.set_trace_callback(statements.append)
+    try:
+        upper = guard.operation_recovery_membership_upper_watermark()
+        assert upper == 103
+        first = guard.scan_operation_recovery_members(
+            after=None,
+            through_membership_sequence=upper,
+            limit=100,
+        )
+    finally:
+        operation_conn.set_trace_callback(None)
+
+    assert len(first.members) == 100
+    assert [
+        member.recovery_membership_sequence
+        for member in first.members
+    ] == list(range(3, 103))
+    assert first.scanned_through is not None
+    assert first.scanned_through.recovery_membership_sequence == 102
+    assert first.reached_epoch_end is False
+    raw_scan_sql = [
+        statement
+        for statement in statements
+        if "from project_operations indexed by "
+        "idx_project_operations_task7_recovery_page"
+        in " ".join(statement.lower().split())
+    ]
+    raw_statements = [
+        " ".join(statement.lower().split())
+        for statement in raw_scan_sql
+    ]
+    assert len(raw_statements) == 3
+    assert sum(
+        "order by recovery_membership_sequence desc" in statement
+        for statement in raw_statements
+    ) == 1
+    assert sum(
+        "order by recovery_membership_sequence, project_id, "
+        "operation_id, turn_id limit 100" in statement
+        for statement in raw_statements
+    ) == 1
+    assert sum(
+        statement.startswith("select 1 ")
+        for statement in raw_statements
+    ) == 1
+    assert all(
+        "guard_revision = 1" in statement
+        and "guard_validated = 1" in statement
+        and "recovery_membership_sequence is not null" in statement
+        and "'approved', 'effect_started', "
+        "'receipt_recorded', 'unknown'" in statement
+        and "offset" not in statement
+        and "project_turns" not in statement
+        and "project_worker_leases" not in statement
+        for statement in raw_statements
+    )
+    for sql in raw_scan_sql:
+        plan = operation_conn.execute(
+            "EXPLAIN QUERY PLAN " + sql,
+        ).fetchall()
+        details = " ".join(row["detail"] for row in plan)
+        assert "idx_project_operations_task7_recovery_page" in details
+        assert "USE TEMP B-TREE" not in details
+
+    second = guard.scan_operation_recovery_members(
+        after=first.scanned_through,
+        through_membership_sequence=upper,
+        limit=100,
+    )
+    assert len(second.members) == 1
+    assert second.members[0].recovery_membership_sequence == 103
+    assert second.scanned_through == cursor_type(
+        103,
+        second.members[0].project_id,
+        second.members[0].operation_id,
+        second.members[0].turn_id,
+    )
+    assert second.reached_epoch_end is True
+    assert operation_conn.total_changes == before_changes
+    assert tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT operation_id, status, guard_revision, guard_validated,
+                   recovery_membership_sequence
+            FROM project_operations
+            ORDER BY operation_id
+            """
+        )
+    ) == before_rows
+    invalid_calls = (
+        lambda: guard.scan_operation_recovery_members(
+            after=None,
+            through_membership_sequence=upper,
+            limit=True,
+        ),
+        lambda: guard.scan_operation_recovery_members(
+            after=None,
+            through_membership_sequence=upper,
+            limit=0,
+        ),
+        lambda: guard.scan_operation_recovery_members(
+            after=None,
+            through_membership_sequence=upper,
+            limit=101,
+        ),
+        lambda: guard.scan_operation_recovery_members(
+            after=cursor_type(
+                upper + 1,
+                "beyond-project",
+                "beyond-operation",
+                "beyond-turn",
+            ),
+            through_membership_sequence=upper,
+            limit=1,
+        ),
+    )
+    for invalid_call in invalid_calls:
+        invalid_statements = []
+        operation_conn.set_trace_callback(invalid_statements.append)
+        try:
+            with pytest.raises(module.ProjectOperationError) as error:
+                invalid_call()
+        finally:
+            operation_conn.set_trace_callback(None)
+        assert (
+            error.value.code
+            is module.OperationErrorCode.INVALID_OPERATION_ARGUMENT
+        )
+        assert invalid_statements == []
 
 
 def test_allowed_prepare_persists_one_canonical_intent_and_exact_replay_is_write_free(
@@ -3761,6 +4278,385 @@ def test_mapper_accepts_authoritative_not_applied_evidence_on_approved_operation
     assert operation.readback_json == row["readback_json"]
 
 
+@pytest.mark.parametrize("transition", ("renew", "takeover"))
+def test_task7_c4_startauthority_approved_operation_fences_at_write_boundary(
+    operation_env,
+    monkeypatch,
+    request,
+    transition,
+):
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    operation_module = operation_env["module"]
+    conn = operation_env["conn"]
+    project_id = operation_env["project_id"]
+    turn_id = operation_env["turn"].turn_id
+    _prepare_critical(operation_env)
+    operation_env["now"][0] = 131
+    approved = operation_env["guard"].resolve_operation_approval(
+        "approval-1",
+        operation_env["actor"],
+        outcome="approved",
+    )
+    assert approved.status == "approved"
+
+    identity_counts = {}
+    attempt_observations = []
+    traced_statements = []
+
+    def identity(kind):
+        identity_counts[kind] = identity_counts.get(kind, 0) + 1
+        if kind == "attempt":
+            normalized = [
+                " ".join(statement.lower().split())
+                for statement in traced_statements
+            ]
+            attempt_observations.append(
+                (
+                    conn.in_transaction,
+                    any(
+                        statement.startswith(
+                            "select instance_id, generation, "
+                            "fencing_token, expires_at from "
+                            "project_dispatcher_leases "
+                            "where lease_name = 'core'"
+                        )
+                        for statement in normalized
+                    ),
+                    not any(
+                        statement.startswith(
+                            ("insert", "update", "delete", "replace")
+                        )
+                        for statement in normalized
+                    ),
+                )
+            )
+        return f"task7-c4-{kind}-{identity_counts[kind]}"
+
+    runtime = runtime_module.ProjectRuntime(
+        conn,
+        clock=lambda: operation_env["now"][0],
+        id_factory=identity,
+    )
+    guard = operation_module.ProjectOperationGuard(runtime)
+    old_lease = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert old_lease is not None
+    upper = guard.operation_recovery_membership_upper_watermark()
+    assert upper is not None
+    discovery = guard.scan_operation_recovery_members(
+        after=None,
+        through_membership_sequence=upper,
+        limit=100,
+    )
+    assert [
+        (member.project_id, member.operation_id)
+        for member in discovery.members
+    ] == [(project_id, "operation-1")]
+
+    database_path = Path(
+        conn.execute("PRAGMA database_list").fetchone()["file"]
+    )
+    contender_conn = projects_db.connect(database_path)
+    request.addfinalizer(contender_conn.close)
+    contender = runtime_module.ProjectRuntime(
+        contender_conn,
+        clock=lambda: operation_env["now"][0],
+    )
+    newest_lease = []
+    original_write_transaction = prdb.write_transaction
+    intercepted = False
+
+    @contextlib.contextmanager
+    def transition_before_begin(connection):
+        nonlocal intercepted
+        if connection is conn and not intercepted:
+            intercepted = True
+            prdb.write_transaction = original_write_transaction
+            try:
+                if transition == "renew":
+                    newest_lease.append(
+                        contender.renew_dispatcher_lease(
+                            old_lease,
+                            lease_seconds=50,
+                        )
+                    )
+                else:
+                    replacement = contender.acquire_dispatcher_lease(
+                        "22222222-2222-4222-8222-222222222222",
+                        lease_seconds=30,
+                    )
+                    assert replacement is not None
+                    newest_lease.append(replacement)
+            finally:
+                prdb.write_transaction = transition_before_begin
+        with original_write_transaction(connection):
+            yield
+
+    operation_env["now"][0] = (
+        140 if transition == "renew" else 161
+    )
+    monkeypatch.setattr(
+        prdb,
+        "write_transaction",
+        transition_before_begin,
+    )
+    before = _operation_snapshot(operation_env)
+    worker_lease_before = tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM project_worker_leases
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (project_id, turn_id),
+        )
+    )
+    stale_statements = []
+    before_changes = conn.total_changes
+    conn.set_trace_callback(stale_statements.append)
+    try:
+        with pytest.raises(runtime_module.ProjectRuntimeError) as stale:
+            guard.rehydrate_approved_operation_for_dispatcher(
+                project_id,
+                "operation-1",
+                worker_id="task7-c4-worker",
+                lease_seconds=30,
+                dispatcher_lease=old_lease,
+            )
+    finally:
+        conn.set_trace_callback(None)
+    stale_mutations = [
+        statement
+        for statement in stale_statements
+        if statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+    ]
+    assert (
+        stale.value.code
+        is runtime_module.RuntimeErrorCode.STALE_DISPATCHER_LEASE
+    )
+    assert intercepted
+    assert len(newest_lease) == 1
+    assert identity_counts.get("attempt", 0) == 0
+    assert conn.total_changes == before_changes
+    assert stale_mutations == []
+    assert before == _operation_snapshot(operation_env)
+    assert worker_lease_before == tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM project_worker_leases
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (project_id, turn_id),
+        )
+    )
+
+    traced_statements.clear()
+    conn.set_trace_callback(traced_statements.append)
+    try:
+        start = guard.rehydrate_approved_operation_for_dispatcher(
+            project_id,
+            "operation-1",
+            worker_id="task7-c4-worker",
+            lease_seconds=30,
+            dispatcher_lease=newest_lease[0],
+        )
+    finally:
+        conn.set_trace_callback(None)
+    from hermes_cli.project_runtime import WorkerStart
+
+    assert type(start) is WorkerStart
+    assert start.source == "approved_operation"
+    assert start.dispatcher_lease is newest_lease[0]
+    assert start.operation == guard._stored_public_operation(
+        project_id,
+        "operation-1",
+    )
+    assert (
+        start.operation.project_id,
+        start.operation.turn_id,
+        start.operation.operation_id,
+        start.operation.attempt_id,
+        start.operation.lease_generation,
+        start.operation.fencing_token,
+    ) == (
+        start.claim.project_id,
+        start.claim.turn_id,
+        "operation-1",
+        start.claim.attempt_id,
+        start.claim.lease_generation,
+        start.claim.fencing_token,
+    )
+    assert identity_counts["attempt"] == 1
+    assert attempt_observations == [(True, True, True)]
+
+    replay_statements = []
+    replay_changes = conn.total_changes
+    conn.set_trace_callback(replay_statements.append)
+    try:
+        replay = guard.rehydrate_approved_operation_for_dispatcher(
+            project_id,
+            "operation-1",
+            worker_id="task7-c4-worker",
+            lease_seconds=30,
+            dispatcher_lease=newest_lease[0],
+        )
+    finally:
+        conn.set_trace_callback(None)
+    replay_mutations = [
+        statement
+        for statement in replay_statements
+        if statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+    ]
+    assert replay is None
+    assert conn.total_changes == replay_changes
+    assert replay_mutations == []
+    assert identity_counts["attempt"] == 1
+
+
+def test_task7_c4_startauthority_approved_operation_rechecks_expiry_after_lock_wait(
+    operation_env,
+    monkeypatch,
+):
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    operation_module = operation_env["module"]
+    conn = operation_env["conn"]
+    project_id = operation_env["project_id"]
+    turn_id = operation_env["turn"].turn_id
+    _prepare_critical(operation_env)
+    operation_env["now"][0] = 131
+    approved = operation_env["guard"].resolve_operation_approval(
+        "approval-1",
+        operation_env["actor"],
+        outcome="approved",
+    )
+    assert approved.status == "approved"
+    attempt_calls = []
+
+    def identity(kind):
+        if kind == "attempt":
+            attempt_calls.append(kind)
+            raise AssertionError(
+                "attempt factory reached after Core expiry"
+            )
+        return f"task7-c4-{kind}"
+
+    runtime = runtime_module.ProjectRuntime(
+        conn,
+        clock=lambda: operation_env["now"][0],
+        id_factory=identity,
+    )
+    guard = operation_module.ProjectOperationGuard(runtime)
+    lease = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert lease is not None
+    before_core = tuple(
+        conn.execute(
+            """
+            SELECT lease_name, instance_id, generation, fencing_token,
+                   expires_at, updated_at
+            FROM project_dispatcher_leases
+            WHERE lease_name = 'core'
+            """
+        ).fetchone()
+    )
+    before_operation = _operation_snapshot(operation_env)
+    before_worker_lease = tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM project_worker_leases
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (project_id, turn_id),
+        )
+    )
+    original_write_transaction = prdb.write_transaction
+    crossed_boundary = False
+
+    @contextlib.contextmanager
+    def expire_before_begin(connection):
+        nonlocal crossed_boundary
+        if connection is conn and not crossed_boundary:
+            crossed_boundary = True
+            operation_env["now"][0] = lease.expires_at
+        with original_write_transaction(connection):
+            yield
+
+    operation_env["now"][0] = lease.expires_at - 1
+    monkeypatch.setattr(
+        prdb,
+        "write_transaction",
+        expire_before_begin,
+    )
+    statements = []
+    before_changes = conn.total_changes
+    caught = None
+    conn.set_trace_callback(statements.append)
+    try:
+        guard.rehydrate_approved_operation_for_dispatcher(
+            project_id,
+            "operation-1",
+            worker_id="task7-c4-worker",
+            lease_seconds=30,
+            dispatcher_lease=lease,
+        )
+    except Exception as exc:
+        caught = exc
+    finally:
+        conn.set_trace_callback(None)
+    mutations = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+    ]
+
+    assert crossed_boundary
+    assert attempt_calls == []
+    assert conn.total_changes == before_changes
+    assert mutations == []
+    assert before_operation == _operation_snapshot(operation_env)
+    assert before_worker_lease == tuple(
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT * FROM project_worker_leases
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (project_id, turn_id),
+        )
+    )
+    assert tuple(
+        conn.execute(
+            """
+            SELECT lease_name, instance_id, generation, fencing_token,
+                   expires_at, updated_at
+            FROM project_dispatcher_leases
+            WHERE lease_name = 'core'
+            """
+        ).fetchone()
+    ) == before_core
+    assert type(caught) is runtime_module.ProjectRuntimeError
+    assert (
+        caught.code
+        is runtime_module.RuntimeErrorCode.STALE_DISPATCHER_LEASE
+    )
+
+
 def test_live_approved_operation_lease_is_not_stolen(operation_env):
     _prepare_critical(operation_env)
     operation_env["now"][0] = 101
@@ -4785,6 +5681,43 @@ def test_mark_started_is_fenced_atomic_and_exact_replay_is_write_free(
         (operation_env["project_id"],),
     ).fetchone()[0] == 1
     assert after_first == _operation_snapshot(operation_env)
+
+    operation_env["now"][0] = 131
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    before_stale_replay = _transition_authority_snapshot(
+        operation_env
+    )
+    before_stale_changes = conn.total_changes
+    stale_replay_trace = []
+    conn.set_trace_callback(stale_replay_trace.append)
+    try:
+        with pytest.raises(
+            runtime_module.ProjectRuntimeError
+        ) as stale_replay:
+            guard.mark_started(
+                operation_env["claim"], "operation-1"
+            )
+    finally:
+        conn.set_trace_callback(None)
+    stale_replay_mutations = tuple(
+        statement
+        for statement in stale_replay_trace
+        if statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+    )
+    assert (
+        stale_replay.value.code
+        is runtime_module.RuntimeErrorCode.STALE_TURN_CLAIM
+    )
+    assert conn.total_changes == before_stale_changes
+    assert stale_replay_mutations == ()
+    assert (
+        _transition_authority_snapshot(operation_env)
+        == before_stale_replay
+    )
 
 
 def test_stale_start_and_receipt_are_write_free(operation_env):
@@ -6634,6 +7567,14 @@ def _insert_raw_unresolved_operation(
     guard_validated=0,
 ):
     conn = operation_env["conn"]
+    recovery_membership_sequence = (
+        prdb._allocate_membership_sequence(
+            conn,
+            lane="operation_recovery",
+        )
+        if guard_validated == 1
+        else None
+    )
     conn.execute(
         """
         INSERT INTO project_operations (
@@ -6642,11 +7583,12 @@ def _insert_raw_unresolved_operation(
             created_at, updated_at, guard_revision, canonical_action,
             batch_items_json, readback_kind, attempt_id,
             lease_generation, fencing_token,
-            remote_idempotency_supported, guard_validated
+            remote_idempotency_supported, guard_validated,
+            recovery_membership_sequence
         ) VALUES (
             ?, ?, ?, ?, 1, '["c:/work/current"]', '{}', ?,
             1, ?, 1, 'local_code_edit', '["current"]', 'ledger', ?,
-            1, 1, 1, ?
+            1, 1, 1, ?, ?
         )
         """,
         (
@@ -6658,6 +7600,7 @@ def _insert_raw_unresolved_operation(
             updated_at,
             operation_env["claim"].attempt_id,
             guard_validated,
+            recovery_membership_sequence,
         ),
     )
     conn.commit()
@@ -6918,6 +7861,14 @@ def _insert_large_history_unsafe_row(operation_env, shape):
         else '["c:/work/unsafe"]'
     )
     conn = operation_env["conn"]
+    recovery_membership_sequence = (
+        prdb._allocate_membership_sequence(
+            conn,
+            lane="operation_recovery",
+        )
+        if post_effect
+        else None
+    )
     conn.execute("PRAGMA ignore_check_constraints=ON")
     try:
         conn.execute(
@@ -6931,11 +7882,12 @@ def _insert_large_history_unsafe_row(operation_env, shape):
                 attempt_id, lease_generation, fencing_token,
                 receipt_id, readback_json, blocked_reason,
                 remote_idempotency_supported,
-                approval_fingerprint_json
+                approval_fingerprint_json,
+                recovery_membership_sequence
             ) VALUES (
                 ?, ?, ?, ?, NULL, 1, ?, '{}', 'blocked', ?,
                 1, 1, ?, ?, 'local_code_edit', '["unsafe"]', ?,
-                ?, 1, 1, ?, NULL, ?, ?, NULL
+                ?, 1, 1, ?, NULL, ?, ?, NULL, ?
             )
             """,
             (
@@ -6960,6 +7912,7 @@ def _insert_large_history_unsafe_row(operation_env, shape):
                     else "operation_capability_unsupported"
                 ),
                 1 if post_effect else 0,
+                recovery_membership_sequence,
             ),
         )
     finally:
@@ -9998,3 +10951,5278 @@ def test_operation_trigger_rejects_capability_fingerprint_cross_breaks(
             """
         )
     operation_env["conn"].rollback()
+
+
+def _task7_c5_recovery_guard(conn, *, now=500):
+    runtime_module = importlib.import_module(
+        "hermes_cli.project_runtime"
+    )
+    operation_module = importlib.import_module(
+        "hermes_cli.project_operations"
+    )
+    runtime = runtime_module.ProjectRuntime(
+        conn,
+        clock=lambda: now,
+    )
+    guard = operation_module.ProjectOperationGuard(runtime)
+    dispatcher_lease = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert dispatcher_lease is not None
+    return operation_module, guard, dispatcher_lease
+
+
+def _task7_c5_operation_authority_snapshot(conn, operation_id):
+    identity = conn.execute(
+        """
+        SELECT project_id, turn_id
+        FROM project_operations
+        WHERE operation_id = ?
+        """,
+        (operation_id,),
+    ).fetchone()
+    assert identity is not None
+    project_id = identity["project_id"]
+    turn_id = identity["turn_id"]
+    return (
+        tuple(
+            conn.execute(
+                """
+                SELECT * FROM project_operations
+                WHERE project_id = ? AND operation_id = ?
+                """,
+                (project_id, operation_id),
+            ).fetchone()
+        ),
+        tuple(
+            conn.execute(
+                """
+                SELECT * FROM project_runtime_state
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        ),
+        tuple(
+            conn.execute(
+                """
+                SELECT * FROM project_turns
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (project_id, turn_id),
+            ).fetchone()
+        ),
+        tuple(
+            conn.execute(
+                """
+                SELECT * FROM project_run_controls
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (project_id, turn_id),
+            ).fetchone()
+        ),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_worker_leases
+                WHERE project_id = ? AND turn_id = ?
+                ORDER BY lease_id
+                """,
+                (project_id, turn_id),
+            )
+        ),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_events
+                WHERE project_id = ?
+                ORDER BY sequence
+                """,
+                (project_id,),
+            )
+        ),
+    )
+
+
+def test_task7_c5_slotbudget_zero_claims_classifies_waiting_and_permanent(
+    operation_conn,
+    monkeypatch,
+):
+    module = importlib.import_module(
+        "hermes_cli.project_operations"
+    )
+    from hermes_cli.project_runtime import TurnAttemptIdentity
+
+    checkpoint_identity = module.ApprovalCheckpointIdentity
+    assert tuple(
+        field.name for field in fields(checkpoint_identity)
+    ) == (
+        "checkpoint_id",
+        "attempt",
+        "operation_id",
+        "approval_id",
+    )
+    identity = checkpoint_identity(
+        "checkpoint-1",
+        TurnAttemptIdentity(
+            "project-1",
+            "turn-1",
+            1,
+            "worker-1",
+            "attempt-1",
+            1,
+            1,
+            "session-1",
+            100,
+        ),
+        "operation-1",
+        "approval-1",
+    )
+    with pytest.raises(FrozenInstanceError):
+        identity.checkpoint_id = "changed"
+    checkpoint_port = module.ApprovalCheckpointReadPort
+    assert checkpoint_port._is_protocol is True
+    assert tuple(
+        inspect.signature(
+            checkpoint_port.publication_state
+        ).parameters
+    ) == ("self", "checkpoint")
+    assert get_type_hints(
+        checkpoint_port.publication_state
+    ) == {
+        "checkpoint": checkpoint_identity,
+        "return": Literal[
+            "published", "waiting", "permanent_conflict"
+        ],
+    }
+    recovery_signature = inspect.signature(
+        module.ProjectOperationGuard.recover_pending_operations
+    )
+    assert tuple(recovery_signature.parameters) == (
+        "self",
+        "readback",
+        "approval_checkpoints",
+        "worker_id",
+        "lease_seconds",
+        "dispatcher_lease",
+        "max_claims",
+        "after",
+        "through_membership_sequence",
+        "limit",
+    )
+    assert get_type_hints(
+        module.ProjectOperationGuard.recover_pending_operations
+    )["approval_checkpoints"] is checkpoint_port
+
+    waiting_id = _add_parked_operation_candidate(
+        operation_conn,
+        ordinal=501,
+        status="effect_started",
+        updated_at=10,
+    )
+    permanent_id = _add_parked_operation_candidate(
+        operation_conn,
+        ordinal=502,
+        status="unknown",
+        updated_at=20,
+    )
+    _, guard, dispatcher_lease = _task7_c5_recovery_guard(
+        operation_conn
+    )
+    upper = guard.operation_recovery_membership_upper_watermark()
+    assert upper is not None
+
+    class ClassifyingReadback:
+        def __init__(self):
+            self.requests = []
+
+        def read_operation(self, request):
+            assert operation_conn.in_transaction is False
+            self.requests.append(request)
+            if request.operation_id == waiting_id:
+                raise RuntimeError("temporary readback outage")
+            assert request.operation_id == permanent_id
+            return module.OperationReadbackResult(
+                "unknown",
+                None,
+                None,
+            )
+
+    class NoApprovalCheckpoints:
+        calls = 0
+
+        def publication_state(self, checkpoint):
+            self.calls += 1
+            raise AssertionError(
+                "noncritical operations have no approval checkpoint"
+            )
+
+    readback = ClassifyingReadback()
+    checkpoints = NoApprovalCheckpoints()
+    result = guard.recover_pending_operations(
+        readback,
+        checkpoints,
+        worker_id="task7-c5-worker",
+        lease_seconds=30,
+        dispatcher_lease=dispatcher_lease,
+        max_claims=0,
+        after=None,
+        through_membership_sequence=upper,
+        limit=2,
+    )
+
+    raw_last = operation_conn.execute(
+        """
+        SELECT recovery_membership_sequence, project_id,
+               operation_id, turn_id
+        FROM project_operations
+        WHERE operation_id = ?
+        """,
+        (permanent_id,),
+    ).fetchone()
+    assert raw_last is not None
+    assert result == module.OperationRecoveryScanResult(
+        (),
+        module.OperationRecoveryCursor(*tuple(raw_last)),
+        True,
+    )
+    assert [
+        request.operation_id for request in readback.requests
+    ] == [waiting_id, permanent_id]
+    assert checkpoints.calls == 0
+    assert tuple(
+        tuple(row)
+        for row in operation_conn.execute(
+            """
+            SELECT operation_id, status, blocked_reason
+            FROM project_operations
+            WHERE operation_id IN (?, ?)
+            ORDER BY recovery_membership_sequence
+            """,
+            (waiting_id, permanent_id),
+        )
+    ) == (
+        (waiting_id, "effect_started", None),
+        (
+            permanent_id,
+            "blocked",
+            "operation_readback_ambiguous",
+        ),
+    )
+
+    issuer_calls = []
+
+    def invalid_argument_issuer(*args, **kwargs):
+        issuer_calls.append((args, kwargs))
+        raise AssertionError(
+            "invalid recovery arguments reached start issuance"
+        )
+
+    monkeypatch.setattr(
+        guard,
+        "rehydrate_approved_operation_for_dispatcher",
+        invalid_argument_issuer,
+    )
+    invalid_calls = (
+        {"max_claims": True, "limit": 2},
+        {"max_claims": -1, "limit": 2},
+        {"max_claims": 3, "limit": 2},
+        {"max_claims": 0, "limit": True},
+        {"max_claims": 0, "limit": 0},
+        {"max_claims": 0, "limit": 101},
+    )
+    for invalid in invalid_calls:
+        before_readbacks = len(readback.requests)
+        before_checkpoints = checkpoints.calls
+        before_issuers = len(issuer_calls)
+        statements = []
+        operation_conn.set_trace_callback(statements.append)
+        try:
+            with pytest.raises(module.ProjectOperationError) as error:
+                guard.recover_pending_operations(
+                    readback,
+                    checkpoints,
+                    worker_id="task7-c5-worker",
+                    lease_seconds=30,
+                    dispatcher_lease=dispatcher_lease,
+                    after=None,
+                    through_membership_sequence=upper,
+                    **invalid,
+                )
+        finally:
+            operation_conn.set_trace_callback(None)
+        assert (
+            error.value.code
+            is module.OperationErrorCode.INVALID_OPERATION_ARGUMENT
+        )
+        assert statements == []
+        assert len(readback.requests) == before_readbacks
+        assert checkpoints.calls == before_checkpoints
+        assert len(issuer_calls) == before_issuers
+
+
+def test_task7_c5_slotbudget_raw_page_caps_starts_and_defers_next_epoch(
+    operation_conn,
+):
+    waiting_id = _add_parked_operation_candidate(
+        operation_conn,
+        ordinal=511,
+        status="effect_started",
+        updated_at=10,
+    )
+    permanent_id = _add_parked_operation_candidate(
+        operation_conn,
+        ordinal=512,
+        status="unknown",
+        updated_at=20,
+    )
+    actionable_a = _add_parked_operation_candidate(
+        operation_conn,
+        ordinal=513,
+        status="approved",
+        updated_at=30,
+    )
+    actionable_b = _add_parked_operation_candidate(
+        operation_conn,
+        ordinal=514,
+        status="approved",
+        updated_at=40,
+    )
+    module, guard, dispatcher_lease = _task7_c5_recovery_guard(
+        operation_conn
+    )
+    upper = guard.operation_recovery_membership_upper_watermark()
+    assert upper is not None
+
+    class RawPageReadback:
+        def __init__(self):
+            self.requests = []
+
+        def read_operation(self, request):
+            assert operation_conn.in_transaction is False
+            self.requests.append(request)
+            if request.operation_id == waiting_id:
+                raise RuntimeError("temporary readback outage")
+            assert request.operation_id == permanent_id
+            return module.OperationReadbackResult(
+                "unknown",
+                None,
+                None,
+            )
+
+    class NoApprovalCheckpoints:
+        def publication_state(self, checkpoint):
+            raise AssertionError(
+                "noncritical operations have no approval checkpoint"
+            )
+
+    readback = RawPageReadback()
+    deferred_before = _task7_c5_operation_authority_snapshot(
+        operation_conn,
+        actionable_b,
+    )
+    first = guard.recover_pending_operations(
+        readback,
+        NoApprovalCheckpoints(),
+        worker_id="task7-c5-worker",
+        lease_seconds=30,
+        dispatcher_lease=dispatcher_lease,
+        max_claims=1,
+        after=None,
+        through_membership_sequence=upper,
+        limit=4,
+    )
+
+    raw_last = operation_conn.execute(
+        """
+        SELECT recovery_membership_sequence, project_id,
+               operation_id, turn_id
+        FROM project_operations
+        WHERE operation_id = ?
+        """,
+        (actionable_b,),
+    ).fetchone()
+    assert raw_last is not None
+    assert len(first.starts) == 1
+    assert type(first.starts[0]) is module.WorkerStart
+    assert first.starts[0].source == "approved_operation"
+    assert first.starts[0].operation is not None
+    assert (
+        first.starts[0].operation.operation_id == actionable_a
+    )
+    assert first.starts[0].dispatcher_lease is dispatcher_lease
+    assert first.scanned_through == module.OperationRecoveryCursor(
+        *tuple(raw_last)
+    )
+    assert first.reached_epoch_end is True
+    assert [
+        request.operation_id for request in readback.requests
+    ] == [waiting_id, permanent_id]
+
+    turns = {
+        row["operation_id"]: (
+            row["project_id"],
+            row["turn_id"],
+        )
+        for row in operation_conn.execute(
+            """
+            SELECT operation_id, project_id, turn_id
+            FROM project_operations
+            WHERE operation_id IN (?, ?)
+            """,
+            (actionable_a, actionable_b),
+        )
+    }
+    assert prdb._current_worker_lease_for_turn(
+        operation_conn,
+        project_id=turns[actionable_a][0],
+        turn_id=turns[actionable_a][1],
+    ) is not None
+    assert prdb._current_worker_lease_for_turn(
+        operation_conn,
+        project_id=turns[actionable_b][0],
+        turn_id=turns[actionable_b][1],
+    ) is None
+    assert _task7_c5_operation_authority_snapshot(
+        operation_conn,
+        actionable_b,
+    ) == deferred_before
+
+    fresh_upper = (
+        guard.operation_recovery_membership_upper_watermark()
+    )
+    assert fresh_upper is not None
+    second = guard.recover_pending_operations(
+        readback,
+        NoApprovalCheckpoints(),
+        worker_id="task7-c5-worker",
+        lease_seconds=30,
+        dispatcher_lease=dispatcher_lease,
+        max_claims=1,
+        after=None,
+        through_membership_sequence=fresh_upper,
+        limit=4,
+    )
+
+    assert len(second.starts) == 1
+    assert second.starts[0].operation is not None
+    assert second.starts[0].operation.operation_id == actionable_b
+    assert prdb._current_worker_lease_for_turn(
+        operation_conn,
+        project_id=turns[actionable_b][0],
+        turn_id=turns[actionable_b][1],
+    ) is not None
+    assert [
+        request.operation_id for request in readback.requests
+    ] == [waiting_id, permanent_id, waiting_id]
+
+
+def test_task7_c5_slotbudget_stale_core_returns_partial_and_stops_issuance(
+    operation_conn,
+    monkeypatch,
+):
+    actionable_ids = tuple(
+        _add_parked_operation_candidate(
+            operation_conn,
+            ordinal=520 + ordinal,
+            status="approved",
+            updated_at=10 * ordinal,
+        )
+        for ordinal in (1, 2, 3)
+    )
+    module, guard, dispatcher_lease = _task7_c5_recovery_guard(
+        operation_conn
+    )
+    upper = guard.operation_recovery_membership_upper_watermark()
+    assert upper is not None
+
+    class NoReadback:
+        def read_operation(self, request):
+            raise AssertionError(
+                "approved operations do not need readback"
+            )
+
+    class NoApprovalCheckpoints:
+        def publication_state(self, checkpoint):
+            raise AssertionError(
+                "noncritical operations have no approval checkpoint"
+            )
+
+    issued = []
+    renewed = []
+    original_issue = (
+        guard.rehydrate_approved_operation_for_dispatcher
+    )
+
+    def renew_core_after_first_commit(*args, **kwargs):
+        issued.append(args[1])
+        start = original_issue(*args, **kwargs)
+        if len(issued) == 1:
+            fresh = guard._runtime.renew_dispatcher_lease(
+                dispatcher_lease,
+                lease_seconds=60,
+            )
+            assert fresh is not None
+            renewed.append(fresh)
+        return start
+
+    monkeypatch.setattr(
+        guard,
+        "rehydrate_approved_operation_for_dispatcher",
+        renew_core_after_first_commit,
+    )
+    result = guard.recover_pending_operations(
+        NoReadback(),
+        NoApprovalCheckpoints(),
+        worker_id="task7-c5-worker",
+        lease_seconds=30,
+        dispatcher_lease=dispatcher_lease,
+        max_claims=3,
+        after=None,
+        through_membership_sequence=upper,
+        limit=3,
+    )
+
+    assert len(renewed) == 1
+    assert renewed[0].expires_at > dispatcher_lease.expires_at
+    assert issued == list(actionable_ids[:2])
+    assert len(result.starts) == 1
+    assert result.starts[0].operation is not None
+    assert (
+        result.starts[0].operation.operation_id
+        == actionable_ids[0]
+    )
+    assert result.reached_epoch_end is True
+    parked = tuple(
+        operation_conn.execute(
+            """
+            SELECT operation_id, project_id, turn_id
+            FROM project_operations
+            WHERE operation_id IN (?, ?)
+            ORDER BY recovery_membership_sequence
+            """,
+            actionable_ids[1:],
+        )
+    )
+    assert [row["operation_id"] for row in parked] == list(
+        actionable_ids[1:]
+    )
+    assert all(
+        prdb._current_worker_lease_for_turn(
+            operation_conn,
+            project_id=row["project_id"],
+            turn_id=row["turn_id"],
+        )
+        is None
+        for row in parked
+    )
+
+
+def _task7_c6_authority_snapshot(operation_env):
+    """Capture every Projects-side row C6 must roll back together."""
+    conn = operation_env["conn"]
+    project_id = operation_env["project_id"]
+    return (
+        _operation_snapshot(operation_env),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_worker_leases
+                WHERE project_id = ?
+                ORDER BY lease_id
+                """,
+                (project_id,),
+            )
+        ),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_dispatcher_leases
+                ORDER BY lease_name
+                """
+            )
+        ),
+        tuple(
+            conn.execute(
+                """
+                SELECT * FROM project_operation_maintenance
+                WHERE singleton = 1
+                """
+            ).fetchone()
+        ),
+        tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM project_runtime_membership_counters
+                ORDER BY lane
+                """
+            )
+        ),
+    )
+
+
+def test_task7_c6_intent_checkpoint_critical_prepare_is_one_outer_transaction_and_certifies(
+    operation_env,
+    monkeypatch,
+    tmp_path,
+):
+    module = operation_env["module"]
+    guard = operation_env["guard"]
+    intent = _intent(
+        operation_env,
+        canonical_action="publish",
+        operation_id="checkpoint-operation",
+        idempotency_key="checkpoint-operation-key",
+    )
+    approval = module.OperationApprovalSpec(
+        "checkpoint-approval",
+        "publish",
+        1_000,
+        operation_env["actor"],
+    )
+    policy = PolicyDecision(
+        Decision.REQUIRE_APPROVAL,
+        "policy.approval.publish",
+        "checkpointed critical prepare",
+        "publish",
+    )
+    checkpoint_id = "123e4567-e89b-42d3-a456-426614174000"
+    before = _task7_c6_authority_snapshot(operation_env)
+    before_version = prdb.runtime_state_for_project(
+        operation_env["conn"], operation_env["project_id"]
+    ).version
+
+    original_link = prdb._link_project_operation_approval
+    link_hits = [0]
+
+    def fail_after_link(*args, **kwargs):
+        result = original_link(*args, **kwargs)
+        linked = operation_env["conn"].execute(
+            """
+            SELECT operation.approval_id, approval.operation_id
+            FROM project_operations AS operation
+            JOIN project_approvals AS approval
+              ON approval.project_id = operation.project_id
+             AND approval.approval_id = operation.approval_id
+            WHERE operation.operation_id = ?
+            """,
+            (intent.operation_id,),
+        ).fetchone()
+        assert result is True
+        assert linked is not None
+        assert tuple(linked) == (approval.approval_id, intent.operation_id)
+        link_hits[0] += 1
+        raise _InjectedCertificationFault("approval link failure")
+
+    monkeypatch.setattr(
+        prdb, "_link_project_operation_approval", fail_after_link
+    )
+    with pytest.raises(module.ProjectOperationError) as link_failure:
+        guard.prepare(
+            operation_env["claim"],
+            intent,
+            policy=policy,
+            approval=approval,
+            approval_checkpoint_id=checkpoint_id,
+        )
+    assert (
+        link_failure.value.code
+        is module.OperationErrorCode.OPERATION_APPROVAL_CONFLICT
+    )
+    assert _task7_c6_authority_snapshot(operation_env) == before
+    assert link_hits == [1]
+
+    monkeypatch.setattr(
+        prdb, "_link_project_operation_approval", original_link
+    )
+    original_event = guard._runtime._event
+    event_hits = [0]
+
+    def fail_after_staging_event(*args, **kwargs):
+        kind = kwargs.get("kind", args[1] if len(args) > 1 else None)
+        if kind == "operation.intent_recorded":
+            original_event(*args, **kwargs)
+            staged = operation_env["conn"].execute(
+                """
+                SELECT intent_event_id FROM project_operations
+                WHERE operation_id = ?
+                """,
+                (intent.operation_id,),
+            ).fetchone()
+            assert staged is not None
+            assert type(staged["intent_event_id"]) is str
+            assert operation_env["conn"].execute(
+                "SELECT 1 FROM project_events WHERE event_id = ?",
+                (staged["intent_event_id"],),
+            ).fetchone() is not None
+            event_hits[0] += 1
+            raise _InjectedCertificationFault("intent event failure")
+        return original_event(*args, **kwargs)
+
+    monkeypatch.setattr(guard._runtime, "_event", fail_after_staging_event)
+    with pytest.raises(module.ProjectOperationError) as event_failure:
+        guard.prepare(
+            operation_env["claim"],
+            intent,
+            policy=policy,
+            approval=approval,
+            approval_checkpoint_id=checkpoint_id,
+        )
+    assert (
+        event_failure.value.code
+        is module.OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert _task7_c6_authority_snapshot(operation_env) == before
+    assert event_hits == [1]
+
+    monkeypatch.setattr(guard._runtime, "_event", original_event)
+    mismatched_event_hits = [0]
+
+    def insert_claim_mismatched_event(*args, **kwargs):
+        kind = kwargs.get("kind", args[1] if len(args) > 1 else None)
+        if kind != "operation.intent_recorded":
+            return original_event(*args, **kwargs)
+        mismatched_event_hits[0] += 1
+        if "payload" in kwargs:
+            payload = kwargs["payload"]
+        else:
+            payload = args[3]
+        altered_payload = dict(payload)
+        altered_attempt = dict(altered_payload["attempt"])
+        altered_attempt["attempt_id"] = "wrong-original-attempt"
+        altered_payload["attempt"] = altered_attempt
+        if "payload" in kwargs:
+            altered_kwargs = {**kwargs, "payload": altered_payload}
+            return original_event(*args, **altered_kwargs)
+        altered_args = (*args[:3], altered_payload, *args[4:])
+        return original_event(*altered_args, **kwargs)
+
+    monkeypatch.setattr(
+        guard._runtime, "_event", insert_claim_mismatched_event
+    )
+    with pytest.raises(module.ProjectOperationError) as mismatch_failure:
+        guard.prepare(
+            operation_env["claim"],
+            intent,
+            policy=policy,
+            approval=approval,
+            approval_checkpoint_id=checkpoint_id,
+        )
+    assert (
+        mismatch_failure.value.code
+        is module.OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert mismatched_event_hits == [1]
+    assert _task7_c6_authority_snapshot(operation_env) == before
+
+    monkeypatch.setattr(guard._runtime, "_event", original_event)
+    original_certify = prdb._certify_project_operation
+
+    pre_certification_hits = [0]
+
+    def fail_pre_certification(conn, *, project_id, operation_id):
+        staged = conn.execute(
+            """
+            SELECT guard_validated, recovery_membership_sequence,
+                   approval_checkpoint_id, intent_event_id
+            FROM project_operations
+            WHERE project_id = ? AND operation_id = ?
+            """,
+            (project_id, operation_id),
+        ).fetchone()
+        linked_approval = conn.execute(
+            """
+            SELECT operation_id FROM project_approvals
+            WHERE project_id = ? AND approval_id = ?
+            """,
+            (project_id, approval.approval_id),
+        ).fetchone()
+        assert staged is not None
+        assert staged["guard_validated"] == 0
+        assert type(staged["recovery_membership_sequence"]) is int
+        assert staged["recovery_membership_sequence"] > 0
+        assert staged["approval_checkpoint_id"] == checkpoint_id
+        assert type(staged["intent_event_id"]) is str
+        assert staged["intent_event_id"]
+        assert linked_approval is not None
+        assert linked_approval["operation_id"] == operation_id
+        staged_event = conn.execute(
+            "SELECT * FROM project_events WHERE event_id = ?",
+            (staged["intent_event_id"],),
+        ).fetchone()
+        assert staged_event is not None
+        pre_certification_hits[0] += 1
+        raise _InjectedCertificationFault("final certification failure")
+
+    monkeypatch.setattr(
+        prdb, "_certify_project_operation", fail_pre_certification
+    )
+    with pytest.raises(module.ProjectOperationError) as certification_failure:
+        guard.prepare(
+            operation_env["claim"],
+            intent,
+            policy=policy,
+            approval=approval,
+            approval_checkpoint_id=checkpoint_id,
+        )
+    assert (
+        certification_failure.value.code
+        is module.OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert _task7_c6_authority_snapshot(operation_env) == before
+    assert pre_certification_hits == [1]
+
+    def fail_after_final_certification(conn, *, project_id, operation_id):
+        post_certification_hits[0] += 1
+        stored = original_certify(
+            conn,
+            project_id=project_id,
+            operation_id=operation_id,
+        )
+        raise _InjectedCertificationFault(
+            f"post-certification failure for {stored.operation_id}"
+        )
+
+    post_certification_hits = [0]
+    monkeypatch.setattr(
+        prdb, "_certify_project_operation", fail_after_final_certification
+    )
+    with pytest.raises(module.ProjectOperationError) as post_failure:
+        guard.prepare(
+            operation_env["claim"],
+            intent,
+            policy=policy,
+            approval=approval,
+            approval_checkpoint_id=checkpoint_id,
+        )
+    assert (
+        post_failure.value.code
+        is module.OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert _task7_c6_authority_snapshot(operation_env) == before
+    assert post_certification_hits == [1]
+
+    monkeypatch.setattr(
+        prdb, "_certify_project_operation", original_certify
+    )
+    certification_change_deltas = []
+
+    def record_final_certification(conn, *, project_id, operation_id):
+        changes_before = conn.total_changes
+        stored = original_certify(
+            conn,
+            project_id=project_id,
+            operation_id=operation_id,
+        )
+        certification_change_deltas.append(
+            conn.total_changes - changes_before
+        )
+        return stored
+
+    monkeypatch.setattr(
+        prdb,
+        "_certify_project_operation",
+        record_final_certification,
+    )
+    original_insert = prdb._insert_project_operation
+    insert_calls = []
+    original_id_factory = operation_env["runtime"]._id_factory
+    event_allocation_transactions = []
+
+    def record_event_allocation(kind):
+        if kind == "event":
+            event_allocation_transactions.append(
+                operation_env["conn"].in_transaction
+            )
+        return original_id_factory(kind)
+
+    monkeypatch.setattr(
+        operation_env["runtime"], "_id_factory", record_event_allocation
+    )
+
+    def record_staged_insert(*args, **kwargs):
+        result = original_insert(*args, **kwargs)
+        staged = operation_env["conn"].execute(
+            """
+            SELECT approval_checkpoint_id, intent_event_id
+            FROM project_operations WHERE operation_id = ?
+            """,
+            (intent.operation_id,),
+        ).fetchone()
+        assert staged is not None
+        insert_calls.append(tuple(staged))
+        return result
+
+    monkeypatch.setattr(
+        prdb, "_insert_project_operation", record_staged_insert
+    )
+    prepare_clock_samples = []
+
+    def advancing_prepare_clock():
+        sampled = 100 + len(prepare_clock_samples)
+        prepare_clock_samples.append(sampled)
+        return sampled
+
+    monkeypatch.setattr(
+        operation_env["runtime"],
+        "_clock",
+        advancing_prepare_clock,
+    )
+    statements = []
+    operation_env["conn"].set_trace_callback(statements.append)
+    try:
+        prepared = guard.prepare(
+            operation_env["claim"],
+            intent,
+            policy=policy,
+            approval=approval,
+            approval_checkpoint_id=checkpoint_id,
+        )
+    finally:
+        operation_env["conn"].set_trace_callback(None)
+
+    assert prepared.status == "awaiting_approval"
+    assert prepare_clock_samples == [100]
+    transaction_controls = [
+        statement.lstrip().upper() for statement in statements
+        if statement.lstrip().upper().startswith(
+            ("BEGIN", "COMMIT", "SAVEPOINT", "ROLLBACK")
+        )
+    ]
+    assert transaction_controls == ["BEGIN IMMEDIATE", "COMMIT"]
+    assert len(insert_calls) == 1
+    assert insert_calls[0][0] == checkpoint_id
+    assert type(insert_calls[0][1]) is str and insert_calls[0][1]
+    assert event_allocation_transactions
+    assert all(
+        allocation_in_transaction is True
+        for allocation_in_transaction in event_allocation_transactions
+    )
+    row = operation_env["conn"].execute(
+        """
+        SELECT guard_validated, recovery_membership_sequence,
+               approval_checkpoint_id, intent_event_id
+        FROM project_operations
+        WHERE operation_id = ?
+        """,
+        (intent.operation_id,),
+    ).fetchone()
+    assert row is not None
+    assert tuple(row[:3]) == (1, row["recovery_membership_sequence"], checkpoint_id)
+    assert type(row["recovery_membership_sequence"]) is int
+    assert row["recovery_membership_sequence"] > 0
+    assert type(row["intent_event_id"]) is str and row["intent_event_id"]
+    assert row["intent_event_id"] == insert_calls[0][1]
+    operation_updates = [
+        " ".join(statement.lower().split())
+        for statement in statements
+        if statement.lstrip().lower().startswith("update project_operations")
+    ]
+    mutation_clauses = [
+        statement.split(" set ", 1)[1].split(" where ", 1)[0]
+        for statement in operation_updates
+    ]
+    assert not any(
+        "approval_checkpoint_id" in clause
+        or "intent_event_id" in clause
+        for clause in mutation_clauses
+    )
+    certification_updates = [
+        statement
+        for statement in operation_updates
+        if "set guard_validated = 1" in statement
+    ]
+    assert certification_change_deltas == [1]
+    assert certification_updates
+    assert len(set(certification_updates)) == 1
+    certification_where = certification_updates[0].split(" where ", 1)[1]
+    staged_task7_values = {
+        "approval_checkpoint_id": row["approval_checkpoint_id"],
+        "intent_event_id": row["intent_event_id"],
+        "recovery_membership_sequence": row[
+            "recovery_membership_sequence"
+        ],
+    }
+    staged_task7_literals = {
+        column: operation_env["conn"].execute(
+            "SELECT quote(?)", (value,)
+        ).fetchone()[0].lower()
+        for column, value in staged_task7_values.items()
+    }
+    assert all(
+        f"and {column} is {staged_task7_literals[column]}"
+        in certification_where
+        for column in staged_task7_values
+    )
+    event = operation_env["conn"].execute(
+        """
+        SELECT * FROM project_events WHERE event_id = ?
+        """,
+        (row["intent_event_id"],),
+    ).fetchone()
+    assert event is not None
+    assert event["kind"] == "operation.intent_recorded"
+    assert event["turn_id"] == intent.turn_id
+    payload = json.loads(event["payload_json"])
+    assert payload["approval_checkpoint_id"] == checkpoint_id
+    assert payload["operation_id"] == intent.operation_id
+    assert payload["approval_id"] == approval.approval_id
+    assert payload["status"] == "awaiting_approval"
+    assert payload["turn_id"] == intent.turn_id
+    assert payload["version"] == 3
+    assert prdb.runtime_state_for_project(
+        operation_env["conn"], operation_env["project_id"]
+    ).version == before_version + 1
+    assert payload["attempt"] == {
+        "project_id": operation_env["claim"].project_id,
+        "turn_id": operation_env["claim"].turn_id,
+        "sequence": operation_env["claim"].sequence,
+        "worker_id": operation_env["claim"].worker_id,
+        "attempt_id": operation_env["claim"].attempt_id,
+        "lease_generation": operation_env["claim"].lease_generation,
+        "fencing_token": operation_env["claim"].fencing_token,
+        "canonical_session_id": operation_env["claim"].canonical_session_id,
+        "lease_expires_at": operation_env["claim"].lease_expires_at,
+    }
+    assert operation_env["conn"].execute(
+        """
+        SELECT COUNT(*) FROM project_events
+        WHERE project_id = ? AND turn_id = ?
+          AND kind = 'operation.intent_recorded'
+        """,
+        (operation_env["project_id"], intent.turn_id),
+    ).fetchone()[0] == 1
+
+    standalone_dir = tmp_path / "standalone-approval"
+    standalone_dir.mkdir()
+    standalone = _build_operation_env(standalone_dir, started=True)
+    try:
+        request = _generic_approval_request(
+            standalone, approval_id="standalone-approval"
+        )
+        control = prdb._runtime_control_for_turn(
+            standalone["conn"],
+            project_id=standalone["project_id"],
+            turn_id=standalone["turn"].turn_id,
+        )
+        assert control is not None
+        standalone["runtime"]._operation_prepare_outer = True
+        standalone_trace = []
+        standalone["conn"].set_trace_callback(standalone_trace.append)
+        try:
+            standalone["runtime"].request_turn_approval(
+                standalone["turn"].turn_id,
+                request,
+                standalone["actor"],
+                expected_control_version=control.control_version,
+            )
+        finally:
+            standalone["conn"].set_trace_callback(None)
+            del standalone["runtime"]._operation_prepare_outer
+        assert standalone["conn"].in_transaction is False
+        standalone_controls = [
+            statement.lstrip().upper()
+            for statement in standalone_trace
+            if statement.lstrip().upper().startswith(
+                ("BEGIN", "COMMIT", "SAVEPOINT", "ROLLBACK")
+            )
+        ]
+        assert standalone_controls == ["BEGIN IMMEDIATE", "COMMIT"]
+        observer = projects_db.connect(standalone_dir / "guard.db")
+        try:
+            visible = observer.execute(
+                """
+                SELECT status FROM project_approvals
+                WHERE approval_id = 'standalone-approval'
+                """
+            ).fetchone()
+            assert visible is not None and visible["status"] == "pending"
+        finally:
+            observer.close()
+    finally:
+        standalone["conn"].close()
+
+    external_dir = tmp_path / "external-transaction"
+    external_dir.mkdir()
+    external = _build_operation_env(external_dir, started=True)
+    try:
+        external_intent = _intent(
+            external,
+            canonical_action="publish",
+            operation_id="external-operation",
+            idempotency_key="external-operation-key",
+        )
+        external_approval = external["module"].OperationApprovalSpec(
+            "external-approval", "publish", 1_000, external["actor"]
+        )
+        external_allocations = []
+        external_factory = external["runtime"]._id_factory
+
+        def record_external_allocation(kind):
+            external_allocations.append(kind)
+            return external_factory(kind)
+
+        monkeypatch.setattr(
+            external["runtime"], "_id_factory", record_external_allocation
+        )
+        external["conn"].execute("BEGIN IMMEDIATE")
+        assert external["conn"].in_transaction is True
+        external_before = _task7_c6_authority_snapshot(external)
+        external_trace = []
+        external["conn"].set_trace_callback(external_trace.append)
+        try:
+            with pytest.raises(external["module"].ProjectOperationError):
+                external["guard"].prepare(
+                    external["claim"],
+                    external_intent,
+                    policy=PolicyDecision(
+                        Decision.REQUIRE_APPROVAL,
+                        "policy.approval.publish",
+                        "external transaction must fail closed",
+                        "publish",
+                    ),
+                    approval=external_approval,
+                    approval_checkpoint_id=(
+                        "123e4567-e89b-42d3-a456-426614174000"
+                    ),
+                )
+        finally:
+            external["conn"].set_trace_callback(None)
+        assert external_allocations == []
+        assert not any(
+            statement.lstrip().upper().startswith(
+                (
+                    "BEGIN",
+                    "COMMIT",
+                    "ROLLBACK",
+                    "SAVEPOINT",
+                    "INSERT",
+                    "UPDATE",
+                    "DELETE",
+                    "REPLACE",
+                )
+            )
+            for statement in external_trace
+        )
+        assert _task7_c6_authority_snapshot(external) == external_before
+        assert external["conn"].in_transaction is True
+        external["conn"].rollback()
+        assert external["conn"].in_transaction is False
+    finally:
+        external["conn"].close()
+
+    denied_dir = tmp_path / "checkpoint-denial"
+    denied_dir.mkdir()
+    denied_env = _build_operation_env(denied_dir, started=True)
+    try:
+        _, denied_intent, denied_approval = (
+            _task7_c6_prepare_checkpointed_critical(denied_env)
+        )
+        denied = denied_env["guard"].resolve_operation_approval(
+            denied_approval.approval_id,
+            denied_env["actor"],
+            outcome="denied",
+        )
+        assert denied.status == "blocked"
+        assert denied.blocked_reason == "approval_denied"
+        denied_turn = prdb._runtime_turn_for_project(
+            denied_env["conn"],
+            project_id=denied_env["project_id"],
+            turn_id=denied_intent.turn_id,
+        )
+        denied_control = prdb._runtime_control_for_turn(
+            denied_env["conn"],
+            project_id=denied_env["project_id"],
+            turn_id=denied_intent.turn_id,
+        )
+        assert denied_turn is not None
+        assert denied_turn.status == "failed"
+        assert denied_control is not None
+        assert denied_control.control_state == "terminal"
+        assert prdb._current_worker_lease_for_turn(
+            denied_env["conn"],
+            project_id=denied_env["project_id"],
+            turn_id=denied_intent.turn_id,
+        ) is None
+        denied_stored = prdb._project_operation_for_id(
+            denied_env["conn"],
+            project_id=denied_env["project_id"],
+            operation_id=denied_intent.operation_id,
+        )
+        assert denied_stored is not None
+        assert denied_stored.guard_validated == 1
+    finally:
+        denied_env["conn"].close()
+
+
+def _task7_c6_prepare_checkpointed_critical(
+    operation_env,
+    *,
+    operation_id="checkpoint-operation",
+    approval_id="checkpoint-approval",
+    checkpoint_id="123e4567-e89b-42d3-a456-426614174000",
+):
+    module = operation_env["module"]
+    intent = _intent(
+        operation_env,
+        canonical_action="publish",
+        operation_id=operation_id,
+        idempotency_key=f"{operation_id}-key",
+    )
+    approval = module.OperationApprovalSpec(
+        approval_id,
+        "publish",
+        1_000,
+        operation_env["actor"],
+    )
+    result = operation_env["guard"].prepare(
+        operation_env["claim"],
+        intent,
+        policy=PolicyDecision(
+            Decision.REQUIRE_APPROVAL,
+            "policy.approval.publish",
+            "checkpointed critical prepare",
+            "publish",
+        ),
+        approval=approval,
+        approval_checkpoint_id=checkpoint_id,
+    )
+    return result, intent, approval
+
+
+def _task7_c6_checkpoint_identity(module, operation_env, intent):
+    runtime_module = importlib.import_module("hermes_cli.project_runtime")
+    row = operation_env["conn"].execute(
+        """
+        SELECT approval_checkpoint_id, intent_event_id, approval_id
+        FROM project_operations WHERE operation_id = ?
+        """,
+        (intent.operation_id,),
+    ).fetchone()
+    assert row is not None
+    event = operation_env["conn"].execute(
+        "SELECT payload_json FROM project_events WHERE event_id = ?",
+        (row["intent_event_id"],),
+    ).fetchone()
+    assert event is not None
+    payload = json.loads(event["payload_json"])
+    attempt = payload["attempt"]
+    return (
+        module.ApprovalCheckpointIdentity(
+            row["approval_checkpoint_id"],
+            runtime_module.TurnAttemptIdentity(
+                attempt["project_id"],
+                attempt["turn_id"],
+                attempt["sequence"],
+                attempt["worker_id"],
+                attempt["attempt_id"],
+                attempt["lease_generation"],
+                attempt["fencing_token"],
+                attempt["canonical_session_id"],
+                attempt["lease_expires_at"],
+            ),
+            intent.operation_id,
+            row["approval_id"],
+        ),
+        row["intent_event_id"],
+        payload,
+    )
+
+
+def test_task7_c6_intent_checkpoint_exact_pk_resolver_and_malformed_event_fail_closed(
+    operation_env,
+    monkeypatch,
+):
+    module = operation_env["module"]
+    runtime_module = importlib.import_module("hermes_cli.project_runtime")
+    prepared, intent, approval = _task7_c6_prepare_checkpointed_critical(
+        operation_env
+    )
+    assert prepared.approval_id == approval.approval_id
+    identity, event_id, payload = _task7_c6_checkpoint_identity(
+        module, operation_env, intent
+    )
+
+    def resolve_with_event_trace(checkpoint):
+        statements = []
+        operation_env["conn"].set_trace_callback(statements.append)
+        try:
+            return operation_env["guard"].resolve_approval_checkpoint(
+                checkpoint
+            )
+        finally:
+            operation_env["conn"].set_trace_callback(None)
+            normalized = [
+                " ".join(statement.lower().split())
+                for statement in statements
+            ]
+            event_reads = [
+                statement
+                for statement in normalized
+                if "from project_events" in statement
+            ]
+            assert event_reads == [
+                "select * from project_events "
+                f"where event_id = '{event_id.lower()}'"
+            ]
+            assert not any(
+                "json_extract" in statement
+                or "order by" in statement and "project_events" in statement
+                or "limit" in statement and "project_events" in statement
+                for statement in normalized
+            )
+
+    assert tuple(
+        inspect.signature(
+            module.ProjectOperationGuard.resolve_approval_checkpoint
+        ).parameters
+    ) == ("self", "checkpoint")
+    assert get_type_hints(
+        module.ProjectOperationGuard.resolve_approval_checkpoint
+    ) == {
+        "checkpoint": module.ApprovalCheckpointIdentity,
+        "return": module.ApprovalCheckpointDecision,
+    }
+    for ordinal in range(3):
+        operation_env["conn"].execute(
+            """
+            INSERT INTO project_events (
+                event_id, project_id, sequence, kind, turn_id,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"unrelated-intent-{ordinal}",
+                operation_env["project_id"],
+                100 + ordinal,
+                "operation.intent_recorded",
+                operation_env["turn"].turn_id,
+                '{"unrelated":true}',
+                200 + ordinal,
+            ),
+        )
+    operation_env["conn"].commit()
+
+    decision = resolve_with_event_trace(identity)
+    decision_type = module.ApprovalCheckpointDecision
+    assert tuple(field.name for field in fields(decision_type)) == ("action",)
+    assert decision == decision_type("publish")
+    with pytest.raises(FrozenInstanceError):
+        decision.action = "discard"
+
+    original_payload = operation_env["conn"].execute(
+        "SELECT payload_json FROM project_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()[0]
+    extended_payload = json.loads(original_payload)
+    extended_payload["attempt"]["lease_expires_at"] += 1
+    operation_env["conn"].execute(
+        "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+        (
+            runtime_module.canonical_json_object(extended_payload),
+            event_id,
+        ),
+    )
+    operation_env["conn"].commit()
+    assert resolve_with_event_trace(identity).action == "publish"
+    operation_env["conn"].execute(
+        "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+        (original_payload, event_id),
+    )
+    operation_env["conn"].commit()
+
+    lowered_horizon = replace(
+        identity,
+        attempt=replace(
+            identity.attempt,
+            lease_expires_at=identity.attempt.lease_expires_at - 1,
+        ),
+    )
+    assert operation_env["guard"].resolve_approval_checkpoint(
+        lowered_horizon
+    ).action == "publish"
+    invalid_attempts = (
+        replace(identity, checkpoint_id=""),
+        replace(identity, checkpoint_id=7),
+        replace(
+            identity,
+            checkpoint_id="123E4567-E89B-42D3-A456-426614174000",
+        ),
+        replace(
+            identity,
+            checkpoint_id="123e4567-e89b-12d3-a456-426614174000",
+        ),
+        replace(identity, operation_id=""),
+        replace(identity, operation_id=7),
+        replace(identity, approval_id=""),
+        replace(identity, approval_id=7),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, project_id=""),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, project_id=7),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, turn_id=""),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, turn_id=7),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, worker_id=""),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, worker_id=7),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, attempt_id=""),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, attempt_id=7),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, canonical_session_id=""),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, canonical_session_id=7),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, sequence=0),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, sequence=True),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, sequence=1.0),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, lease_generation=0),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, lease_generation=True),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, lease_generation=1.0),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, fencing_token=0),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, fencing_token=True),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, fencing_token=1.0),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, lease_expires_at=-1),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, lease_expires_at=True),
+        ),
+        replace(
+            identity,
+            attempt=replace(
+                identity.attempt,
+                lease_expires_at=float(
+                    identity.attempt.lease_expires_at
+                ),
+            ),
+        ),
+        replace(
+            identity,
+            attempt=replace(
+                identity.attempt,
+                lease_expires_at=identity.attempt.lease_expires_at + 1,
+            ),
+        ),
+        replace(identity, attempt=replace(identity.attempt, sequence=99)),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, worker_id="wrong-worker"),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, attempt_id="wrong-attempt"),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, lease_generation=99),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, fencing_token=99),
+        ),
+        replace(
+            identity,
+            attempt=replace(
+                identity.attempt,
+                canonical_session_id="wrong-session",
+            ),
+        ),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, project_id="wrong-project"),
+        ),
+        replace(identity, operation_id="wrong-operation"),
+        replace(identity, approval_id="wrong-approval"),
+        replace(identity, checkpoint_id="123e4567-e89b-42d3-a456-426614174099"),
+        replace(
+            identity,
+            attempt=replace(identity.attempt, turn_id="wrong-turn"),
+        ),
+    )
+    for invalid_identity in invalid_attempts:
+        before_invalid = _task7_c6_authority_snapshot(operation_env)
+        with pytest.raises(runtime_module.ProjectRuntimeError) as invalid:
+            operation_env["guard"].resolve_approval_checkpoint(
+                invalid_identity
+            )
+        assert (
+            invalid.value.code
+            is runtime_module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+        )
+        assert _task7_c6_authority_snapshot(operation_env) == before_invalid
+
+    fallback_calls = [0]
+
+    def unexpected_c10_fallback(*args, **kwargs):
+        fallback_calls[0] += 1
+        raise AssertionError("C6 must not call the C10 fallback")
+
+    monkeypatch.setattr(
+        operation_env["runtime"],
+        "resolve_prepared_approval_checkpoint",
+        unexpected_c10_fallback,
+        raising=False,
+    )
+    absent_before = _task7_c6_authority_snapshot(operation_env)
+    with pytest.raises(runtime_module.ProjectRuntimeError) as absent:
+        operation_env["guard"].resolve_approval_checkpoint(
+            replace(identity, operation_id="absent-operation")
+        )
+    assert (
+        absent.value.code
+        is runtime_module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+    )
+    assert fallback_calls == [0]
+    assert _task7_c6_authority_snapshot(operation_env) == absent_before
+
+    operation_env["conn"].execute(
+        "UPDATE project_events SET payload_json = '{malformed' WHERE event_id = ?",
+        (event_id,),
+    )
+    operation_env["conn"].commit()
+    malformed_before = _task7_c6_authority_snapshot(operation_env)
+    with pytest.raises(runtime_module.ProjectRuntimeError) as malformed:
+        resolve_with_event_trace(identity)
+    assert (
+        malformed.value.code
+        is runtime_module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+    )
+    assert _task7_c6_authority_snapshot(operation_env) == malformed_before
+
+    operation_env["conn"].execute(
+        "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+        (json.dumps(payload, indent=2), event_id),
+    )
+    operation_env["conn"].commit()
+    noncanonical_before = _task7_c6_authority_snapshot(operation_env)
+    with pytest.raises(runtime_module.ProjectRuntimeError) as noncanonical:
+        resolve_with_event_trace(identity)
+    assert (
+        noncanonical.value.code
+        is runtime_module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+    )
+    assert _task7_c6_authority_snapshot(operation_env) == noncanonical_before
+
+    for field, value in (
+        ("operation_id", "wrong-operation"),
+        ("approval_id", "wrong-approval"),
+        (
+            "approval_checkpoint_id",
+            "123e4567-e89b-42d3-a456-426614174099",
+        ),
+        ("attempt.lease_expires_at", identity.attempt.lease_expires_at - 1),
+    ):
+        mismatched_payload = json.loads(original_payload)
+        if field == "attempt.lease_expires_at":
+            mismatched_payload["attempt"]["lease_expires_at"] = value
+        else:
+            mismatched_payload[field] = value
+        operation_env["conn"].execute(
+            "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+            (
+                runtime_module.canonical_json_object(mismatched_payload),
+                event_id,
+            ),
+        )
+        operation_env["conn"].commit()
+        mismatch_before = _task7_c6_authority_snapshot(operation_env)
+        with pytest.raises(runtime_module.ProjectRuntimeError) as mismatch:
+            resolve_with_event_trace(identity)
+        assert (
+            mismatch.value.code
+            is runtime_module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+        )
+        assert _task7_c6_authority_snapshot(operation_env) == mismatch_before
+
+    operation_env["conn"].execute(
+        "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+        (original_payload, event_id),
+    )
+    operation_env["conn"].commit()
+    stored_operation = prdb._project_operation_for_id(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        operation_id=intent.operation_id,
+    )
+    assert stored_operation is not None
+
+    def identity_from_event_payload(candidate):
+        attempt = candidate["attempt"]
+        return module.ApprovalCheckpointIdentity(
+            candidate["approval_checkpoint_id"],
+            runtime_module.TurnAttemptIdentity(
+                attempt["project_id"],
+                attempt["turn_id"],
+                attempt["sequence"],
+                attempt["worker_id"],
+                attempt["attempt_id"],
+                attempt["lease_generation"],
+                attempt["fencing_token"],
+                attempt["canonical_session_id"],
+                attempt["lease_expires_at"],
+            ),
+            candidate["operation_id"],
+            candidate["approval_id"],
+        )
+
+    malformed_matched_events = (
+        ("empty-worker", ("attempt", "worker_id"), ""),
+        ("non-string-worker", ("attempt", "worker_id"), 7),
+        ("empty-attempt", ("attempt", "attempt_id"), ""),
+        ("non-string-attempt", ("attempt", "attempt_id"), 7),
+        ("empty-session", ("attempt", "canonical_session_id"), ""),
+        (
+            "non-string-session",
+            ("attempt", "canonical_session_id"),
+            7,
+        ),
+        ("zero-sequence", ("attempt", "sequence"), 0),
+        ("bool-sequence", ("attempt", "sequence"), True),
+        ("float-sequence", ("attempt", "sequence"), 1.0),
+        ("zero-generation", ("attempt", "lease_generation"), 0),
+        ("bool-generation", ("attempt", "lease_generation"), True),
+        ("float-generation", ("attempt", "lease_generation"), 1.0),
+        ("zero-fence", ("attempt", "fencing_token"), 0),
+        ("bool-fence", ("attempt", "fencing_token"), True),
+        ("float-fence", ("attempt", "fencing_token"), 1.0),
+        ("negative-horizon", ("attempt", "lease_expires_at"), -1),
+        ("bool-horizon", ("attempt", "lease_expires_at"), True),
+        (
+            "float-horizon",
+            ("attempt", "lease_expires_at"),
+            float(identity.attempt.lease_expires_at),
+        ),
+        ("empty-attempt-project", ("attempt", "project_id"), ""),
+        ("non-string-attempt-project", ("attempt", "project_id"), 7),
+        ("empty-attempt-turn", ("attempt", "turn_id"), ""),
+        ("non-string-attempt-turn", ("attempt", "turn_id"), 7),
+        (
+            "wrong-attempt-project",
+            ("attempt", "project_id"),
+            "wrong-project",
+        ),
+        ("wrong-attempt-turn", ("attempt", "turn_id"), "wrong-turn"),
+        ("bool-transition-version", ("version",), True),
+        ("float-transition-version", ("version",), 1.0),
+        ("negative-transition-version", ("version",), -1),
+        ("overflow-transition-version", ("version",), 1 << 63),
+        ("wrong-transition-version", ("version",), payload["version"] + 1),
+    )
+    for label, path, value in malformed_matched_events:
+        candidate = json.loads(original_payload)
+        if len(path) == 2:
+            candidate[path[0]][path[1]] = value
+        else:
+            candidate[path[0]] = value
+        operation_env["conn"].execute(
+            "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+            (
+                runtime_module.canonical_json_object(candidate),
+                event_id,
+            ),
+        )
+        operation_env["conn"].commit()
+        malformed_identity = identity_from_event_payload(candidate)
+        malformed_before = _task7_c6_authority_snapshot(operation_env)
+        with pytest.raises(
+            runtime_module.ProjectRuntimeError
+        ) as malformed_match:
+            operation_env["guard"].resolve_approval_checkpoint(
+                malformed_identity
+            )
+        assert (
+            malformed_match.value.code
+            is runtime_module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+        )
+        assert label
+        assert _task7_c6_authority_snapshot(operation_env) == malformed_before
+        operation_env["conn"].execute(
+            "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+            (original_payload, event_id),
+        )
+        operation_env["conn"].commit()
+        certified_operation = prdb._project_operation_for_id(
+            operation_env["conn"],
+            project_id=operation_env["project_id"],
+            operation_id=intent.operation_id,
+        )
+        assert certified_operation == stored_operation
+        with prdb.write_transaction(operation_env["conn"]):
+            prdb._decertify_project_operation(
+                operation_env["conn"], certified_operation
+            )
+        operation_env["conn"].execute(
+            "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+            (
+                runtime_module.canonical_json_object(candidate),
+                event_id,
+            ),
+        )
+        operation_env["conn"].commit()
+        recertification_before = _task7_c6_authority_snapshot(
+            operation_env
+        )
+        with pytest.raises(RuntimeError):
+            with prdb.write_transaction(operation_env["conn"]):
+                prdb._certify_project_operation(
+                    operation_env["conn"],
+                    project_id=operation_env["project_id"],
+                    operation_id=intent.operation_id,
+                )
+        assert (
+            _task7_c6_authority_snapshot(operation_env)
+            == recertification_before
+        )
+        operation_env["conn"].execute(
+            "UPDATE project_events SET payload_json = ? WHERE event_id = ?",
+            (original_payload, event_id),
+        )
+        operation_env["conn"].commit()
+        with prdb.write_transaction(operation_env["conn"]):
+            restored_operation = prdb._certify_project_operation(
+                operation_env["conn"],
+                project_id=operation_env["project_id"],
+                operation_id=intent.operation_id,
+            )
+        assert restored_operation == stored_operation
+
+
+def test_task7_c6_intent_checkpoint_rehydrated_attempt_keeps_original_checkpoint_identity(
+    operation_env,
+):
+    runtime_module = importlib.import_module("hermes_cli.project_runtime")
+    _, intent, approval = _task7_c6_prepare_checkpointed_critical(
+        operation_env
+    )
+    original_identity, event_id, payload = _task7_c6_checkpoint_identity(
+        operation_env["module"], operation_env, intent
+    )
+    original_attempt = payload["attempt"]
+    assert original_attempt["attempt_id"] == operation_env["claim"].attempt_id
+
+    approved = operation_env["guard"].resolve_operation_approval(
+        approval.approval_id,
+        operation_env["actor"],
+        outcome="approved",
+    )
+    assert approved.status == "approved"
+    operation_env["now"][0] = 131
+    dispatcher_lease = operation_env["runtime"].acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111",
+        lease_seconds=30,
+    )
+    assert dispatcher_lease is not None
+    exact_event = operation_env["conn"].execute(
+        "SELECT * FROM project_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    assert exact_event is not None
+    event_columns = tuple(exact_event.keys())
+    event_values = tuple(exact_event)
+    exact_payload_json = exact_event["payload_json"]
+
+    tampered_status = json.loads(exact_payload_json)
+    tampered_status["status"] = "approved"
+    wrong_immutable_attempt = json.loads(exact_payload_json)
+    wrong_immutable_attempt["attempt"]["attempt_id"] = (
+        "wrong-original-attempt"
+    )
+    corruptions = (
+        ("missing", None),
+        ("malformed", "{malformed"),
+        (
+            "canonical-tampered",
+            runtime_module.canonical_json_object(tampered_status),
+        ),
+        (
+            "wrong-immutable-identity",
+            runtime_module.canonical_json_object(wrong_immutable_attempt),
+        ),
+    )
+
+    def restore_exact_event():
+        operation_env["conn"].execute(
+            "DELETE FROM project_events WHERE event_id = ?",
+            (event_id,),
+        )
+        operation_env["conn"].execute(
+            f"""
+            INSERT INTO project_events ({", ".join(event_columns)})
+            VALUES ({", ".join("?" for _ in event_columns)})
+            """,
+            event_values,
+        )
+        operation_env["conn"].commit()
+        restored = operation_env["conn"].execute(
+            "SELECT * FROM project_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        assert restored is not None and tuple(restored) == event_values
+
+    def apply_event_corruption(label, payload_json):
+        if label == "missing":
+            operation_env["conn"].execute(
+                "DELETE FROM project_events WHERE event_id = ?",
+                (event_id,),
+            )
+        else:
+            operation_env["conn"].execute(
+                """
+                UPDATE project_events SET payload_json = ?
+                WHERE event_id = ?
+                """,
+                (payload_json, event_id),
+            )
+        operation_env["conn"].commit()
+
+    for corruption_label, corrupted_payload in corruptions:
+        apply_event_corruption(corruption_label, corrupted_payload)
+        rehydrate_before = _task7_c6_authority_snapshot(operation_env)
+        with pytest.raises(
+            operation_env["module"].ProjectOperationError
+        ) as rehydrate_conflict:
+            operation_env[
+                "guard"
+            ].rehydrate_approved_operation_for_dispatcher(
+                operation_env["project_id"],
+                intent.operation_id,
+                worker_id="checkpoint-worker-b",
+                lease_seconds=30,
+                dispatcher_lease=dispatcher_lease,
+            )
+        assert (
+            rehydrate_conflict.value.code
+            is operation_env[
+                "module"
+            ].OperationErrorCode.OPERATION_STATE_CONFLICT
+        )
+        assert (
+            _task7_c6_authority_snapshot(operation_env)
+            == rehydrate_before
+        )
+        restore_exact_event()
+
+        certified = prdb._project_operation_for_id(
+            operation_env["conn"],
+            project_id=operation_env["project_id"],
+            operation_id=intent.operation_id,
+        )
+        assert certified is not None
+        with prdb.write_transaction(operation_env["conn"]):
+            prdb._decertify_project_operation(
+                operation_env["conn"], certified
+            )
+        apply_event_corruption(corruption_label, corrupted_payload)
+        recertification_before = _task7_c6_authority_snapshot(
+            operation_env
+        )
+        with pytest.raises(RuntimeError):
+            with prdb.write_transaction(operation_env["conn"]):
+                prdb._certify_project_operation(
+                    operation_env["conn"],
+                    project_id=operation_env["project_id"],
+                    operation_id=intent.operation_id,
+                )
+        assert (
+            _task7_c6_authority_snapshot(operation_env)
+            == recertification_before
+        )
+        restore_exact_event()
+        with prdb.write_transaction(operation_env["conn"]):
+            recertified = prdb._certify_project_operation(
+                operation_env["conn"],
+                project_id=operation_env["project_id"],
+                operation_id=intent.operation_id,
+            )
+        assert recertified.guard_validated == 1
+
+    class PublishedCheckpointPort:
+        def __init__(self):
+            self.calls = []
+
+        def publication_state(self, checkpoint):
+            assert operation_env["conn"].in_transaction is False
+            assert checkpoint == original_identity
+            self.calls.append(checkpoint)
+            return "published"
+
+    class NoApprovedReadback:
+        def read_operation(self, request):
+            raise AssertionError("approved recovery must not read back")
+
+    published_checkpoints = PublishedCheckpointPort()
+
+    def recover_with_published_checkpoint(worker_id):
+        upper = (
+            operation_env[
+                "guard"
+            ].operation_recovery_membership_upper_watermark()
+        )
+        assert upper is not None
+        recovered = operation_env[
+            "guard"
+        ].recover_pending_operations(
+            NoApprovedReadback(),
+            published_checkpoints,
+            worker_id=worker_id,
+            lease_seconds=30,
+            dispatcher_lease=dispatcher_lease,
+            max_claims=1,
+            after=None,
+            through_membership_sequence=upper,
+            limit=1,
+        )
+        assert len(recovered.starts) == 1
+        return recovered.starts[0]
+
+    start = recover_with_published_checkpoint("checkpoint-worker-b")
+    assert published_checkpoints.calls == [original_identity]
+    assert start.claim.attempt_id != original_attempt["attempt_id"]
+    assert start.claim.lease_generation != original_attempt["lease_generation"]
+    assert start.claim.fencing_token != original_attempt["fencing_token"]
+    current = operation_env["conn"].execute(
+        """
+        SELECT attempt_id, lease_generation, fencing_token,
+               approval_checkpoint_id, intent_event_id
+        FROM project_operations WHERE operation_id = ?
+        """,
+        (intent.operation_id,),
+    ).fetchone()
+    assert current is not None
+    assert tuple(current[:3]) == (
+        start.claim.attempt_id,
+        start.claim.lease_generation,
+        start.claim.fencing_token,
+    )
+    assert current["approval_checkpoint_id"] == original_identity.checkpoint_id
+    assert current["intent_event_id"] == event_id
+    unchanged_event = operation_env["conn"].execute(
+        "SELECT payload_json FROM project_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    assert unchanged_event is not None
+    assert json.loads(unchanged_event["payload_json"])["attempt"] == original_attempt
+    current_operation = prdb._project_operation_for_id(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        operation_id=intent.operation_id,
+    )
+    assert current_operation is not None
+    assert (
+        current_operation.attempt_id,
+        current_operation.lease_generation,
+        current_operation.fencing_token,
+    ) == (
+        start.claim.attempt_id,
+        start.claim.lease_generation,
+        start.claim.fencing_token,
+    )
+    with prdb.write_transaction(operation_env["conn"]):
+        prdb._decertify_project_operation(
+            operation_env["conn"], current_operation
+        )
+        recertified_current = prdb._certify_project_operation(
+            operation_env["conn"],
+            project_id=operation_env["project_id"],
+            operation_id=intent.operation_id,
+        )
+    assert (
+        recertified_current.attempt_id,
+        recertified_current.lease_generation,
+        recertified_current.fencing_token,
+    ) == (
+        start.claim.attempt_id,
+        start.claim.lease_generation,
+        start.claim.fencing_token,
+    )
+    recertified_event = operation_env["conn"].execute(
+        "SELECT payload_json FROM project_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    assert recertified_event is not None
+    assert recertified_event["payload_json"] == exact_payload_json
+    current_authority_snapshot = _task7_c6_authority_snapshot(
+        operation_env
+    )
+    for authority_column, corrupted_value in (
+        ("attempt_id", "wrong-current-attempt"),
+        (
+            "lease_generation",
+            recertified_current.lease_generation + 1,
+        ),
+        (
+            "fencing_token",
+            recertified_current.fencing_token + 1,
+        ),
+    ):
+        assert operation_env["conn"].in_transaction is False
+        operation_env["conn"].execute("BEGIN IMMEDIATE")
+        try:
+            prdb._decertify_project_operation(
+                operation_env["conn"], recertified_current
+            )
+            changed = operation_env["conn"].execute(
+                f"""
+                UPDATE project_operations
+                SET {authority_column} = ?
+                WHERE project_id = ? AND operation_id = ?
+                  AND guard_validated = 0
+                """,
+                (
+                    corrupted_value,
+                    operation_env["project_id"],
+                    intent.operation_id,
+                ),
+            )
+            assert changed.rowcount == 1
+            assert operation_env["conn"].execute(
+                f"""
+                SELECT {authority_column}
+                FROM project_operations
+                WHERE project_id = ? AND operation_id = ?
+                """,
+                (
+                    operation_env["project_id"],
+                    intent.operation_id,
+                ),
+            ).fetchone()[0] == corrupted_value
+            with pytest.raises(RuntimeError):
+                prdb._certify_project_operation(
+                    operation_env["conn"],
+                    project_id=operation_env["project_id"],
+                    operation_id=intent.operation_id,
+                )
+        finally:
+            assert operation_env["conn"].in_transaction is True
+            operation_env["conn"].rollback()
+        assert operation_env["conn"].in_transaction is False
+        assert (
+            _task7_c6_authority_snapshot(operation_env)
+            == current_authority_snapshot
+        )
+    for authority_table, authority_column, corrupted_value in (
+        (
+            "project_turns",
+            "attempt_id",
+            "wrong-current-turn-attempt",
+        ),
+        (
+            "project_run_controls",
+            "claim_worker_id",
+            "wrong-current-control-worker",
+        ),
+        (
+            "project_worker_leases",
+            "worker_id",
+            "wrong-current-lease-worker",
+        ),
+    ):
+        original_value = operation_env["conn"].execute(
+            f"""
+            SELECT {authority_column}
+            FROM {authority_table}
+            WHERE project_id = ? AND turn_id = ?
+            """,
+            (
+                operation_env["project_id"],
+                intent.turn_id,
+            ),
+        ).fetchone()
+        assert original_value is not None
+        assert original_value[0] != corrupted_value
+        assert operation_env["conn"].in_transaction is False
+        operation_env["conn"].execute("BEGIN IMMEDIATE")
+        try:
+            prdb._decertify_project_operation(
+                operation_env["conn"], recertified_current
+            )
+            changed_authority = operation_env["conn"].execute(
+                f"""
+                UPDATE {authority_table}
+                SET {authority_column} = ?
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (
+                    corrupted_value,
+                    operation_env["project_id"],
+                    intent.turn_id,
+                ),
+            )
+            assert changed_authority.rowcount == 1
+            stored_corruption = operation_env["conn"].execute(
+                f"""
+                SELECT {authority_column}
+                FROM {authority_table}
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (
+                    operation_env["project_id"],
+                    intent.turn_id,
+                ),
+            ).fetchone()
+            assert stored_corruption is not None
+            assert stored_corruption[0] == corrupted_value
+            with pytest.raises(RuntimeError):
+                prdb._certify_project_operation(
+                    operation_env["conn"],
+                    project_id=operation_env["project_id"],
+                    operation_id=intent.operation_id,
+                )
+        finally:
+            assert operation_env["conn"].in_transaction is True
+            operation_env["conn"].rollback()
+        assert operation_env["conn"].in_transaction is False
+        assert (
+            _task7_c6_authority_snapshot(operation_env)
+            == current_authority_snapshot
+        )
+    started_claim = operation_env["runtime"].mark_turn_started(
+        start.claim
+    )
+    started = operation_env["guard"].mark_started(
+        started_claim,
+        intent.operation_id,
+        approval_checkpoints=published_checkpoints,
+    )
+    assert started.status == "effect_started"
+    assert published_checkpoints.calls == [
+        original_identity,
+        original_identity,
+    ]
+    not_applied = operation_env["guard"].reconcile(
+        started_claim,
+        intent.operation_id,
+        _Readback(
+            operation_env["conn"],
+            _readback_result(
+                operation_env,
+                "not_applied",
+                evidence={"remote_history": "complete_absence"},
+            ),
+        ),
+    )
+    assert not_applied.status == "approved"
+    parked_turn = prdb._runtime_turn_for_project(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        turn_id=intent.turn_id,
+    )
+    assert parked_turn is not None
+    assert parked_turn.status == "reconciling"
+    assert prdb._current_worker_lease_for_turn(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        turn_id=intent.turn_id,
+    ) is None
+    parked_event = operation_env["conn"].execute(
+        "SELECT payload_json FROM project_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    assert parked_event is not None
+    assert parked_event["payload_json"] == exact_payload_json
+
+    restarted = recover_with_published_checkpoint(
+        "checkpoint-worker-c"
+    )
+    assert published_checkpoints.calls == [
+        original_identity,
+        original_identity,
+        original_identity,
+    ]
+    assert restarted.claim.lease_generation == (
+        start.claim.lease_generation + 1
+    )
+    assert restarted.claim.fencing_token == (
+        start.claim.fencing_token + 1
+    )
+    current_c = prdb._project_operation_for_id(
+        operation_env["conn"],
+        project_id=operation_env["project_id"],
+        operation_id=intent.operation_id,
+    )
+    assert current_c is not None
+    with prdb.write_transaction(operation_env["conn"]):
+        prdb._decertify_project_operation(
+            operation_env["conn"],
+            current_c,
+        )
+        recertified_c = prdb._certify_project_operation(
+            operation_env["conn"],
+            project_id=operation_env["project_id"],
+            operation_id=intent.operation_id,
+        )
+    assert (
+        recertified_c.attempt_id,
+        recertified_c.lease_generation,
+        recertified_c.fencing_token,
+    ) == (
+        restarted.claim.attempt_id,
+        restarted.claim.lease_generation,
+        restarted.claim.fencing_token,
+    )
+    immutable_event = operation_env["conn"].execute(
+        "SELECT payload_json FROM project_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    assert immutable_event is not None
+    assert immutable_event["payload_json"] == exact_payload_json
+
+    decision = operation_env["guard"].resolve_approval_checkpoint(
+        original_identity
+    )
+    assert decision.action == "publish"
+    current_identity = replace(
+        original_identity,
+        attempt=runtime_module.TurnAttemptIdentity(
+            intent.project_id,
+            intent.turn_id,
+            restarted.claim.sequence,
+            restarted.claim.worker_id,
+            restarted.claim.attempt_id,
+            restarted.claim.lease_generation,
+            restarted.claim.fencing_token,
+            restarted.claim.canonical_session_id,
+            restarted.claim.lease_expires_at,
+        ),
+    )
+    with pytest.raises(runtime_module.ProjectRuntimeError) as current_conflict:
+        operation_env["guard"].resolve_approval_checkpoint(current_identity)
+    assert (
+        current_conflict.value.code
+        is runtime_module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT
+    )
+    assert (
+        runtime_module.RuntimeErrorCode.PROJECT_AUTHORITY_CONFLICT.value
+        == "project_authority_conflict"
+    )
+    assert published_checkpoints.calls == [
+        original_identity,
+        original_identity,
+        original_identity,
+    ]
+
+
+def test_task7_c6_intent_checkpoint_replay_and_marker_identity_immutability(
+    operation_env,
+    monkeypatch,
+    tmp_path,
+):
+    module = operation_env["module"]
+    prepared, intent, _ = _task7_c6_prepare_checkpointed_critical(
+        operation_env
+    )
+    before_replay = _task7_c6_authority_snapshot(operation_env)
+    original_id_factory = operation_env["runtime"]._id_factory
+
+    def replay_must_not_allocate(kind):
+        raise AssertionError(f"replay allocated {kind}")
+
+    monkeypatch.setattr(
+        operation_env["runtime"], "_id_factory", replay_must_not_allocate
+    )
+    replay, _, _ = _task7_c6_prepare_checkpointed_critical(operation_env)
+    assert replay == prepared
+    assert _task7_c6_authority_snapshot(operation_env) == before_replay
+    monkeypatch.setattr(
+        operation_env["runtime"], "_id_factory", original_id_factory
+    )
+
+    with pytest.raises(module.ProjectOperationError) as different_checkpoint:
+        _task7_c6_prepare_checkpointed_critical(
+            operation_env,
+            checkpoint_id="123e4567-e89b-42d3-a456-426614174001",
+        )
+    assert (
+        different_checkpoint.value.code
+        is module.OperationErrorCode.OPERATION_IDEMPOTENCY_CONFLICT
+    )
+    assert _task7_c6_authority_snapshot(operation_env) == before_replay
+
+    for invalid_checkpoint in (
+        "123E4567-E89B-42D3-A456-426614174000",
+        "123e4567-e89b-12d3-a456-426614174000",
+        "not-a-checkpoint",
+    ):
+        with pytest.raises(module.ProjectOperationError) as invalid:
+            _task7_c6_prepare_checkpointed_critical(
+                operation_env,
+                checkpoint_id=invalid_checkpoint,
+            )
+        assert (
+            invalid.value.code
+            is module.OperationErrorCode.INVALID_OPERATION_ARGUMENT
+        )
+        assert _task7_c6_authority_snapshot(operation_env) == before_replay
+
+    race_dir = tmp_path / "concurrent-replay"
+    race_env = _build_operation_env(race_dir, started=True)
+    race_a_at_outer = threading.Event()
+    race_winner_committed = threading.Event()
+    race_b_outcome = queue.Queue()
+    race_a_allocations = []
+    race_a_lookup_transactions = []
+    original_outer_transaction = prdb.task7_outer_write_transaction
+    original_race_factory = race_env["runtime"]._id_factory
+    original_race_lookup = race_env["guard"]._existing_operation
+
+    def record_race_a_allocation(kind):
+        race_a_allocations.append(kind)
+        return original_race_factory(kind)
+
+    def record_race_a_lookup(**kwargs):
+        result = original_race_lookup(**kwargs)
+        race_a_lookup_transactions.append(
+            race_env["conn"].in_transaction
+        )
+        return result
+
+    @contextlib.contextmanager
+    def gate_race_a_before_outer(conn):
+        if conn is race_env["conn"]:
+            race_a_at_outer.set()
+            if not race_winner_committed.wait(10):
+                raise AssertionError(
+                    "concurrent replay winner did not commit"
+                )
+        with original_outer_transaction(conn) as transaction_conn:
+            yield transaction_conn
+
+    def commit_concurrent_winner():
+        if not race_a_at_outer.wait(10):
+            race_b_outcome.put(
+                (
+                    "error",
+                    AssertionError(
+                        "replay contender did not reach outer boundary"
+                    ),
+                )
+            )
+            race_winner_committed.set()
+            return
+        contender_conn = projects_db.connect(race_dir / "guard.db")
+        try:
+            runtime_module = importlib.import_module(
+                "hermes_cli.project_runtime"
+            )
+            contender_runtime = runtime_module.ProjectRuntime(
+                contender_conn,
+                clock=lambda: race_env["now"][0],
+            )
+            contender_guard = module.ProjectOperationGuard(
+                contender_runtime
+            )
+            contender_env = {
+                **race_env,
+                "conn": contender_conn,
+                "runtime": contender_runtime,
+                "guard": contender_guard,
+            }
+            winner, _, _ = _task7_c6_prepare_checkpointed_critical(
+                contender_env
+            )
+            winner_snapshot = _task7_c6_authority_snapshot(
+                contender_env
+            )
+            race_b_outcome.put(
+                ("result", winner, winner_snapshot)
+            )
+        except BaseException as exc:
+            race_b_outcome.put(("error", exc))
+        finally:
+            contender_conn.close()
+            race_winner_committed.set()
+
+    race_thread = threading.Thread(
+        target=commit_concurrent_winner,
+        name="task7-c6-concurrent-winner",
+    )
+    try:
+        monkeypatch.setattr(
+            race_env["runtime"],
+            "_id_factory",
+            record_race_a_allocation,
+        )
+        monkeypatch.setattr(
+            race_env["guard"],
+            "_existing_operation",
+            record_race_a_lookup,
+        )
+        monkeypatch.setattr(
+            prdb,
+            "task7_outer_write_transaction",
+            gate_race_a_before_outer,
+        )
+        try:
+            race_thread.start()
+            try:
+                race_a_result, _, _ = (
+                    _task7_c6_prepare_checkpointed_critical(race_env)
+                )
+                race_a_outcome = ("result", race_a_result)
+            except BaseException as exc:
+                race_a_outcome = ("error", exc)
+        finally:
+            race_winner_committed.set()
+            race_thread.join(timeout=10)
+            monkeypatch.setattr(
+                prdb,
+                "task7_outer_write_transaction",
+                original_outer_transaction,
+            )
+        assert not race_thread.is_alive()
+        assert race_b_outcome.qsize() == 1
+        winner_outcome = race_b_outcome.get_nowait()
+        assert winner_outcome[0] == "result", repr(winner_outcome[1])
+        _, race_winner, race_after_winner = winner_outcome
+        assert (
+            _task7_c6_authority_snapshot(race_env)
+            == race_after_winner
+        )
+        assert race_a_allocations == []
+        assert race_a_outcome[0] == "result", repr(race_a_outcome[1])
+        assert race_a_outcome[1] == race_winner
+        assert race_a_lookup_transactions
+        assert race_a_lookup_transactions[-1] is True
+    finally:
+        race_env["conn"].close()
+
+
+    row = operation_env["conn"].execute(
+        """
+        SELECT approval_checkpoint_id, intent_event_id
+        FROM project_operations WHERE operation_id = ?
+        """,
+        (intent.operation_id,),
+    ).fetchone()
+    assert row is not None
+    for expected_marker, statement, value in (
+        (0, "approval_checkpoint_id", "123e4567-e89b-42d3-a456-426614174010"),
+        (0, "intent_event_id", "changed-intent-event"),
+        (1, "approval_checkpoint_id", "123e4567-e89b-42d3-a456-426614174011"),
+        (1, "intent_event_id", "changed-intent-event-again"),
+    ):
+        if expected_marker == 0:
+            operation = prdb._project_operation_for_id(
+                operation_env["conn"],
+                project_id=operation_env["project_id"],
+                operation_id=intent.operation_id,
+            )
+            assert operation is not None
+            prdb._decertify_project_operation(operation_env["conn"], operation)
+            staged = operation_env["conn"].execute(
+                """
+                SELECT guard_validated, approval_checkpoint_id, intent_event_id
+                FROM project_operations WHERE operation_id = ?
+                """,
+                (intent.operation_id,),
+            ).fetchone()
+            assert staged is not None
+            assert tuple(staged) == (0, row["approval_checkpoint_id"], row["intent_event_id"])
+        with pytest.raises(sqlite3.IntegrityError):
+            operation_env["conn"].execute(
+                f"""
+                UPDATE project_operations SET {statement} = ?
+                WHERE operation_id = ?
+                """,
+                (value, intent.operation_id),
+            )
+        operation_env["conn"].rollback()
+        assert _task7_c6_authority_snapshot(operation_env) == before_replay
+
+    noncritical_env = _build_operation_env(tmp_path / "noncritical", started=True)
+    try:
+        noncritical_before = _task7_c6_authority_snapshot(noncritical_env)
+        with pytest.raises(
+            noncritical_env["module"].ProjectOperationError
+        ) as noncritical_error:
+            noncritical_env["guard"].prepare(
+                noncritical_env["claim"],
+                _intent(noncritical_env, canonical_action="local_code_edit"),
+                policy=_allow_local_policy(),
+                approval=None,
+                approval_checkpoint_id="123e4567-e89b-42d3-a456-426614174000",
+            )
+        assert (
+            noncritical_error.value.code
+            is noncritical_env["module"].OperationErrorCode.INVALID_OPERATION_ARGUMENT
+        )
+        assert _task7_c6_authority_snapshot(noncritical_env) == noncritical_before
+    finally:
+        noncritical_env["conn"].close()
+
+    blocked_env = _build_operation_env(tmp_path / "blocked", started=True)
+    try:
+        blocked_before = _task7_c6_authority_snapshot(blocked_env)
+        blocked_approval = blocked_env["module"].OperationApprovalSpec(
+            "blocked-approval", "publish", 1_000, blocked_env["actor"]
+        )
+        with pytest.raises(
+            blocked_env["module"].ProjectOperationError
+        ) as blocked_error:
+            blocked_env["guard"].prepare(
+                blocked_env["claim"],
+                _intent(
+                    blocked_env,
+                    canonical_action="publish",
+                    readback_kind=None,
+                    remote_idempotency_supported=False,
+                ),
+                policy=PolicyDecision(
+                    Decision.REQUIRE_APPROVAL,
+                    "policy.approval.publish",
+                    "blocked critical checkpoint",
+                    "publish",
+                ),
+                approval=blocked_approval,
+                approval_checkpoint_id="123e4567-e89b-42d3-a456-426614174000",
+            )
+        assert (
+            blocked_error.value.code
+            is blocked_env["module"].OperationErrorCode.INVALID_OPERATION_ARGUMENT
+        )
+        assert _task7_c6_authority_snapshot(blocked_env) == blocked_before
+    finally:
+        blocked_env["conn"].close()
+
+    legacy_env = _build_operation_env(tmp_path / "legacy", started=True)
+    try:
+        _prepare_critical(legacy_env)
+        legacy_pair = legacy_env["conn"].execute(
+            """
+            SELECT approval_checkpoint_id, intent_event_id
+            FROM project_operations WHERE operation_id = 'operation-1'
+            """
+        ).fetchone()
+        assert legacy_pair is not None
+        assert tuple(legacy_pair) == (None, None)
+        for expected_marker in (1, 0):
+            if expected_marker == 0:
+                legacy_operation = prdb._project_operation_for_id(
+                    legacy_env["conn"],
+                    project_id=legacy_env["project_id"],
+                    operation_id="operation-1",
+                )
+                assert legacy_operation is not None
+                with prdb.write_transaction(legacy_env["conn"]):
+                    prdb._decertify_project_operation(
+                        legacy_env["conn"], legacy_operation
+                    )
+            marker = legacy_env["conn"].execute(
+                """
+                SELECT guard_validated
+                FROM project_operations
+                WHERE operation_id = 'operation-1'
+                """
+            ).fetchone()
+            assert marker is not None
+            assert marker["guard_validated"] == expected_marker
+            legacy_mutations = (
+                (
+                    """
+                    approval_checkpoint_id = ?,
+                    intent_event_id = ?
+                    """,
+                    (
+                        "123e4567-e89b-42d3-a456-426614174099",
+                        "late-bound-intent-event",
+                    ),
+                ),
+            )
+            if expected_marker == 0:
+                legacy_mutations = (
+                    (
+                        "approval_checkpoint_id = ?",
+                        (
+                            "123e4567-e89b-42d3-a456-426614174099",
+                        ),
+                    ),
+                    (
+                        "intent_event_id = ?",
+                        ("late-bound-intent-event",),
+                    ),
+                    *legacy_mutations,
+                )
+            for mutation, parameters in legacy_mutations:
+                legacy_before = _task7_c6_authority_snapshot(
+                    legacy_env
+                )
+                with pytest.raises(sqlite3.IntegrityError):
+                    legacy_env["conn"].execute(
+                        f"""
+                        UPDATE project_operations
+                        SET {mutation}
+                        WHERE operation_id = 'operation-1'
+                        """,
+                        parameters,
+                    )
+                legacy_env["conn"].rollback()
+                assert (
+                    _task7_c6_authority_snapshot(legacy_env)
+                    == legacy_before
+                )
+    finally:
+        legacy_env["conn"].close()
+
+    upgrade_env = _build_operation_env(
+        tmp_path / "old-trigger-upgrade",
+        started=True,
+    )
+    old_trigger_name = "trg_project_operations_task7_certified_update"
+    old_trigger_sql = f"""
+    CREATE TRIGGER {old_trigger_name}
+    BEFORE UPDATE ON project_operations
+    WHEN (
+           OLD.approval_checkpoint_id IS NOT NULL
+           AND NEW.approval_checkpoint_id
+               IS NOT OLD.approval_checkpoint_id
+         )
+     OR (
+           OLD.intent_event_id IS NOT NULL
+           AND NEW.intent_event_id IS NOT OLD.intent_event_id
+         )
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'certified Task-7 operation requires marker-only transition'
+        );
+    END
+    """
+    try:
+        _prepare_critical(upgrade_env)
+        upgrade_before = _task7_c6_authority_snapshot(upgrade_env)
+        upgrade_env["conn"].execute(
+            f"DROP TRIGGER {old_trigger_name}"
+        )
+        upgrade_env["conn"].execute(old_trigger_sql)
+        upgrade_env["conn"].commit()
+        installed_old = upgrade_env["conn"].execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'trigger' AND name = ?
+            """,
+            (old_trigger_name,),
+        ).fetchone()
+        assert installed_old is not None
+        assert prdb._normalized_named_schema_sql(
+            installed_old["sql"]
+        ) == prdb._normalized_named_schema_sql(old_trigger_sql)
+
+        upgrade_env["conn"].execute("BEGIN IMMEDIATE")
+        try:
+            late_bound = upgrade_env["conn"].execute(
+                """
+                UPDATE project_operations
+                SET approval_checkpoint_id = ?,
+                    intent_event_id = ?
+                WHERE operation_id = 'operation-1'
+                """,
+                (
+                    "123e4567-e89b-42d3-a456-426614174088",
+                    "old-trigger-late-bound-event",
+                ),
+            )
+            assert late_bound.rowcount == 1
+            permitted_pair = upgrade_env["conn"].execute(
+                """
+                SELECT approval_checkpoint_id, intent_event_id
+                FROM project_operations
+                WHERE operation_id = 'operation-1'
+                """
+            ).fetchone()
+            assert permitted_pair is not None
+            assert tuple(permitted_pair) == (
+                "123e4567-e89b-42d3-a456-426614174088",
+                "old-trigger-late-bound-event",
+            )
+        finally:
+            upgrade_env["conn"].rollback()
+        assert (
+            _task7_c6_authority_snapshot(upgrade_env)
+            == upgrade_before
+        )
+
+        prdb.ensure_schema(upgrade_env["conn"])
+        assert (
+            _task7_c6_authority_snapshot(upgrade_env)
+            == upgrade_before
+        )
+        converged_before = _task7_c6_authority_snapshot(upgrade_env)
+        with pytest.raises(sqlite3.IntegrityError):
+            upgrade_env["conn"].execute(
+                """
+                UPDATE project_operations
+                SET approval_checkpoint_id = ?,
+                    intent_event_id = ?
+                WHERE operation_id = 'operation-1'
+                """,
+                (
+                    "123e4567-e89b-42d3-a456-426614174089",
+                    "converged-trigger-late-bound-event",
+                ),
+            )
+        upgrade_env["conn"].rollback()
+        assert (
+            _task7_c6_authority_snapshot(upgrade_env)
+            == converged_before
+        )
+        installed_new = upgrade_env["conn"].execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'trigger' AND name = ?
+            """,
+            (old_trigger_name,),
+        ).fetchone()
+        assert installed_new is not None
+        canonical_trigger_sql = prdb._canonical_named_schema_sql(
+            prdb.TASK7_MEMBERSHIP_TRIGGER_SQL,
+            prdb._TASK7_MEMBERSHIP_TRIGGER_NAMES,
+        )[old_trigger_name]
+        assert prdb._normalized_named_schema_sql(
+            installed_new["sql"]
+        ) == prdb._normalized_named_schema_sql(
+            canonical_trigger_sql
+        )
+        assert prdb._normalized_named_schema_sql(
+            installed_new["sql"]
+        ) != prdb._normalized_named_schema_sql(old_trigger_sql)
+    finally:
+        upgrade_env["conn"].close()
+
+
+def test_task7_c7_terminal_gate_blocks_runnable_queue_claim_and_approved_rehydration(
+    operation_env,
+):
+    runtime_module = importlib.import_module("hermes_cli.project_runtime")
+    operation_module = operation_env["module"]
+    conn = operation_env["conn"]
+    project_id = operation_env["project_id"]
+    gate_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(project_runtime_state)")
+    }
+    assert {
+        "transcript_pending_batch_id",
+        "transcript_dispatch_block_key",
+    } <= gate_columns
+
+    _prepare_critical(operation_env)
+    operation_env["now"][0] = 131
+    approved = operation_env["guard"].resolve_operation_approval(
+        "approval-1", operation_env["actor"], outcome="approved"
+    )
+    assert approved.status == "approved"
+
+    attempts = []
+    identity_counts = {}
+    armed_gate = [None]
+    duplicate_event_id = [None]
+
+    def identity(kind):
+        identity_counts[kind] = identity_counts.get(kind, 0) + 1
+        if kind == "attempt":
+            attempts.append(kind)
+            if armed_gate[0] is not None:
+                gate_project, gate_field, gate_value = armed_gate[0]
+                conn.execute(
+                    f"""
+                    UPDATE project_runtime_state
+                    SET {gate_field} = ?
+                    WHERE project_id = ?
+                    """,
+                    (gate_value, gate_project),
+                )
+        if kind == "event" and duplicate_event_id[0] is not None:
+            return duplicate_event_id[0]
+        return f"c7-{kind}-{identity_counts[kind]}"
+
+    runtime = runtime_module.ProjectRuntime(
+        conn,
+        clock=lambda: operation_env["now"][0],
+        id_factory=identity,
+    )
+    guard = operation_module.ProjectOperationGuard(runtime)
+    dispatcher_lease = runtime.acquire_dispatcher_lease(
+        "11111111-1111-4111-8111-111111111111", lease_seconds=30
+    )
+    assert dispatcher_lease is not None
+
+    queue_project = projects_db.create_project(conn, name="C7 queue gate")
+    prdb.create_project_conversation(
+        conn,
+        project_id=queue_project,
+        conversation_id="c7-queue-root",
+        current_phase="implementation",
+        now=1,
+    )
+    prdb.bind_surface(
+        conn,
+        binding_id="c7-queue-binding",
+        project_id=queue_project,
+        surface="desktop",
+        external_binding_id="c7-queue-window",
+        actor_id="owner-1",
+        now=1,
+    )
+    queue_actor = ActorContext(
+        "owner-1", "desktop", "c7-queue-binding", True
+    )
+    queued = runtime.enqueue_turn(
+        queue_project,
+        {"message": "gated queue turn"},
+        queue_actor,
+        idempotency_key="c7-queue-turn",
+        expected_version=0,
+    )
+
+    def full_snapshot():
+        projects = (project_id, queue_project)
+        return (
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_runtime_state
+                    WHERE project_id IN (?, ?) ORDER BY project_id
+                    """,
+                    projects,
+                )
+            ),
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_turns
+                    WHERE project_id IN (?, ?)
+                    ORDER BY project_id, sequence
+                    """,
+                    projects,
+                )
+            ),
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_run_controls
+                    WHERE project_id IN (?, ?)
+                    ORDER BY project_id, turn_id
+                    """,
+                    projects,
+                )
+            ),
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_worker_leases
+                    WHERE project_id IN (?, ?)
+                    ORDER BY project_id, turn_id
+                    """,
+                    projects,
+                )
+            ),
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_events
+                    WHERE project_id IN (?, ?)
+                    ORDER BY project_id, sequence
+                    """,
+                    projects,
+                )
+            ),
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_operations
+                    WHERE project_id IN (?, ?)
+                    ORDER BY project_id, operation_id
+                    """,
+                    projects,
+                )
+            ),
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_approvals
+                    WHERE project_id IN (?, ?)
+                    ORDER BY project_id, approval_id
+                    """,
+                    projects,
+                )
+            ),
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_runtime_membership_counters
+                    ORDER BY lane
+                    """
+                )
+            ),
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_dispatcher_leases
+                    ORDER BY lease_name
+                    """
+                )
+            ),
+            tuple(
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT * FROM project_operation_maintenance
+                    ORDER BY singleton
+                    """
+                )
+            ),
+        )
+
+    for field, value in (
+        (
+            "transcript_pending_batch_id",
+            "123e4567-e89b-42d3-a456-426614174000",
+        ),
+        ("transcript_dispatch_block_key", "count-drift-c7"),
+    ):
+        conn.execute(
+            """
+            UPDATE project_runtime_state
+            SET transcript_pending_batch_id = NULL,
+                transcript_dispatch_block_key = NULL
+            WHERE project_id IN (?, ?)
+            """,
+            (project_id, queue_project),
+        )
+        conn.execute(
+            f"UPDATE project_runtime_state SET {field} = ? WHERE project_id IN (?, ?)",
+            (value, project_id, queue_project),
+        )
+        conn.commit()
+
+        scan_trace = []
+        conn.set_trace_callback(scan_trace.append)
+        try:
+            upper = runtime.runnable_project_membership_upper_watermark()
+            assert upper is not None
+            first_discovery = runtime.scan_runnable_projects(
+                after=None,
+                through_membership_sequence=upper,
+                limit=1,
+            )
+            assert first_discovery.scanned_through is not None
+            discovered = runtime.scan_runnable_projects(
+                after=first_discovery.scanned_through,
+                through_membership_sequence=upper,
+                limit=1,
+            )
+        finally:
+            conn.set_trace_callback(None)
+        assert first_discovery.projects == ()
+        operation_membership = conn.execute(
+            """
+            SELECT dispatch_membership_sequence
+            FROM project_runtime_state WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()[0]
+        assert first_discovery.scanned_through == (
+            runtime_module.RunnableProjectCursor(
+                operation_membership, project_id
+            )
+        )
+        assert queue_project not in {
+            item.project_id for item in discovered.projects
+        }
+        queue_membership = conn.execute(
+            """
+            SELECT dispatch_membership_sequence
+            FROM project_runtime_state WHERE project_id = ?
+            """,
+            (queue_project,),
+        ).fetchone()[0]
+        assert discovered.scanned_through == (
+            runtime_module.RunnableProjectCursor(
+                queue_membership, queue_project
+            )
+        )
+        raw_page_statements = [
+            " ".join(statement.lower().split())
+            for statement in scan_trace
+            if "indexed by idx_project_runtime_dispatch_membership"
+            in statement.lower()
+        ]
+        assert raw_page_statements
+        assert all(
+            "transcript_pending_batch_id" not in statement
+            and "transcript_dispatch_block_key" not in statement
+            for statement in raw_page_statements
+        )
+        assert any(
+            statement.startswith(
+                "select dispatch_membership_sequence, project_id"
+            )
+            and "order by dispatch_membership_sequence desc" in statement
+            for statement in raw_page_statements
+        )
+        assert any(
+            statement.startswith(
+                "select dispatch_membership_sequence, project_id"
+            )
+            and "order by dispatch_membership_sequence, project_id"
+            in statement
+            for statement in raw_page_statements
+        )
+        assert any(
+            statement.startswith("select 1")
+            for statement in raw_page_statements
+        )
+
+        before = full_snapshot()
+        assert runtime.claim_next_turn_for_dispatcher(
+            queue_project,
+            "c7-queue-worker",
+            lease_seconds=30,
+            dispatcher_lease=dispatcher_lease,
+        ) is None
+        assert guard.rehydrate_approved_operation_for_dispatcher(
+            project_id,
+            "operation-1",
+            worker_id="c7-operation-worker",
+            lease_seconds=30,
+            dispatcher_lease=dispatcher_lease,
+        ) is None
+        assert attempts == []
+        assert full_snapshot() == before
+
+    conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET transcript_pending_batch_id = NULL,
+            transcript_dispatch_block_key = NULL
+        WHERE project_id IN (?, ?)
+        """,
+        (project_id, queue_project),
+    )
+    conn.commit()
+
+    state_column_names = tuple(
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(project_runtime_state)")
+    )
+
+    def state_by_project(snapshot, selected_project):
+        return dict(
+            zip(
+                state_column_names,
+                next(
+                    row
+                    for row in snapshot[0]
+                    if row[state_column_names.index("project_id")]
+                    == selected_project
+                ),
+            )
+        )
+
+    for path, target_project in (
+        ("queue", queue_project),
+        ("rehydrate", project_id),
+    ):
+        for gate_field, gate_value in (
+            (
+                "transcript_pending_batch_id",
+                "123e4567-e89b-42d3-a456-426614174000",
+            ),
+            (
+                "transcript_dispatch_block_key",
+                f"late exact {path} block key",
+            ),
+        ):
+            conn.execute(
+                """
+                UPDATE project_runtime_state
+                SET transcript_pending_batch_id = NULL,
+                    transcript_dispatch_block_key = NULL
+                WHERE project_id IN (?, ?)
+                """,
+                (project_id, queue_project),
+            )
+            conn.commit()
+            late_before = full_snapshot()
+            attempt_count_before = len(attempts)
+            armed_gate[0] = (
+                target_project,
+                gate_field,
+                gate_value,
+            )
+            try:
+                if path == "queue":
+                    start = runtime.claim_next_turn_for_dispatcher(
+                        queue_project,
+                        f"c7-late-queue-{gate_field}",
+                        lease_seconds=30,
+                        dispatcher_lease=dispatcher_lease,
+                    )
+                else:
+                    start = (
+                        guard
+                        .rehydrate_approved_operation_for_dispatcher(
+                            project_id,
+                            "operation-1",
+                            worker_id=(
+                                f"c7-late-operation-{gate_field}"
+                            ),
+                            lease_seconds=30,
+                            dispatcher_lease=dispatcher_lease,
+                        )
+                    )
+            finally:
+                armed_gate[0] = None
+
+            assert start is None
+            assert len(attempts) == attempt_count_before + 1
+            late_after = full_snapshot()
+            assert late_after[1:] == late_before[1:]
+            for selected_project in (project_id, queue_project):
+                expected_state = state_by_project(
+                    late_before, selected_project
+                )
+                if selected_project == target_project:
+                    expected_state[gate_field] = gate_value
+                assert state_by_project(
+                    late_after, selected_project
+                ) == expected_state
+
+    assert conn.execute(
+        "SELECT status FROM project_turns WHERE turn_id = ?",
+        (queued.turn_id,),
+    ).fetchone()[0] == "queued"
+
+    conn.execute(
+        """
+        UPDATE project_runtime_state
+        SET transcript_pending_batch_id = NULL,
+            transcript_dispatch_block_key = NULL
+        WHERE project_id IN (?, ?)
+        """,
+        (project_id, queue_project),
+    )
+    conn.commit()
+
+    duplicate_before = full_snapshot()
+    duplicate_attempt_count = len(attempts)
+    duplicate_event_count = identity_counts.get("event", 0)
+    duplicate_event_id[0] = "c7-duplicate-rehydration-event"
+    assert conn.execute(
+        "SELECT 1 FROM project_events WHERE event_id = ?",
+        (duplicate_event_id[0],),
+    ).fetchone() is None
+    duplicate_trace = []
+    conn.set_trace_callback(duplicate_trace.append)
+    try:
+        with pytest.raises(
+            operation_module.ProjectOperationError
+        ) as duplicate_event:
+            guard.rehydrate_approved_operation_for_dispatcher(
+                project_id,
+                "operation-1",
+                worker_id="c7-duplicate-event-worker",
+                lease_seconds=30,
+                dispatcher_lease=dispatcher_lease,
+            )
+    finally:
+        conn.set_trace_callback(None)
+        duplicate_event_id[0] = None
+    assert (
+        duplicate_event.value.code
+        is operation_module.OperationErrorCode.OPERATION_STATE_CONFLICT
+    )
+    assert len(attempts) == duplicate_attempt_count + 1
+    assert identity_counts["event"] == duplicate_event_count + 2
+    duplicate_normalized = [
+        " ".join(statement.lower().split())
+        for statement in duplicate_trace
+    ]
+    duplicate_controls = [
+        statement.upper()
+        for statement in duplicate_normalized
+        if statement.upper().startswith(
+            ("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE")
+        )
+    ]
+    assert duplicate_controls == ["BEGIN IMMEDIATE", "ROLLBACK"]
+    assert conn.in_transaction is False
+    assert full_snapshot() == duplicate_before
+
+    queue_success_trace = []
+    conn.set_trace_callback(queue_success_trace.append)
+    try:
+        queue_start = runtime.claim_next_turn_for_dispatcher(
+            queue_project,
+            "c7-valid-queue-worker",
+            lease_seconds=30,
+            dispatcher_lease=dispatcher_lease,
+        )
+    finally:
+        conn.set_trace_callback(None)
+    assert queue_start is not None
+    queue_final_mutations = [
+        " ".join(statement.lower().split())
+        for statement in queue_success_trace
+        if statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+    ]
+    queue_claim_cas = [
+        statement
+        for statement in queue_final_mutations
+        if statement.startswith("update project_turns")
+        and "status = 'claimed'" in statement.partition(" where ")[0]
+        and "execution_state = 'not_started'" in statement
+    ]
+    assert queue_claim_cas
+    assert all(
+        "transcript_pending_batch_id" in statement
+        and "transcript_dispatch_block_key" in statement
+        for statement in queue_claim_cas
+    )
+
+    rehydrate_success_trace = []
+    conn.set_trace_callback(rehydrate_success_trace.append)
+    try:
+        operation_start = (
+            guard.rehydrate_approved_operation_for_dispatcher(
+                project_id,
+                "operation-1",
+                worker_id="c7-valid-operation-worker",
+                lease_seconds=30,
+                dispatcher_lease=dispatcher_lease,
+            )
+        )
+    finally:
+        conn.set_trace_callback(None)
+    assert operation_start is not None
+    rehydrate_final_mutations = [
+        " ".join(statement.lower().split())
+        for statement in rehydrate_success_trace
+        if statement.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "REPLACE")
+        )
+    ]
+    rehydrate_turn_cas = [
+        statement
+        for statement in rehydrate_final_mutations
+        if statement.startswith("update project_turns")
+        and "status = 'claimed'" in statement.partition(" where ")[0]
+        and "execution_state = 'not_started'" in statement
+    ]
+    assert rehydrate_turn_cas
+    assert all(
+        "transcript_pending_batch_id" in statement
+        and "transcript_dispatch_block_key" in statement
+        for statement in rehydrate_turn_cas
+    )
+
+
+def test_task7_c10_checkpoint_publication_mismatch_blocks_effect_and_replays_without_append(
+    operation_env,
+    tmp_path,
+):
+    """A critical effect/recovery needs one immutable published checkpoint."""
+    module = operation_env["module"]
+
+    def c10_authority_snapshot(env):
+        connection = env["conn"]
+        project_id = env["project_id"]
+        turn_id = env["turn"].turn_id
+
+        def rows(sql, parameters=()):
+            return tuple(
+                tuple(row)
+                for row in connection.execute(sql, parameters)
+            )
+
+        return {
+            "state": rows(
+                """
+                SELECT project_id, lifecycle, current_phase, version,
+                       conversation_root_id, conversation_tip_id,
+                       dispatch_membership_sequence,
+                       transcript_pending_batch_id,
+                       transcript_dispatch_block_key, updated_at
+                FROM project_runtime_state
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ),
+            "turn": rows(
+                """
+                SELECT turn_id, project_id, sequence, status, attempt_id,
+                       lease_generation, fencing_token, execution_state,
+                       terminal_result_id, recovery_block_key,
+                       transcript_applied_batch_id, updated_at
+                FROM project_turns
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (project_id, turn_id),
+            ),
+            "control": rows(
+                """
+                SELECT turn_id, project_id, control_state, control_version,
+                       attempt_id, claim_worker_id, claim_lease_expires_at,
+                       claim_canonical_session_id, updated_at
+                FROM project_run_controls
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (project_id, turn_id),
+            ),
+            "leases": rows(
+                """
+                SELECT lease_id, project_id, turn_id, worker_id,
+                       lease_generation, fencing_token, expires_at, updated_at
+                FROM project_worker_leases
+                WHERE project_id = ? AND turn_id = ?
+                ORDER BY lease_id
+                """,
+                (project_id, turn_id),
+            ),
+            "operations": rows(
+                """
+                SELECT operation_id, project_id, turn_id, approval_id,
+                       status, guard_revision, guard_validated,
+                       canonical_action, attempt_id, lease_generation,
+                       fencing_token, receipt_id, blocked_reason,
+                       approval_checkpoint_id, intent_event_id,
+                       recovery_membership_sequence, updated_at
+                FROM project_operations
+                WHERE project_id = ?
+                ORDER BY operation_id
+                """,
+                (project_id,),
+            ),
+            "approvals": rows(
+                """
+                SELECT approval_id, project_id, turn_id, operation_id,
+                       operation_maintenance_seq, status, resolved_at,
+                       resolved_by_actor_id, consumed_at
+                FROM project_approvals
+                WHERE project_id = ?
+                ORDER BY approval_id
+                """,
+                (project_id,),
+            ),
+            "events": rows(
+                """
+                SELECT event_id, project_id, sequence, kind, turn_id,
+                       payload_json, created_at
+                FROM project_events
+                WHERE project_id = ?
+                ORDER BY sequence, event_id
+                """,
+                (project_id,),
+            ),
+            "membership": rows(
+                """
+                SELECT lane, last_sequence
+                FROM project_runtime_membership_counters
+                ORDER BY lane
+                """
+            ),
+            "dispatcher": rows(
+                """
+                SELECT lease_name, instance_id, generation, fencing_token,
+                       expires_at, updated_at
+                FROM project_dispatcher_leases
+                ORDER BY lease_name
+                """
+            ),
+            "total_changes": connection.total_changes,
+        }
+
+    def dml_categories(statements):
+        categories = []
+        for statement in statements:
+            words = statement.strip().split()
+            if not words:
+                continue
+            verb = words[0].upper()
+            if verb == "UPDATE" and len(words) > 1:
+                categories.append((verb, words[1].strip('"`[]').lower()))
+            elif verb in {"INSERT", "REPLACE"} and len(words) > 2:
+                categories.append(
+                    (verb, words[2].strip('"`[]').lower())
+                )
+            elif verb == "DELETE" and len(words) > 2:
+                categories.append(
+                    (verb, words[2].strip('"`[]').lower())
+                )
+        return tuple(categories)
+
+    prepared, intent, approval = _task7_c6_prepare_checkpointed_critical(
+        operation_env
+    )
+    assert prepared.status == "awaiting_approval"
+    checkpoint, _, _ = _task7_c6_checkpoint_identity(
+        module, operation_env, intent
+    )
+    operation_env["guard"].resolve_operation_approval(
+        approval.approval_id, operation_env["actor"], outcome="approved"
+    )
+
+    class FixedCheckpointPort:
+        def __init__(self, outcome):
+            self.outcome = outcome
+            self.calls = []
+
+        def publication_state(self, observed):
+            assert operation_env["conn"].in_transaction is False
+            self.calls.append(observed)
+            return self.outcome
+
+    live_claim = operation_env["runtime"].mark_turn_started(
+        operation_env["claim"]
+    )
+    for outcome in ("waiting", "permanent_conflict", "malformed"):
+        port = FixedCheckpointPort(outcome)
+        before = c10_authority_snapshot(operation_env)
+        trace = []
+        operation_env["conn"].set_trace_callback(trace.append)
+        try:
+            with pytest.raises(module.ProjectOperationError) as blocked:
+                operation_env["guard"].mark_started(
+                    live_claim,
+                    intent.operation_id,
+                    approval_checkpoints=port,
+                )
+        finally:
+            operation_env["conn"].set_trace_callback(None)
+        assert (
+            blocked.value.code
+            is module.OperationErrorCode.OPERATION_STATE_CONFLICT
+        )
+        assert port.calls == [checkpoint]
+        assert c10_authority_snapshot(operation_env) == before
+        assert dml_categories(trace) == ()
+
+    before_missing = c10_authority_snapshot(operation_env)
+    missing_trace = []
+    operation_env["conn"].set_trace_callback(missing_trace.append)
+    try:
+        with pytest.raises(module.ProjectOperationError) as missing:
+            operation_env["guard"].mark_started(
+                live_claim,
+                intent.operation_id,
+                approval_checkpoints=None,
+            )
+    finally:
+        operation_env["conn"].set_trace_callback(None)
+    assert missing.value.code is module.OperationErrorCode.OPERATION_STATE_CONFLICT
+    assert c10_authority_snapshot(operation_env) == before_missing
+    assert dml_categories(missing_trace) == ()
+
+    published = FixedCheckpointPort("published")
+    started = operation_env["guard"].mark_started(
+        live_claim,
+        intent.operation_id,
+        approval_checkpoints=published,
+    )
+    assert started.status == "effect_started"
+    assert published.calls == [checkpoint]
+    after_started = c10_authority_snapshot(operation_env)
+    replay_trace = []
+    operation_env["conn"].set_trace_callback(replay_trace.append)
+    try:
+        assert operation_env["guard"].mark_started(
+            live_claim,
+            intent.operation_id,
+            approval_checkpoints=published,
+        ).status == "effect_started"
+    finally:
+        operation_env["conn"].set_trace_callback(None)
+    assert published.calls == [checkpoint]
+    assert c10_authority_snapshot(operation_env) == after_started
+    assert dml_categories(replay_trace) == ()
+
+    legacy_env = _build_operation_env(tmp_path / "legacy-live", started=True)
+    try:
+        legacy_prepared = _prepare_critical(
+            legacy_env,
+            operation_id="c10-legacy-operation",
+            approval_id="c10-legacy-approval",
+        )
+        legacy_env["guard"].resolve_operation_approval(
+            "c10-legacy-approval", legacy_env["actor"], outcome="approved"
+        )
+        legacy_claim = legacy_env["runtime"].mark_turn_started(
+            legacy_env["claim"]
+        )
+        legacy_live_trace = []
+        legacy_env["conn"].set_trace_callback(legacy_live_trace.append)
+        try:
+            assert legacy_env["guard"].mark_started(
+                legacy_claim,
+                legacy_prepared.operation_id,
+                approval_checkpoints=None,
+            ).status == "effect_started"
+        finally:
+            legacy_env["conn"].set_trace_callback(None)
+        assert any(
+            table == "project_operations"
+            for _, table in dml_categories(legacy_live_trace)
+        )
+    finally:
+        legacy_env["conn"].close()
+
+    legacy_recovery_env = _build_operation_env(
+        tmp_path / "legacy-recovery", started=True
+    )
+    try:
+        legacy_recovery = _prepare_critical(
+            legacy_recovery_env,
+            operation_id="c10-legacy-recovery-operation",
+            approval_id="c10-legacy-recovery-approval",
+        )
+        legacy_recovery_env["guard"].resolve_operation_approval(
+            "c10-legacy-recovery-approval", legacy_recovery_env["actor"],
+            outcome="approved",
+        )
+        legacy_recovery_env["now"][0] = 131
+        legacy_core = legacy_recovery_env["runtime"].acquire_dispatcher_lease(
+            "33333333-3333-4333-8333-333333333333", lease_seconds=30
+        )
+        assert legacy_core is not None
+        legacy_upper = (
+            legacy_recovery_env["guard"].operation_recovery_membership_upper_watermark()
+        )
+        assert legacy_upper is not None
+
+        class LegacyNoReadback:
+            def read_operation(self, request):
+                raise AssertionError("approved legacy operation must not read back")
+
+        class NeverCalledPort:
+            calls = 0
+
+            def publication_state(self, checkpoint):
+                self.calls += 1
+                raise AssertionError("legacy NULL checkpoint must not consult a port")
+
+        legacy_port = NeverCalledPort()
+        legacy_before = c10_authority_snapshot(legacy_recovery_env)
+        legacy_first_trace = []
+        legacy_recovery_env["conn"].set_trace_callback(
+            legacy_first_trace.append
+        )
+        try:
+            legacy_result = (
+                legacy_recovery_env["guard"].recover_pending_operations(
+                    LegacyNoReadback(),
+                    legacy_port,
+                    worker_id="c10-legacy-recovery",
+                    lease_seconds=30,
+                    dispatcher_lease=legacy_core,
+                    max_claims=1,
+                    after=None,
+                    through_membership_sequence=legacy_upper,
+                    limit=1,
+                )
+            )
+        finally:
+            legacy_recovery_env["conn"].set_trace_callback(None)
+        assert legacy_result.starts == ()
+        assert legacy_port.calls == 0
+        legacy_row = legacy_recovery_env["conn"].execute(
+            "SELECT status, blocked_reason FROM project_operations WHERE operation_id = ?",
+            (legacy_recovery.operation_id,),
+        ).fetchone()
+        assert legacy_row is not None and legacy_row[0] == "blocked"
+        assert legacy_row[1] is not None
+        legacy_after = c10_authority_snapshot(legacy_recovery_env)
+        assert (
+            legacy_after["state"][0][3]
+            == legacy_before["state"][0][3] + 1
+        )
+        legacy_turn = legacy_after["turn"][0]
+        assert legacy_turn[3] == "reconciling"
+        assert legacy_turn[9]
+        legacy_block_events = tuple(
+            event
+            for event in legacy_after["events"]
+            if event[3] == "turn.recovery_blocked"
+        )
+        assert len(legacy_block_events) == 1
+        assert legacy_block_events[0][0] == legacy_turn[9]
+        assert not any(
+            event[3] == "operation.effect_started"
+            for event in legacy_after["events"]
+        )
+        assert dml_categories(legacy_first_trace)
+
+        legacy_replay_before = c10_authority_snapshot(
+            legacy_recovery_env
+        )
+        legacy_replay_trace = []
+        legacy_recovery_env["conn"].set_trace_callback(
+            legacy_replay_trace.append
+        )
+        try:
+            legacy_replay = (
+                legacy_recovery_env["guard"].recover_pending_operations(
+                    LegacyNoReadback(),
+                    legacy_port,
+                    worker_id="c10-legacy-recovery",
+                    lease_seconds=30,
+                    dispatcher_lease=legacy_core,
+                    max_claims=1,
+                    after=None,
+                    through_membership_sequence=legacy_upper,
+                    limit=1,
+                )
+            )
+        finally:
+            legacy_recovery_env["conn"].set_trace_callback(None)
+        assert legacy_replay.starts == ()
+        assert legacy_port.calls == 0
+        assert (
+            c10_authority_snapshot(legacy_recovery_env)
+            == legacy_replay_before
+        )
+        assert dml_categories(legacy_replay_trace) == ()
+    finally:
+        legacy_recovery_env["conn"].close()
+
+    # Recovery is a separate persisted attempt: waiting leaves it parked,
+    # permanent conflict records one visible block, and only published starts.
+    recovery_env = _build_operation_env(tmp_path / "recovery", started=True)
+    try:
+        _, recovery_intent, recovery_approval = (
+            _task7_c6_prepare_checkpointed_critical(recovery_env)
+        )
+        recovery_checkpoint, _, _ = _task7_c6_checkpoint_identity(
+            recovery_env["module"], recovery_env, recovery_intent
+        )
+        recovery_env["guard"].resolve_operation_approval(
+            recovery_approval.approval_id,
+            recovery_env["actor"],
+            outcome="approved",
+        )
+        recovery_env["now"][0] = 131
+        dispatcher_lease = recovery_env["runtime"].acquire_dispatcher_lease(
+            "11111111-1111-4111-8111-111111111111", lease_seconds=30
+        )
+        assert dispatcher_lease is not None
+        upper = recovery_env["guard"].operation_recovery_membership_upper_watermark()
+        assert upper is not None
+
+        class NoReadback:
+            def read_operation(self, request):
+                raise AssertionError("an approved operation does not read back")
+
+        class RecoveryPort:
+            def __init__(self, outcome):
+                self.outcome = outcome
+                self.calls = []
+
+            def publication_state(self, observed):
+                assert recovery_env["conn"].in_transaction is False
+                self.calls.append(observed)
+                return self.outcome
+
+        waiting = RecoveryPort("waiting")
+        parked_before = c10_authority_snapshot(recovery_env)
+        waiting_trace = []
+        recovery_env["conn"].set_trace_callback(waiting_trace.append)
+        try:
+            waiting_result = (
+                recovery_env["guard"].recover_pending_operations(
+                    NoReadback(),
+                    waiting,
+                    worker_id="c10-recovery",
+                    lease_seconds=30,
+                    dispatcher_lease=dispatcher_lease,
+                    max_claims=1,
+                    after=None,
+                    through_membership_sequence=upper,
+                    limit=1,
+                )
+            )
+        finally:
+            recovery_env["conn"].set_trace_callback(None)
+        assert waiting_result.starts == ()
+        assert waiting.calls == [recovery_checkpoint]
+        assert c10_authority_snapshot(recovery_env) == parked_before
+        assert dml_categories(waiting_trace) == ()
+
+        permanent = RecoveryPort("permanent_conflict")
+        permanent_before = c10_authority_snapshot(recovery_env)
+        permanent_trace = []
+        recovery_env["conn"].set_trace_callback(permanent_trace.append)
+        try:
+            permanent_result = (
+                recovery_env["guard"].recover_pending_operations(
+                    NoReadback(),
+                    permanent,
+                    worker_id="c10-recovery",
+                    lease_seconds=30,
+                    dispatcher_lease=dispatcher_lease,
+                    max_claims=1,
+                    after=None,
+                    through_membership_sequence=upper,
+                    limit=1,
+                )
+            )
+        finally:
+            recovery_env["conn"].set_trace_callback(None)
+        assert permanent_result.starts == ()
+        assert permanent.calls == [recovery_checkpoint]
+        blocked_row = recovery_env["conn"].execute(
+            "SELECT status, blocked_reason FROM project_operations WHERE operation_id = ?",
+            (recovery_intent.operation_id,),
+        ).fetchone()
+        assert blocked_row is not None and blocked_row[0] == "blocked"
+        assert blocked_row[1] is not None
+
+        after_block = c10_authority_snapshot(recovery_env)
+        assert (
+            after_block["state"][0][3]
+            == permanent_before["state"][0][3] + 1
+        )
+        blocked_turn = after_block["turn"][0]
+        assert blocked_turn[3] == "reconciling"
+        assert blocked_turn[9]
+        recovery_block_events = tuple(
+            event
+            for event in after_block["events"]
+            if event[3] == "turn.recovery_blocked"
+        )
+        assert len(recovery_block_events) == 1
+        assert recovery_block_events[0][0] == blocked_turn[9]
+        assert not any(
+            event[3] == "operation.effect_started"
+            for event in after_block["events"]
+        )
+        assert dml_categories(permanent_trace)
+
+        repeat_trace = []
+        recovery_env["conn"].set_trace_callback(repeat_trace.append)
+        try:
+            repeated = (
+                recovery_env["guard"].recover_pending_operations(
+                    NoReadback(),
+                    permanent,
+                    worker_id="c10-recovery",
+                    lease_seconds=30,
+                    dispatcher_lease=dispatcher_lease,
+                    max_claims=1,
+                    after=None,
+                    through_membership_sequence=upper,
+                    limit=1,
+                )
+            )
+        finally:
+            recovery_env["conn"].set_trace_callback(None)
+        assert repeated.starts == ()
+        assert permanent.calls == [recovery_checkpoint]
+        assert c10_authority_snapshot(recovery_env) == after_block
+        assert dml_categories(repeat_trace) == ()
+    finally:
+        recovery_env["conn"].close()
+
+    rotated_env = _build_operation_env(
+        tmp_path / "rotated-checkpoint-conflict",
+        started=True,
+    )
+    try:
+        (
+            _,
+            rotated_intent,
+            rotated_approval,
+        ) = _task7_c6_prepare_checkpointed_critical(
+            rotated_env,
+            operation_id="c10-rotated-conflict-operation",
+            approval_id="c10-rotated-conflict-approval",
+            checkpoint_id="77777777-7777-4777-8777-777777777777",
+        )
+        (
+            rotated_checkpoint,
+            rotated_event_id,
+            rotated_event_payload,
+        ) = _task7_c6_checkpoint_identity(
+            rotated_env["module"],
+            rotated_env,
+            rotated_intent,
+        )
+        rotated_env["guard"].resolve_operation_approval(
+            rotated_approval.approval_id,
+            rotated_env["actor"],
+            outcome="approved",
+        )
+        rotated_env["now"][0] = 131
+        rotated_core = rotated_env["runtime"].acquire_dispatcher_lease(
+            "88888888-8888-4888-8888-888888888888",
+            lease_seconds=30,
+        )
+        assert rotated_core is not None
+        rotated_upper = (
+            rotated_env[
+                "guard"
+            ].operation_recovery_membership_upper_watermark()
+        )
+        assert rotated_upper is not None
+
+        class RotatedNoReadback:
+            def __init__(self):
+                self.calls = []
+
+            def read_operation(self, request):
+                self.calls.append(request)
+                raise AssertionError(
+                    "approved checkpoint recovery must not read back"
+                )
+
+        class RotatedCheckpointPort:
+            def __init__(self, outcome):
+                self.outcome = outcome
+                self.calls = []
+
+            def publication_state(self, observed):
+                assert rotated_env["conn"].in_transaction is False
+                assert observed == rotated_checkpoint
+                self.calls.append(observed)
+                return self.outcome
+
+        published_rotated = RotatedCheckpointPort("published")
+        initial_no_readback = RotatedNoReadback()
+        rotated_recovery = rotated_env["guard"].recover_pending_operations(
+            initial_no_readback,
+            published_rotated,
+            worker_id="c10-rotated-worker-b",
+            lease_seconds=30,
+            dispatcher_lease=rotated_core,
+            max_claims=1,
+            after=None,
+            through_membership_sequence=rotated_upper,
+            limit=1,
+        )
+        assert len(rotated_recovery.starts) == 1
+        assert initial_no_readback.calls == []
+        rotated_start = rotated_recovery.starts[0]
+        assert rotated_start.operation is not None
+        assert (
+            rotated_start.operation.operation_id
+            == rotated_intent.operation_id
+        )
+        claim_b = rotated_start.claim
+        assert (
+            claim_b.attempt_id
+            != rotated_checkpoint.attempt.attempt_id
+        )
+        assert (
+            claim_b.lease_generation
+            == rotated_checkpoint.attempt.lease_generation + 1
+        )
+        assert (
+            claim_b.fencing_token
+            == rotated_checkpoint.attempt.fencing_token + 1
+        )
+
+        # The checkpoint keeps immutable authority A.  A real recovery has
+        # now installed B, so mutate only B's coherent projection after a
+        # positive publication read.  A=1/1 cannot be lowered on both axes
+        # without leaving the domain; the two mixed permutations cover the
+        # remaining non-monotone pairs.
+        def mutate_rotated_b_epoch(lease_generation, fencing_token):
+            writer = projects_db.connect(
+                tmp_path / "rotated-checkpoint-conflict" / "guard.db"
+            )
+            try:
+                claimed_b_event = writer.execute(
+                    """
+                    SELECT event_id, payload_json FROM project_events
+                    WHERE project_id = ? AND turn_id = ?
+                      AND kind = 'turn.claimed'
+                    ORDER BY sequence DESC, event_id DESC LIMIT 1
+                    """,
+                    (rotated_env["project_id"], rotated_intent.turn_id),
+                ).fetchone()
+                assert claimed_b_event is not None
+                event_payload = json.loads(claimed_b_event[1])
+                original = {
+                    "operation": writer.execute(
+                        """
+                        SELECT attempt_id, lease_generation, fencing_token
+                        FROM project_operations
+                        WHERE project_id = ? AND operation_id = ?
+                        """,
+                        (
+                            rotated_env["project_id"],
+                            rotated_intent.operation_id,
+                        ),
+                    ).fetchone(),
+                    "turn": writer.execute(
+                        """
+                        SELECT attempt_id, lease_generation, fencing_token
+                        FROM project_turns
+                        WHERE project_id = ? AND turn_id = ?
+                        """,
+                        (rotated_env["project_id"], rotated_intent.turn_id),
+                    ).fetchone(),
+                    "control": writer.execute(
+                        """
+                        SELECT attempt_id FROM project_run_controls
+                        WHERE project_id = ? AND turn_id = ?
+                        """,
+                        (rotated_env["project_id"], rotated_intent.turn_id),
+                    ).fetchone(),
+                    "leases": tuple(writer.execute(
+                        """
+                        SELECT lease_id, lease_generation, fencing_token
+                        FROM project_worker_leases
+                        WHERE project_id = ? AND turn_id = ?
+                        ORDER BY lease_id
+                        """,
+                        (rotated_env["project_id"], rotated_intent.turn_id),
+                    )),
+                    "event": (claimed_b_event[0], claimed_b_event[1]),
+                }
+                event_payload["lease_generation"] = lease_generation
+                event_payload["fencing_token"] = fencing_token
+                with prdb.write_transaction(writer):
+                    decertified = writer.execute(
+                        """
+                        UPDATE project_operations SET guard_validated = 0
+                        WHERE project_id = ? AND operation_id = ?
+                          AND guard_validated = 1
+                        """,
+                        (
+                            rotated_env["project_id"],
+                            rotated_intent.operation_id,
+                        ),
+                    )
+                    assert decertified.rowcount == 1
+                    for table, where, identifier in (
+                        (
+                            "project_operations",
+                            "operation_id = ?",
+                            rotated_intent.operation_id,
+                        ),
+                        (
+                            "project_turns",
+                            "turn_id = ?",
+                            rotated_intent.turn_id,
+                        ),
+                    ):
+                        writer.execute(
+                            f"""
+                            UPDATE {table}
+                            SET lease_generation = ?, fencing_token = ?
+                            WHERE project_id = ? AND {where}
+                            """,
+                            (
+                                lease_generation,
+                                fencing_token,
+                                rotated_env["project_id"],
+                                identifier,
+                            ),
+                        )
+                    writer.execute(
+                        """
+                        UPDATE project_worker_leases
+                        SET lease_generation = ?, fencing_token = ?
+                        WHERE project_id = ? AND turn_id = ?
+                        """,
+                        (
+                            lease_generation,
+                            fencing_token,
+                            rotated_env["project_id"],
+                            rotated_intent.turn_id,
+                        ),
+                    )
+                    writer.execute(
+                        """
+                        UPDATE project_events SET payload_json = ?
+                        WHERE event_id = ?
+                        """,
+                        (
+                            json.dumps(
+                                event_payload,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            claimed_b_event[0],
+                        ),
+                    )
+                    recertified = writer.execute(
+                        """
+                        UPDATE project_operations SET guard_validated = 1
+                        WHERE project_id = ? AND operation_id = ?
+                          AND guard_validated = 0
+                        """,
+                        (
+                            rotated_env["project_id"],
+                            rotated_intent.operation_id,
+                        ),
+                    )
+                    assert recertified.rowcount == 1
+                return original
+            finally:
+                writer.close()
+
+        def restore_rotated_b_epoch(original):
+            writer = projects_db.connect(
+                tmp_path / "rotated-checkpoint-conflict" / "guard.db"
+            )
+            try:
+                with prdb.write_transaction(writer):
+                    decertified = writer.execute(
+                        """
+                        UPDATE project_operations SET guard_validated = 0
+                        WHERE project_id = ? AND operation_id = ?
+                          AND guard_validated = 1
+                        """,
+                        (
+                            rotated_env["project_id"],
+                            rotated_intent.operation_id,
+                        ),
+                    )
+                    assert decertified.rowcount == 1
+                    writer.execute(
+                        """
+                        UPDATE project_operations
+                        SET attempt_id = ?, lease_generation = ?, fencing_token = ?
+                        WHERE project_id = ? AND operation_id = ?
+                        """,
+                        (*original["operation"], rotated_env["project_id"], rotated_intent.operation_id),
+                    )
+                    writer.execute(
+                        """
+                        UPDATE project_turns
+                        SET attempt_id = ?, lease_generation = ?, fencing_token = ?
+                        WHERE project_id = ? AND turn_id = ?
+                        """,
+                        (*original["turn"], rotated_env["project_id"], rotated_intent.turn_id),
+                    )
+                    writer.execute(
+                        """
+                        UPDATE project_run_controls SET attempt_id = ?
+                        WHERE project_id = ? AND turn_id = ?
+                        """,
+                        (*original["control"], rotated_env["project_id"], rotated_intent.turn_id),
+                    )
+                    for lease_id, generation, fence in original["leases"]:
+                        writer.execute(
+                            """
+                            UPDATE project_worker_leases
+                            SET lease_generation = ?, fencing_token = ?
+                            WHERE lease_id = ?
+                            """,
+                            (generation, fence, lease_id),
+                        )
+                    writer.execute(
+                        """
+                        UPDATE project_events SET payload_json = ?
+                        WHERE event_id = ?
+                        """,
+                        (original["event"][1], original["event"][0]),
+                    )
+                    recertified = writer.execute(
+                        """
+                        UPDATE project_operations SET guard_validated = 1
+                        WHERE project_id = ? AND operation_id = ?
+                          AND guard_validated = 0
+                        """,
+                        (
+                            rotated_env["project_id"],
+                            rotated_intent.operation_id,
+                        ),
+                    )
+                    assert recertified.rowcount == 1
+            finally:
+                writer.close()
+
+        class PostPublicationEpochPort:
+            def __init__(self):
+                self.calls = []
+
+            def publication_state(self, observed):
+                assert rotated_env["conn"].in_transaction is False
+                assert observed == rotated_checkpoint
+                self.calls.append(observed)
+                return "published"
+
+        claim_b = rotated_env["runtime"].mark_turn_started(claim_b)
+        for mutated_generation, mutated_fence in ((2, 1), (1, 2)):
+            before_mutation = c10_authority_snapshot(rotated_env)
+            original_b = mutate_rotated_b_epoch(
+                mutated_generation,
+                mutated_fence,
+            )
+            preexisting_b = c10_authority_snapshot(rotated_env)
+            preexisting_changes = rotated_env["conn"].total_changes
+            mutated_claim = replace(
+                claim_b,
+                lease_generation=mutated_generation,
+                fencing_token=mutated_fence,
+            )
+            epoch_port = PostPublicationEpochPort()
+            live_trace = []
+            try:
+                rotated_env["conn"].set_trace_callback(live_trace.append)
+                with pytest.raises(module.ProjectOperationError) as rejected:
+                    rotated_env["guard"].mark_started(
+                        mutated_claim,
+                        rotated_intent.operation_id,
+                        approval_checkpoints=epoch_port,
+                    )
+                assert rejected.value.code is module.OperationErrorCode.OPERATION_STATE_CONFLICT
+                assert epoch_port.calls == []
+                assert c10_authority_snapshot(rotated_env) == preexisting_b
+                assert rotated_env["conn"].total_changes == preexisting_changes
+                assert dml_categories(live_trace) == ()
+                assert rotated_env["conn"].in_transaction is False
+            finally:
+                rotated_env["conn"].set_trace_callback(None)
+                restore_rotated_b_epoch(original_b)
+            assert c10_authority_snapshot(rotated_env) == before_mutation
+
+        effect_b = rotated_env["guard"].mark_started(
+            claim_b,
+            rotated_intent.operation_id,
+            approval_checkpoints=published_rotated,
+        )
+        assert effect_b.status == "effect_started"
+        assert published_rotated.calls == [
+            rotated_checkpoint,
+            rotated_checkpoint,
+        ]
+        parked_b = rotated_env["guard"].reconcile(
+            claim_b,
+            rotated_intent.operation_id,
+            _Readback(
+                rotated_env["conn"],
+                _readback_result(
+                    rotated_env,
+                    "not_applied",
+                    evidence={
+                        "remote_history": "complete_absence",
+                    },
+                ),
+            ),
+        )
+        assert parked_b.status == "approved"
+        parked_authority_b = c10_authority_snapshot(rotated_env)
+        assert len(parked_authority_b["operations"]) == 1
+        certified_b = parked_authority_b["operations"][0]
+        assert certified_b[0] == rotated_intent.operation_id
+        assert certified_b[6] == 1
+        assert certified_b[8:11] == (
+            claim_b.attempt_id,
+            claim_b.lease_generation,
+            claim_b.fencing_token,
+        )
+        assert certified_b[13] == rotated_checkpoint.checkpoint_id
+        immutable_before_conflict = rotated_env["conn"].execute(
+            """
+            SELECT payload_json FROM project_events
+            WHERE project_id = ? AND event_id = ?
+            """,
+            (rotated_env["project_id"], rotated_event_id),
+        ).fetchone()
+        assert immutable_before_conflict is not None
+        assert (
+            json.loads(immutable_before_conflict["payload_json"])
+            == rotated_event_payload
+        )
+        assert (
+            rotated_event_payload["attempt"]["attempt_id"]
+            == rotated_checkpoint.attempt.attempt_id
+        )
+        assert len(parked_authority_b["turn"]) == 1
+        parked_turn_b = parked_authority_b["turn"][0]
+        assert parked_turn_b[0] == rotated_intent.turn_id
+        assert parked_turn_b[3] == "reconciling"
+        assert parked_turn_b[4] == claim_b.attempt_id
+        assert parked_authority_b["leases"] == ()
+
+        conflict_upper = (
+            rotated_env[
+                "guard"
+            ].operation_recovery_membership_upper_watermark()
+        )
+        assert conflict_upper is not None
+
+        class RecoveryEpochPort:
+            def __init__(self, lease_generation, fencing_token):
+                self.lease_generation = lease_generation
+                self.fencing_token = fencing_token
+                self.calls = []
+                self.original = None
+                self.after_mutation = None
+                self.caller_changes = None
+
+            def publication_state(self, observed):
+                assert rotated_env["conn"].in_transaction is False
+                assert observed == rotated_checkpoint
+                self.calls.append(observed)
+                self.original = mutate_rotated_b_epoch(
+                    self.lease_generation,
+                    self.fencing_token,
+                )
+                self.after_mutation = c10_authority_snapshot(rotated_env)
+                self.caller_changes = rotated_env["conn"].total_changes
+                return "published"
+
+        # The recovery path has no caller-supplied claim to reject.  Its
+        # fresh transaction must therefore relate immutable A to the B that
+        # the published callback just changed, and may never mint C.
+        for mutated_generation, mutated_fence in ((1, 1), (2, 1), (1, 2)):
+            before_recovery_mutation = c10_authority_snapshot(rotated_env)
+            recovery_port = RecoveryEpochPort(
+                mutated_generation,
+                mutated_fence,
+            )
+            recovery_trace = []
+            try:
+                rotated_env["conn"].set_trace_callback(recovery_trace.append)
+                no_c = rotated_env["guard"].recover_pending_operations(
+                    RotatedNoReadback(),
+                    recovery_port,
+                    worker_id="c10-rotated-no-c",
+                    lease_seconds=30,
+                    dispatcher_lease=rotated_core,
+                    max_claims=1,
+                    after=None,
+                    through_membership_sequence=conflict_upper,
+                    limit=1,
+                )
+                assert no_c.starts == ()
+                assert recovery_port.calls == [rotated_checkpoint]
+                assert c10_authority_snapshot(rotated_env) == recovery_port.after_mutation
+                assert rotated_env["conn"].total_changes == recovery_port.caller_changes
+                assert dml_categories(recovery_trace) == ()
+                assert rotated_env["conn"].in_transaction is False
+            finally:
+                rotated_env["conn"].set_trace_callback(None)
+                if recovery_port.original is not None:
+                    restore_rotated_b_epoch(recovery_port.original)
+            assert c10_authority_snapshot(rotated_env) == before_recovery_mutation
+
+        permanent_after_rotation = RotatedCheckpointPort(
+            "permanent_conflict"
+        )
+        conflict_no_readback = RotatedNoReadback()
+        before_rotated_block = c10_authority_snapshot(rotated_env)
+        rotated_block_trace = []
+        rotated_env["conn"].set_trace_callback(
+            rotated_block_trace.append
+        )
+        try:
+            rotated_block = (
+                rotated_env["guard"].recover_pending_operations(
+                    conflict_no_readback,
+                    permanent_after_rotation,
+                    worker_id="c10-rotated-conflict",
+                    lease_seconds=30,
+                    dispatcher_lease=rotated_core,
+                    max_claims=1,
+                    after=None,
+                    through_membership_sequence=conflict_upper,
+                    limit=1,
+                )
+            )
+        finally:
+            rotated_env["conn"].set_trace_callback(None)
+        assert rotated_block.starts == ()
+        assert conflict_no_readback.calls == []
+        assert permanent_after_rotation.calls == [rotated_checkpoint]
+        after_rotated_block = c10_authority_snapshot(rotated_env)
+        rotated_operation = after_rotated_block["operations"][0]
+        assert rotated_operation[4] == "blocked"
+        assert rotated_operation[12] == "approval_checkpoint_conflict"
+        assert rotated_operation[8:11] == (
+            claim_b.attempt_id,
+            claim_b.lease_generation,
+            claim_b.fencing_token,
+        )
+        assert rotated_operation[13] == rotated_checkpoint.checkpoint_id
+        assert (
+            after_rotated_block["state"][0][3]
+            == before_rotated_block["state"][0][3] + 1
+        )
+        blocked_turn_b = after_rotated_block["turn"][0]
+        assert blocked_turn_b[3] == "reconciling"
+        assert blocked_turn_b[4:7] == (
+            claim_b.attempt_id,
+            claim_b.lease_generation,
+            claim_b.fencing_token,
+        )
+        assert blocked_turn_b[9]
+        rotated_block_events = tuple(
+            event
+            for event in after_rotated_block["events"]
+            if event[3] == "turn.recovery_blocked"
+        )
+        assert len(rotated_block_events) == 1
+        assert rotated_block_events[0][0] == blocked_turn_b[9]
+        assert (
+            tuple(
+                event[3]
+                for event in after_rotated_block["events"][
+                    len(before_rotated_block["events"]):
+                ]
+            )
+            == ("turn.recovery_blocked",)
+        )
+        assert dml_categories(rotated_block_trace)
+        immutable_after_block = rotated_env["conn"].execute(
+            """
+            SELECT payload_json FROM project_events
+            WHERE project_id = ? AND event_id = ?
+            """,
+            (rotated_env["project_id"], rotated_event_id),
+        ).fetchone()
+        assert immutable_after_block is not None
+        assert (
+            json.loads(immutable_after_block["payload_json"])
+            == rotated_event_payload
+        )
+
+        rotated_replay_before = c10_authority_snapshot(rotated_env)
+        rotated_replay_changes = rotated_env["conn"].total_changes
+        rotated_replay_trace = []
+        rotated_env["conn"].set_trace_callback(
+            rotated_replay_trace.append
+        )
+        try:
+            rotated_replay = (
+                rotated_env["guard"].recover_pending_operations(
+                    conflict_no_readback,
+                    permanent_after_rotation,
+                    worker_id="c10-rotated-conflict",
+                    lease_seconds=30,
+                    dispatcher_lease=rotated_core,
+                    max_claims=1,
+                    after=None,
+                    through_membership_sequence=conflict_upper,
+                    limit=1,
+                )
+            )
+        finally:
+            rotated_env["conn"].set_trace_callback(None)
+        assert rotated_replay.starts == ()
+        assert conflict_no_readback.calls == []
+        assert permanent_after_rotation.calls == [rotated_checkpoint]
+        assert (
+            c10_authority_snapshot(rotated_env)
+            == rotated_replay_before
+        )
+        assert rotated_env["conn"].total_changes == rotated_replay_changes
+        assert dml_categories(rotated_replay_trace) == ()
+        assert rotated_env["conn"].in_transaction is False
+    finally:
+        rotated_env["conn"].close()
+
+
+def test_task7_c10_stale_or_superseded_checkpoint_cas_is_write_free_and_cannot_publish(
+    operation_env,
+    tmp_path,
+):
+    """A positive publication read is advisory until the fresh fenced CAS wins."""
+
+    def c10_authority_snapshot(env, *, connection=None):
+        connection = connection or env["conn"]
+        project_id = env["project_id"]
+        turn_id = env["turn"].turn_id
+
+        def rows(sql, parameters=()):
+            return tuple(
+                tuple(row)
+                for row in connection.execute(sql, parameters)
+            )
+
+        return {
+            "state": rows(
+                """
+                SELECT project_id, lifecycle, current_phase, version,
+                       conversation_root_id, conversation_tip_id,
+                       dispatch_membership_sequence,
+                       transcript_pending_batch_id,
+                       transcript_dispatch_block_key, updated_at
+                FROM project_runtime_state
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ),
+            "turn": rows(
+                """
+                SELECT turn_id, project_id, sequence, status, attempt_id,
+                       lease_generation, fencing_token, execution_state,
+                       terminal_result_id, recovery_block_key,
+                       transcript_applied_batch_id, updated_at
+                FROM project_turns
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (project_id, turn_id),
+            ),
+            "control": rows(
+                """
+                SELECT turn_id, project_id, control_state, control_version,
+                       attempt_id, claim_worker_id, claim_lease_expires_at,
+                       claim_canonical_session_id, updated_at
+                FROM project_run_controls
+                WHERE project_id = ? AND turn_id = ?
+                """,
+                (project_id, turn_id),
+            ),
+            "leases": rows(
+                """
+                SELECT lease_id, project_id, turn_id, worker_id,
+                       lease_generation, fencing_token, expires_at, updated_at
+                FROM project_worker_leases
+                WHERE project_id = ? AND turn_id = ?
+                ORDER BY lease_id
+                """,
+                (project_id, turn_id),
+            ),
+            "operations": rows(
+                """
+                SELECT operation_id, project_id, turn_id, approval_id,
+                       status, guard_revision, guard_validated,
+                       canonical_action, attempt_id, lease_generation,
+                       fencing_token, receipt_id, blocked_reason,
+                       approval_checkpoint_id, intent_event_id,
+                       recovery_membership_sequence, updated_at
+                FROM project_operations
+                WHERE project_id = ?
+                ORDER BY operation_id
+                """,
+                (project_id,),
+            ),
+            "approvals": rows(
+                """
+                SELECT approval_id, project_id, turn_id, operation_id,
+                       operation_maintenance_seq, status, resolved_at,
+                       resolved_by_actor_id, consumed_at
+                FROM project_approvals
+                WHERE project_id = ?
+                ORDER BY approval_id
+                """,
+                (project_id,),
+            ),
+            "events": rows(
+                """
+                SELECT event_id, project_id, sequence, kind, turn_id,
+                       payload_json, created_at
+                FROM project_events
+                WHERE project_id = ?
+                ORDER BY sequence, event_id
+                """,
+                (project_id,),
+            ),
+            "membership": rows(
+                """
+                SELECT lane, last_sequence
+                FROM project_runtime_membership_counters
+                ORDER BY lane
+                """
+            ),
+            "dispatcher": rows(
+                """
+                SELECT lease_name, instance_id, generation, fencing_token,
+                       expires_at, updated_at
+                FROM project_dispatcher_leases
+                ORDER BY lease_name
+                """
+            ),
+        }
+
+    def dml_categories(statements):
+        categories = []
+        for statement in statements:
+            words = statement.strip().split()
+            if not words:
+                continue
+            verb = words[0].upper()
+            if verb == "UPDATE" and len(words) > 1:
+                categories.append((verb, words[1].strip('"`[]').lower()))
+            elif verb in {"INSERT", "REPLACE"} and len(words) > 2:
+                categories.append(
+                    (verb, words[2].strip('"`[]').lower())
+                )
+            elif verb == "DELETE" and len(words) > 2:
+                categories.append(
+                    (verb, words[2].strip('"`[]').lower())
+                )
+        return tuple(categories)
+
+    _, intent, approval = _task7_c6_prepare_checkpointed_critical(operation_env)
+    immutable_checkpoint, _, _ = _task7_c6_checkpoint_identity(
+        operation_env["module"], operation_env, intent
+    )
+    operation_env["guard"].resolve_operation_approval(
+        approval.approval_id, operation_env["actor"], outcome="approved"
+    )
+    operation_env["now"][0] = 131
+    stale_core = operation_env["runtime"].acquire_dispatcher_lease(
+        "22222222-2222-4222-8222-222222222222", lease_seconds=30
+    )
+    assert stale_core is not None
+    upper = operation_env["guard"].operation_recovery_membership_upper_watermark()
+    assert upper is not None
+    before = c10_authority_snapshot(operation_env)
+    before_changes = operation_env["conn"].total_changes
+
+    class NoReadback:
+        def read_operation(self, request):
+            raise AssertionError("approved operation must not read back")
+
+    class SupersedingPublishedPort:
+        def __init__(self):
+            self.calls = []
+
+        def publication_state(self, checkpoint):
+            assert operation_env["conn"].in_transaction is False
+            self.calls.append(checkpoint)
+            assert checkpoint == immutable_checkpoint
+            writer = projects_db.connect(tmp_path / "guard.db")
+            try:
+                writer_runtime = importlib.import_module(
+                    "hermes_cli.project_runtime"
+                ).ProjectRuntime(writer, clock=lambda: 131)
+                replacement = writer_runtime.renew_dispatcher_lease(
+                    stale_core,
+                    lease_seconds=60,
+                )
+                assert replacement is not None
+            finally:
+                writer.close()
+            return "published"
+
+    port = SupersedingPublishedPort()
+    stale_trace = []
+    operation_env["conn"].set_trace_callback(stale_trace.append)
+    try:
+        result = operation_env["guard"].recover_pending_operations(
+            NoReadback(), port, worker_id="c10-stale", lease_seconds=30,
+            dispatcher_lease=stale_core, max_claims=1, after=None,
+            through_membership_sequence=upper, limit=1,
+        )
+    finally:
+        operation_env["conn"].set_trace_callback(None)
+    assert result.starts == ()
+    assert port.calls == [immutable_checkpoint]
+    after = c10_authority_snapshot(operation_env)
+    assert {
+        key: value
+        for key, value in after.items()
+        if key != "dispatcher"
+    } == {
+        key: value
+        for key, value in before.items()
+        if key != "dispatcher"
+    }
+    assert operation_env["conn"].total_changes == before_changes
+    assert dml_categories(stale_trace) == ()
+
+    # A second, domain-valid Projects writer may win the fresh CAS after the
+    # first caller's positive port read.  The first caller must add no write.
+    supersession_env = _build_operation_env(
+        tmp_path / "published-supersession",
+        started=True,
+    )
+    try:
+        (
+            _,
+            supersession_intent,
+            supersession_approval,
+        ) = _task7_c6_prepare_checkpointed_critical(
+            supersession_env,
+            operation_id="c10-supersession-operation",
+            approval_id="c10-supersession-approval",
+            checkpoint_id="55555555-5555-4555-8555-555555555555",
+        )
+        supersession_checkpoint, _, _ = _task7_c6_checkpoint_identity(
+            supersession_env["module"],
+            supersession_env,
+            supersession_intent,
+        )
+        supersession_env["guard"].resolve_operation_approval(
+            supersession_approval.approval_id,
+            supersession_env["actor"],
+            outcome="approved",
+        )
+        supersession_env["now"][0] = 131
+        supersession_core = (
+            supersession_env["runtime"].acquire_dispatcher_lease(
+                "66666666-6666-4666-8666-666666666666",
+                lease_seconds=30,
+            )
+        )
+        assert supersession_core is not None
+        supersession_upper = (
+            supersession_env[
+                "guard"
+            ].operation_recovery_membership_upper_watermark()
+        )
+        assert supersession_upper is not None
+        supersession_path = (
+            tmp_path / "published-supersession" / "guard.db"
+        )
+        supersession_start = []
+        supersession_winner_trace = []
+        supersession_winner_closed = []
+        authorized_after = []
+
+        class SupersessionPublishedPort:
+            def __init__(self):
+                self.calls = []
+
+            def publication_state(self, checkpoint):
+                assert supersession_env["conn"].in_transaction is False
+                assert checkpoint == supersession_checkpoint
+                self.calls.append(checkpoint)
+                winner_conn = projects_db.connect(supersession_path)
+                try:
+                    winner_runtime_module = importlib.import_module(
+                        "hermes_cli.project_runtime"
+                    )
+                    winner_guard_module = importlib.import_module(
+                        "hermes_cli.project_operations"
+                    )
+                    winner_runtime = (
+                        winner_runtime_module.ProjectRuntime(
+                            winner_conn,
+                            clock=lambda: 131,
+                        )
+                    )
+                    winner_guard = (
+                        winner_guard_module.ProjectOperationGuard(
+                            winner_runtime
+                        )
+                    )
+
+                    class WinnerPublishedPort:
+                        calls = []
+
+                        def publication_state(self, observed):
+                            assert winner_conn.in_transaction is False
+                            assert observed == supersession_checkpoint
+                            self.calls.append(observed)
+                            return "published"
+
+                    winner_port = WinnerPublishedPort()
+                    winner_conn.set_trace_callback(
+                        supersession_winner_trace.append
+                    )
+                    try:
+                        winner_result = (
+                            winner_guard.recover_pending_operations(
+                                NoReadback(),
+                                winner_port,
+                                worker_id="c10-supersession-winner",
+                                lease_seconds=30,
+                                dispatcher_lease=supersession_core,
+                                max_claims=1,
+                                after=None,
+                                through_membership_sequence=(
+                                    supersession_upper
+                                ),
+                                limit=1,
+                            )
+                        )
+                    finally:
+                        winner_conn.set_trace_callback(None)
+                    assert winner_port.calls == [supersession_checkpoint]
+                    assert len(winner_result.starts) == 1
+                    supersession_start.append(winner_result.starts[0])
+                    authorized_after.append(
+                        c10_authority_snapshot(
+                            supersession_env,
+                            connection=winner_conn,
+                        )
+                    )
+                finally:
+                    winner_conn.close()
+                    supersession_winner_closed.append(True)
+                return "published"
+
+        supersession_port = SupersessionPublishedPort()
+        supersession_before_changes = (
+            supersession_env["conn"].total_changes
+        )
+        supersession_loser_trace = []
+        supersession_env["conn"].set_trace_callback(
+            supersession_loser_trace.append
+        )
+        try:
+            supersession_result = (
+                supersession_env[
+                    "guard"
+                ].recover_pending_operations(
+                    NoReadback(),
+                    supersession_port,
+                    worker_id="c10-supersession-loser",
+                    lease_seconds=30,
+                    dispatcher_lease=supersession_core,
+                    max_claims=1,
+                    after=None,
+                    through_membership_sequence=supersession_upper,
+                    limit=1,
+                )
+            )
+        finally:
+            supersession_env["conn"].set_trace_callback(None)
+        assert supersession_result.starts == ()
+        assert supersession_port.calls == [supersession_checkpoint]
+        assert len(supersession_start) == 1
+        assert supersession_start[0].claim.attempt_id != (
+            supersession_checkpoint.attempt.attempt_id
+        )
+        assert supersession_winner_closed == [True]
+        assert dml_categories(supersession_winner_trace)
+        assert dml_categories(supersession_loser_trace) == ()
+        assert (
+            supersession_env["conn"].total_changes
+            == supersession_before_changes
+        )
+        assert c10_authority_snapshot(
+            supersession_env
+        ) == authorized_after[0]
+        superseded_authority = supersession_env["conn"].execute(
+            """
+            SELECT o.attempt_id, o.lease_generation, o.fencing_token,
+                   t.attempt_id, t.lease_generation, t.fencing_token,
+                   c.attempt_id, c.claim_worker_id
+            FROM project_operations AS o
+            JOIN project_turns AS t
+              ON t.project_id = o.project_id
+             AND t.turn_id = o.turn_id
+            JOIN project_run_controls AS c
+              ON c.project_id = o.project_id
+             AND c.turn_id = o.turn_id
+            WHERE o.project_id = ? AND o.operation_id = ?
+            """,
+            (
+                supersession_env["project_id"],
+                supersession_intent.operation_id,
+            ),
+        ).fetchone()
+        winner_claim = supersession_start[0].claim
+        assert tuple(superseded_authority) == (
+            winner_claim.attempt_id,
+            winner_claim.lease_generation,
+            winner_claim.fencing_token,
+            winner_claim.attempt_id,
+            winner_claim.lease_generation,
+            winner_claim.fencing_token,
+            winner_claim.attempt_id,
+            winner_claim.worker_id,
+        )
+        immutable_payload = supersession_env["conn"].execute(
+            """
+            SELECT e.payload_json
+            FROM project_operations AS o
+            JOIN project_events AS e
+              ON e.project_id = o.project_id
+             AND e.event_id = o.intent_event_id
+            WHERE o.project_id = ? AND o.operation_id = ?
+            """,
+            (
+                supersession_env["project_id"],
+                supersession_intent.operation_id,
+            ),
+        ).fetchone()
+        assert immutable_payload is not None
+        assert (
+            json.loads(immutable_payload[0])["attempt"]["attempt_id"]
+            == supersession_checkpoint.attempt.attempt_id
+        )
+    finally:
+        supersession_env["conn"].close()
+
+    # Two independent recovery processes can both see immutable publication,
+    # but the fresh Projects CAS may mint at most one new attempt.
+    race_env = _build_operation_env(tmp_path / "published-race", started=True)
+    try:
+        _, race_intent, race_approval = _task7_c6_prepare_checkpointed_critical(
+            race_env,
+            operation_id="c10-race-operation",
+            approval_id="c10-race-approval",
+            checkpoint_id="33333333-3333-4333-8333-333333333333",
+        )
+        race_checkpoint, _, _ = _task7_c6_checkpoint_identity(
+            race_env["module"], race_env, race_intent
+        )
+        race_env["guard"].resolve_operation_approval(
+            race_approval.approval_id, race_env["actor"], outcome="approved"
+        )
+        race_env["now"][0] = 131
+        race_core = race_env["runtime"].acquire_dispatcher_lease(
+            "44444444-4444-4444-8444-444444444444", lease_seconds=30
+        )
+        assert race_core is not None
+        race_path = tmp_path / "published-race" / "guard.db"
+        race_before = c10_authority_snapshot(race_env)
+        port_barrier = threading.Barrier(2)
+
+        class ConcurrentPublishedPort:
+            def __init__(self):
+                self.calls = []
+                self.lock = threading.Lock()
+                self.records = {}
+
+            def publication_state(self, checkpoint):
+                thread_id = threading.get_ident()
+                with self.lock:
+                    record = self.records[thread_id]
+                    assert record["thread_id"] == thread_id
+                    assert record["connection"].in_transaction is False
+                    record["events"].append(
+                        ("port", record["connection"].in_transaction)
+                    )
+                    self.calls.append((checkpoint, thread_id))
+                try:
+                    port_barrier.wait(timeout=10)
+                except threading.BrokenBarrierError as exc:
+                    raise AssertionError("both recovery readers must reach publication") from exc
+                return "published"
+
+        class RaceNoReadback:
+            def read_operation(self, request):
+                raise AssertionError("approved operation must not read back")
+
+        published_port = ConcurrentPublishedPort()
+
+        def recover_from_fresh_connection(worker_id):
+            fresh = projects_db.connect(race_path)
+            thread_id = threading.get_ident()
+            trace = []
+            record = {
+                "worker_id": worker_id,
+                "connection": fresh,
+                "thread_id": thread_id,
+                "before_changes": fresh.total_changes,
+                "after_changes": None,
+                "dml": None,
+                "events": [("opened", thread_id)],
+                "closed": False,
+                "snapshot": None,
+            }
+            with published_port.lock:
+                assert thread_id not in published_port.records
+                published_port.records[thread_id] = record
+            try:
+                runtime_module = importlib.import_module("hermes_cli.project_runtime")
+                guard_module = importlib.import_module("hermes_cli.project_operations")
+                runtime = runtime_module.ProjectRuntime(fresh, clock=lambda: 131)
+                guard = guard_module.ProjectOperationGuard(runtime)
+                upper = guard.operation_recovery_membership_upper_watermark()
+                assert upper is not None
+                fresh.set_trace_callback(trace.append)
+                try:
+                    result = guard.recover_pending_operations(
+                        RaceNoReadback(), published_port, worker_id=worker_id,
+                        lease_seconds=30, dispatcher_lease=race_core, max_claims=1,
+                        after=None, through_membership_sequence=upper, limit=1,
+                    )
+                finally:
+                    fresh.set_trace_callback(None)
+                record["after_changes"] = fresh.total_changes
+                record["dml"] = dml_categories(trace)
+                record["snapshot"] = c10_authority_snapshot(
+                    race_env,
+                    connection=fresh,
+                )
+                return worker_id, result
+            finally:
+                fresh.close()
+                record["closed"] = True
+                record["events"].append(("closed", thread_id))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            worker_results = list(pool.map(
+                recover_from_fresh_connection, ("c10-race-a", "c10-race-b")
+            ))
+        assert [call[0] for call in published_port.calls] == [
+            race_checkpoint,
+            race_checkpoint,
+        ]
+        records = tuple(published_port.records.values())
+        assert len(records) == 2
+        assert len({record["thread_id"] for record in records}) == 2
+        assert len({id(record["connection"]) for record in records}) == 2
+        assert all(record["closed"] for record in records)
+        assert all(
+            record["events"]
+            == [
+                ("opened", record["thread_id"]),
+                ("port", False),
+                ("closed", record["thread_id"]),
+            ]
+            for record in records
+        )
+
+        results_by_worker = dict(worker_results)
+        winners = tuple(
+            record
+            for record in records
+            if results_by_worker[record["worker_id"]].starts
+        )
+        losers = tuple(
+            record
+            for record in records
+            if not results_by_worker[record["worker_id"]].starts
+        )
+        assert len(winners) == 1
+        assert len(losers) == 1
+        winner = winners[0]
+        loser = losers[0]
+        winner_result = results_by_worker[winner["worker_id"]]
+        assert len(winner_result.starts) == 1
+        winner_start = winner_result.starts[0]
+        assert (
+            winner_start.claim.attempt_id
+            != race_checkpoint.attempt.attempt_id
+        )
+        assert (
+            winner_start.claim.lease_generation
+            == race_checkpoint.attempt.lease_generation + 1
+        )
+        assert (
+            winner_start.claim.fencing_token
+            == race_checkpoint.attempt.fencing_token + 1
+        )
+        assert winner["after_changes"] > winner["before_changes"]
+        assert winner["dml"]
+        assert loser["after_changes"] == loser["before_changes"]
+        assert loser["dml"] == ()
+
+        race_after = c10_authority_snapshot(race_env)
+        assert race_after == winner["snapshot"]
+        assert (
+            race_after["state"][0][3]
+            == race_before["state"][0][3] + 1
+        )
+        new_events = race_after["events"][
+            len(race_before["events"]):
+        ]
+        assert tuple(event[3] for event in new_events) == (
+            "operation.rehydrated",
+            "turn.claimed",
+        )
+        assert not any(
+            event[3] == "operation.effect_started"
+            for event in race_after["events"]
+        )
+        final_operation = race_after["operations"][0]
+        assert final_operation[8:11] == (
+            winner_start.claim.attempt_id,
+            winner_start.claim.lease_generation,
+            winner_start.claim.fencing_token,
+        )
+        assert final_operation[13] == race_checkpoint.checkpoint_id
+    finally:
+        race_env["conn"].close()
+
+    snapshot_race_env = _build_operation_env(
+        tmp_path / "checkpoint-snapshot-race",
+        started=True,
+    )
+    snapshot_resolver = None
+    try:
+        snapshot_module = snapshot_race_env["module"]
+        runtime_module = importlib.import_module(
+            "hermes_cli.project_runtime"
+        )
+        operation_module = importlib.import_module(
+            "hermes_cli.project_operations"
+        )
+        snapshot_operation_id = "c10-snapshot-race-operation"
+        snapshot_approval_id = "c10-snapshot-race-approval"
+        snapshot_checkpoint_id = (
+            "99999999-9999-4999-8999-999999999999"
+        )
+        snapshot_claim = snapshot_race_env["claim"]
+        snapshot_checkpoint = (
+            snapshot_module.ApprovalCheckpointIdentity(
+                snapshot_checkpoint_id,
+                runtime_module.TurnAttemptIdentity(
+                    snapshot_claim.project_id,
+                    snapshot_claim.turn_id,
+                    snapshot_claim.sequence,
+                    snapshot_claim.worker_id,
+                    snapshot_claim.attempt_id,
+                    snapshot_claim.lease_generation,
+                    snapshot_claim.fencing_token,
+                    snapshot_claim.canonical_session_id,
+                    snapshot_claim.lease_expires_at,
+                ),
+                snapshot_operation_id,
+                snapshot_approval_id,
+            )
+        )
+        snapshot_path = (
+            tmp_path
+            / "checkpoint-snapshot-race"
+            / "guard.db"
+        )
+        assert (
+            snapshot_race_env["conn"].execute(
+                "PRAGMA journal_mode"
+            ).fetchone()[0]
+            == "wal"
+        )
+        assert c10_authority_snapshot(
+            snapshot_race_env
+        )["operations"] == ()
+        writer_before_changes = snapshot_race_env[
+            "conn"
+        ].total_changes
+        writer_trace = []
+        writer_results = []
+        absent_reads = []
+        resolver_call_active = [False]
+        authority_fetch_transactions = []
+        resolver_key = (
+            snapshot_race_env["project_id"],
+            snapshot_operation_id,
+        )
+
+        def commit_matching_checkpoint():
+            snapshot_race_env["conn"].set_trace_callback(
+                writer_trace.append
+            )
+            try:
+                writer_results.append(
+                    _task7_c6_prepare_checkpointed_critical(
+                        snapshot_race_env,
+                        operation_id=snapshot_operation_id,
+                        approval_id=snapshot_approval_id,
+                        checkpoint_id=snapshot_checkpoint_id,
+                    )
+                )
+            finally:
+                snapshot_race_env["conn"].set_trace_callback(
+                    None
+                )
+            assert snapshot_race_env["conn"].in_transaction is False
+
+        class SnapshotRaceCursor(sqlite3.Cursor):
+            def execute(self, statement, parameters=(), /):
+                self._first_operation_lookup = (
+                    not absent_reads
+                    and tuple(parameters) == resolver_key
+                )
+                return super().execute(statement, parameters)
+
+            def _record_authority_fetch(self):
+                if resolver_call_active[0]:
+                    authority_fetch_transactions.append(
+                        snapshot_resolver.in_transaction
+                    )
+
+            def fetchone(self):
+                row = super().fetchone()
+                self._record_authority_fetch()
+                if getattr(
+                    self,
+                    "_first_operation_lookup",
+                    False,
+                ):
+                    self._first_operation_lookup = False
+                    assert row is None
+                    absent_reads.append(
+                        snapshot_resolver.in_transaction
+                    )
+                    commit_matching_checkpoint()
+                return row
+
+            def fetchmany(self, size=None):
+                rows = (
+                    super().fetchmany()
+                    if size is None
+                    else super().fetchmany(size)
+                )
+                self._record_authority_fetch()
+                return rows
+
+            def fetchall(self):
+                rows = super().fetchall()
+                self._record_authority_fetch()
+                return rows
+
+            def __next__(self):
+                row = super().__next__()
+                self._record_authority_fetch()
+                return row
+
+        class SnapshotRaceConnection(sqlite3.Connection):
+            def cursor(self, *args, **kwargs):
+                kwargs.setdefault("factory", SnapshotRaceCursor)
+                return super().cursor(*args, **kwargs)
+
+            def execute(self, statement, parameters=(), /):
+                return self.cursor().execute(
+                    statement,
+                    parameters,
+                )
+
+        snapshot_resolver = sqlite3.connect(
+            str(snapshot_path),
+            factory=SnapshotRaceConnection,
+        )
+        snapshot_resolver.row_factory = sqlite3.Row
+        snapshot_resolver.execute("PRAGMA foreign_keys=ON")
+        assert (
+            snapshot_resolver.execute(
+                "PRAGMA journal_mode=WAL"
+            ).fetchone()[0]
+            == "wal"
+        )
+        resolver_runtime = runtime_module.ProjectRuntime(
+            snapshot_resolver,
+            clock=lambda: 100,
+        )
+        resolver_guard = operation_module.ProjectOperationGuard(
+            resolver_runtime
+        )
+        resolver_before_changes = snapshot_resolver.total_changes
+        resolver_trace = []
+        resolver_decision = None
+        resolver_error = None
+        snapshot_resolver.set_trace_callback(
+            resolver_trace.append
+        )
+        resolver_call_active[0] = True
+        try:
+            resolver_decision = (
+                resolver_guard.resolve_approval_checkpoint(
+                    snapshot_checkpoint
+                )
+            )
+        except Exception as exc:
+            resolver_error = exc
+        finally:
+            resolver_call_active[0] = False
+            snapshot_resolver.set_trace_callback(None)
+
+        assert absent_reads == [True]
+        assert authority_fetch_transactions
+        assert all(
+            in_transaction is True
+            for in_transaction in authority_fetch_transactions
+        )
+        transaction_controls = tuple(
+            statement.lstrip().split(None, 1)[0].rstrip(";").upper()
+            for statement in resolver_trace
+            if statement.strip()
+            and statement.lstrip().split(None, 1)[0]
+            .rstrip(";")
+            .upper()
+            in {
+                "BEGIN",
+                "COMMIT",
+                "END",
+                "ROLLBACK",
+                "SAVEPOINT",
+                "RELEASE",
+            }
+        )
+        assert transaction_controls == ("BEGIN", "COMMIT")
+        assert len(writer_results) == 1
+        writer_prepared, writer_intent, writer_approval = (
+            writer_results[0]
+        )
+        assert writer_prepared.status == "awaiting_approval"
+        assert writer_intent.operation_id == snapshot_operation_id
+        assert writer_approval.approval_id == snapshot_approval_id
+        assert (
+            snapshot_race_env["conn"].total_changes
+            > writer_before_changes
+        )
+        assert dml_categories(writer_trace)
+        assert (
+            snapshot_resolver.total_changes
+            == resolver_before_changes
+        )
+        assert dml_categories(resolver_trace) == ()
+        assert snapshot_resolver.in_transaction is False
+        assert snapshot_race_env["conn"].in_transaction is False
+        stored_checkpoint, _, _ = _task7_c6_checkpoint_identity(
+            snapshot_module,
+            snapshot_race_env,
+            writer_intent,
+        )
+        assert stored_checkpoint == snapshot_checkpoint
+        if resolver_error is not None:
+            raise resolver_error
+        assert resolver_decision == (
+            snapshot_module.ApprovalCheckpointDecision("wait")
+        )
+    finally:
+        if snapshot_resolver is not None:
+            snapshot_resolver.close()
+        snapshot_race_env["conn"].close()

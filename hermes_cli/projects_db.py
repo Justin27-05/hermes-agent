@@ -36,6 +36,60 @@ from typing import Iterable, List, Optional
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
 from hermes_constants import get_hermes_home
 
+PROJECT_MANAGED_DELETE_FORBIDDEN = "PROJECT_MANAGED_DELETE_FORBIDDEN"
+PROJECT_MANAGED_ARCHIVE_REQUIRES_COMPLETION = (
+    "PROJECT_MANAGED_ARCHIVE_REQUIRES_COMPLETION"
+)
+PROJECT_MANAGED_MUTATION_REQUIRES_COMMAND = (
+    "PROJECT_MANAGED_MUTATION_REQUIRES_COMMAND"
+)
+MANAGED_PROJECT_RUNTIME_TABLES = (
+    "project_contracts",
+    "project_runtime_state",
+    "project_conversations",
+    "project_surface_bindings",
+    "project_surface_principals",
+    "project_turns",
+    "project_run_controls",
+    "project_events",
+    "project_deliveries",
+    "project_approvals",
+    "project_artifacts",
+    "project_operations",
+    "project_worker_leases",
+)
+
+
+class ManagedProjectDeleteError(RuntimeError):
+    """A canonical project with durable runtime evidence cannot be erased."""
+
+    code = PROJECT_MANAGED_DELETE_FORBIDDEN
+
+    def __init__(self, project_id: str) -> None:
+        super().__init__(PROJECT_MANAGED_DELETE_FORBIDDEN)
+        self.project_id = project_id
+
+
+class ManagedProjectArchiveError(RuntimeError):
+    """Managed work must complete before its catalog entry is hidden."""
+
+    code = PROJECT_MANAGED_ARCHIVE_REQUIRES_COMPLETION
+
+    def __init__(self, project_id: str) -> None:
+        super().__init__(PROJECT_MANAGED_ARCHIVE_REQUIRES_COMPLETION)
+        self.project_id = project_id
+
+
+class ManagedProjectMutationError(RuntimeError):
+    """Managed catalog names change only through the canonical command port."""
+
+    code = PROJECT_MANAGED_MUTATION_REQUIRES_COMMAND
+
+    def __init__(self, project_id: str) -> None:
+        super().__init__(PROJECT_MANAGED_MUTATION_REQUIRES_COMMAND)
+        self.project_id = project_id
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -379,6 +433,7 @@ def create_project(
     conn: sqlite3.Connection,
     *,
     name: str,
+    project_id: Optional[str] = None,
     slug: Optional[str] = None,
     folders: Optional[Iterable[str]] = None,
     primary_path: Optional[str] = None,
@@ -386,6 +441,7 @@ def create_project(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     board_slug: Optional[str] = None,
+    caller_owns_transaction: bool = False,
 ) -> str:
     """Create a project and return its id.
 
@@ -398,7 +454,11 @@ def create_project(
         raise ValueError("project name must not be empty")
 
     slug_candidate = normalize_slug(slug) if slug else _slugify(name)
-    pid = _new_project_id()
+    if project_id is not None and (
+        type(project_id) is not str or not project_id
+    ):
+        raise ValueError("project_id must be a non-empty string")
+    pid = project_id or _new_project_id()
     now = _now()
 
     folder_paths: List[str] = []
@@ -413,7 +473,14 @@ def create_project(
     if primary is None and folder_paths:
         primary = folder_paths[0]
 
-    with write_txn(conn):
+    if caller_owns_transaction and not conn.in_transaction:
+        raise RuntimeError("caller-owned project transaction is not active")
+    transaction = (
+        contextlib.nullcontext(conn)
+        if caller_owns_transaction
+        else write_txn(conn)
+    )
+    with transaction:
         unique = _unique_slug(conn, slug_candidate)
         conn.execute(
             "INSERT INTO projects "
@@ -478,6 +545,7 @@ def update_project(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     board_slug: Optional[str] = None,
+    caller_owns_transaction: bool = False,
 ) -> bool:
     """Patch top-level project fields. Only provided fields change.
 
@@ -508,7 +576,20 @@ def update_project(
     if not sets:
         return False
     params.append(project_id)
-    with write_txn(conn):
+    if caller_owns_transaction and not conn.in_transaction:
+        raise RuntimeError("caller-owned project transaction is not active")
+    transaction = (
+        contextlib.nullcontext(conn)
+        if caller_owns_transaction
+        else write_txn(conn)
+    )
+    with transaction:
+        if (
+            name is not None
+            and not caller_owns_transaction
+            and project_is_managed(conn, project_id)
+        ):
+            raise ManagedProjectMutationError(project_id)
         cur = conn.execute(
             f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
         )
@@ -623,8 +704,41 @@ def set_primary(conn: sqlite3.Connection, project_id: str, path: str) -> bool:
     return True
 
 
+def project_is_managed(
+    conn: sqlite3.Connection, project_id: str
+) -> bool:
+    """Return the exact durable evidence used by the hard-delete guard."""
+    if type(project_id) is not str or not project_id:
+        raise ValueError("project_id must be a non-empty string")
+    union = " UNION ALL ".join(
+        f"SELECT project_id FROM {table} WHERE project_id = ?"
+        for table in MANAGED_PROJECT_RUNTIME_TABLES
+    )
+    return conn.execute(
+        f"SELECT 1 FROM ({union}) LIMIT 1",
+        (project_id,) * len(MANAGED_PROJECT_RUNTIME_TABLES),
+    ).fetchone() is not None
+
+
 def archive_project(conn: sqlite3.Connection, project_id: str) -> bool:
+    if type(project_id) is not str or not project_id:
+        raise ValueError("project_id must be a non-empty string")
     with write_txn(conn):
+        state = conn.execute(
+            """
+            SELECT lifecycle FROM project_runtime_state
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+        if (
+            state is not None
+            and state["lifecycle"] != "completed"
+        ) or (
+            state is None
+            and project_is_managed(conn, project_id)
+        ):
+            raise ManagedProjectArchiveError(project_id)
         cur = conn.execute(
             "UPDATE projects SET archived = 1 WHERE id = ?", (project_id,)
         )
@@ -640,8 +754,16 @@ def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:
 
 
 def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
-    """Hard-delete a project and its folders (cascade)."""
+    """Hard-delete only a project that has never entered managed runtime."""
+    if type(project_id) is not str or not project_id:
+        raise ValueError("project_id must be a non-empty string")
     with write_txn(conn):
+        if project_is_managed(conn, project_id):
+            raise ManagedProjectDeleteError(project_id)
+        conn.execute(
+            "DELETE FROM project_meta WHERE key = ? AND value = ?",
+            ("active_id", project_id),
+        )
         cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     return cur.rowcount > 0
 

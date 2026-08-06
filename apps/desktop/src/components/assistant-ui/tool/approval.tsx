@@ -21,6 +21,13 @@ import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import {
+  type ManagedProjectApproval,
+  managedProjectApprovalAction,
+  managedProjectApprovalForSurface,
+  resolveManagedProjectApproval,
+  retryManagedProjectApproval
+} from '@/store/project-approval'
+import {
   type ApprovalRequest,
   clearApprovalRequest,
   registerApprovalInlineAnchor,
@@ -51,9 +58,26 @@ type ApprovalChoice = 'once' | 'session' | 'always' | 'deny'
 export const PendingToolApproval: FC<{ part: ToolPart }> = ({ part }) => {
   // The tool row lives in whichever session's transcript rendered it — read
   // THAT session's approval (works for the primary and every tile).
-  const sessionId = useStore(useSessionView().$runtimeId)
-  const $request = useMemo(() => sessionApprovalRequest(sessionId), [sessionId])
+  const view = useSessionView()
+  const runtimeSessionId = useStore(view.$runtimeId)
+  const storedSessionId = useStore(view.$storedId)
+
+  const $managedApproval = useMemo(
+    () => managedProjectApprovalForSurface(runtimeSessionId, storedSessionId),
+    [runtimeSessionId, storedSessionId]
+  )
+
+  const $request = useMemo(() => sessionApprovalRequest(runtimeSessionId), [runtimeSessionId])
+  const managedApproval = useStore($managedApproval)
   const request = useStore($request)
+
+  if (managedApproval.managed) {
+    if (!managedApproval.approval || !APPROVAL_TOOLS.has(part.toolName)) {
+      return null
+    }
+
+    return <InlineManagedApprovalBar approval={managedApproval.approval} />
+  }
 
   if (!request || !APPROVAL_TOOLS.has(part.toolName)) {
     return null
@@ -68,13 +92,55 @@ const InlineApprovalBar: FC<{ request: ApprovalRequest }> = ({ request }) => {
   return <ApprovalBar request={request} surface="inline" />
 }
 
+const InlineManagedApprovalBar: FC<{ approval: ManagedProjectApproval }> = ({ approval }) => {
+  useEffect(() => registerApprovalInlineAnchor(approval.sessionId), [approval.sessionId])
+
+  return <ManagedApprovalBar approval={approval} surface="inline" />
+}
+
 export const PendingApprovalFallback: FC = () => {
   const { t } = useI18n()
-  const sessionId = useStore(useSessionView().$runtimeId)
-  const $request = useMemo(() => sessionApprovalRequest(sessionId), [sessionId])
-  const $inlineVisible = useMemo(() => sessionApprovalInlineVisible(sessionId), [sessionId])
+  const view = useSessionView()
+  const runtimeSessionId = useStore(view.$runtimeId)
+  const storedSessionId = useStore(view.$storedId)
+
+  const $managedApproval = useMemo(
+    () => managedProjectApprovalForSurface(runtimeSessionId, storedSessionId),
+    [runtimeSessionId, storedSessionId]
+  )
+
+  const $request = useMemo(() => sessionApprovalRequest(runtimeSessionId), [runtimeSessionId])
+  const managedApproval = useStore($managedApproval)
   const request = useStore($request)
+
+  const inlineSessionId = managedApproval.managed
+    ? (managedApproval.approval?.sessionId ?? storedSessionId)
+    : runtimeSessionId
+
+  const $inlineVisible = useMemo(() => sessionApprovalInlineVisible(inlineSessionId), [inlineSessionId])
   const inlineVisible = useStore($inlineVisible)
+
+  if (managedApproval.managed) {
+    if (!managedApproval.approval || inlineVisible) {
+      return null
+    }
+
+    return (
+      <div
+        className="pointer-events-none absolute left-1/2 z-30 w-[calc(100%-2rem)] max-w-2xl -translate-x-1/2"
+        data-slot="tool-approval-fallback"
+        style={{ bottom: 'calc(var(--composer-measured-height) + var(--status-stack-measured-height) + 0.875rem)' }}
+      >
+        <div className="pointer-events-auto rounded-xl border border-primary/30 bg-(--ui-chat-surface-background) px-3 py-2 shadow-lg backdrop-blur-xl [-webkit-backdrop-filter:blur(1rem)]">
+          <div className="flex min-w-0 items-center gap-2 text-sm text-primary">
+            <AlertCircle className="size-4 shrink-0" />
+            <span className="shrink-0 font-medium">{t.assistant.approval.jumpToApproval}</span>
+          </div>
+          <ManagedApprovalBar approval={managedApproval.approval} surface="floating" />
+        </div>
+      </div>
+    )
+  }
 
   if (!request || inlineVisible) {
     return null
@@ -101,6 +167,135 @@ export const PendingApprovalFallback: FC = () => {
 }
 
 const isMac = typeof navigator !== 'undefined' && /Mac|iP(hone|ad|od)/.test(navigator.platform)
+
+const ManagedApprovalBar: FC<{
+  approval: ManagedProjectApproval
+  surface: 'floating' | 'inline'
+}> = ({ approval, surface }) => {
+  const { t } = useI18n()
+  const copy = t.assistant.approval
+
+  const $action = useMemo(() => managedProjectApprovalAction(approval), [approval])
+
+  const action = useStore($action)
+  const busy = action.status === 'submitting'
+  const locked = busy || action.status === 'conflict' || action.status === 'retry_required'
+
+  const respond = useCallback(
+    async (outcome: 'approved' | 'denied') => {
+      if (locked) {
+        return
+      }
+
+      try {
+        const result = await resolveManagedProjectApproval(approval, outcome)
+
+        if (result.status === 'succeeded') {
+          triggerHaptic(outcome === 'denied' ? 'cancel' : 'submit')
+        }
+      } catch (error) {
+        notifyError(error, copy.sendFailed)
+      }
+    },
+    [approval, copy.sendFailed, locked]
+  )
+
+  const retry = useCallback(async () => {
+    if (action.status !== 'retry_required') {
+      return
+    }
+
+    const requestedOutcome = action.outcome
+
+    try {
+      const result = await retryManagedProjectApproval(approval)
+
+      if (result.status === 'succeeded') {
+        triggerHaptic(requestedOutcome === 'denied' ? 'cancel' : 'submit')
+      }
+    } catch (error) {
+      notifyError(error, copy.sendFailed)
+    }
+  }, [action, approval, copy.sendFailed])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault()
+        void respond('approved')
+      } else if (event.key === 'Escape') {
+        event.preventDefault()
+        void respond('denied')
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown, true)
+
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [respond])
+
+  return (
+    <div
+      className={cn(surface === 'inline' ? 'mt-1 ps-5' : 'mt-2')}
+      data-slot={surface === 'inline' ? 'tool-approval-inline' : 'tool-approval-actions'}
+    >
+      {action.status === 'retry_required' ? (
+        <div className="flex items-center gap-2.5">
+          <div className="text-xs text-(--ui-text-tertiary)" role="status">
+            {copy.sendFailed}
+          </div>
+          <Button onClick={() => void retry()} size="xs" variant="ghost">
+            {t.common.retry}
+          </Button>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2.5">
+          <div className="inline-flex h-6 items-stretch overflow-hidden rounded-md border border-primary/25 bg-primary/10 text-primary">
+            <Button
+              className="h-full gap-1 rounded-none px-2 text-xs font-medium text-primary hover:bg-primary/15 hover:text-primary"
+              disabled={locked}
+              onClick={() => void respond('approved')}
+              size="xs"
+              variant="ghost"
+            >
+              {action.status === 'submitting' && action.outcome === 'approved' ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                copy.run
+              )}
+              {!(action.status === 'submitting' && action.outcome === 'approved') && (
+                <span className="text-[0.625rem] text-primary/60">{isMac ? '⌘⏎' : 'Ctrl⏎'}</span>
+              )}
+            </Button>
+          </div>
+
+          <Button
+            className="h-6 gap-1.5 rounded-md px-1.5 text-xs font-normal text-(--ui-text-tertiary) hover:text-foreground"
+            disabled={locked}
+            onClick={() => void respond('denied')}
+            size="xs"
+            variant="ghost"
+          >
+            {action.status === 'submitting' && action.outcome === 'denied' ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              copy.reject
+            )}
+            {!(action.status === 'submitting' && action.outcome === 'denied') && (
+              <span className="text-[0.625rem] opacity-55">Esc</span>
+            )}
+          </Button>
+        </div>
+      )}
+
+      {(action.status === 'conflict' || action.status === 'failed') && (
+        <div className="mt-1.5 text-xs text-(--ui-text-tertiary)" role="status">
+          {copy.sendFailed}
+        </div>
+      )}
+    </div>
+  )
+}
 
 const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline' }> = ({ request, surface }) => {
   const { t } = useI18n()

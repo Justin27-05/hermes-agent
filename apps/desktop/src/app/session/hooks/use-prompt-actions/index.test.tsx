@@ -4576,6 +4576,61 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
     })
   })
 
+  it('still delivers the first message when a frozen draft authority is present and create legitimately re-homes the refs', async () => {
+    // Positive lock for the C2 guard: a legit first-send WITH a frozen
+    // legacyDraftAuthority must still succeed. createBackendSessionForSend
+    // re-homes the refs AFTER the guard point, so submitText reconstructs
+    // null targets at start and the guard must not reject it.
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    let routeToken = '/'
+
+    setPrimaryGateway({ request: vi.fn() } as never, 'default')
+    const legacyDraftAuthority = captureFrozenLegacyDraftAuthority()
+    expect(legacyDraftAuthority).not.toBeNull()
+
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      return {} as never
+    })
+
+    const createBackendSessionForSend = vi.fn(async () => {
+      activeSessionIdRef.current = 'rt-new-chat'
+      selectedStoredSessionIdRef.current = 'stored-new-chat'
+      routeToken = '/stored-new-chat'
+
+      return 'rt-new-chat'
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        getRouteToken={() => routeToken}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    expect(
+      await handle!.submitTextRaw('first message with frozen draft authority', {
+        legacyDraftAuthority: legacyDraftAuthority!
+      })
+    ).toBe(true)
+    expect(createBackendSessionForSend).toHaveBeenCalledTimes(1)
+    expect(calls.find(c => c.method === 'prompt.submit')?.params).toMatchObject({
+      session_id: 'rt-new-chat'
+    })
+  })
+
   it('does not publish submit success after fresh-draftauthority drifts while prompt.submit awaits', async () => {
     const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }

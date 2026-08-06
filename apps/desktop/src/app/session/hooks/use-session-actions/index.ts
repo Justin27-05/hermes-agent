@@ -970,6 +970,20 @@ export function useSessionActions({
                 }
               }
 
+              // The runtime may have rebounded to a managed project surface
+              // (same canonical session) while the activate RPC / transcript
+              // prefetch was settling. Its warm cache is then owned by the
+              // managed branch — a stale legacy paint would clobber it.
+              if (
+                resolveCurrentManagedProjectSurface(
+                  cachedRuntimeId,
+                  storedSessionId,
+                  stored
+                ).status !== 'conclusively-legacy'
+              ) {
+                return
+              }
+
               const activatedState = updateSessionState(
                 cachedRuntimeId,
                 state => ({
@@ -1183,6 +1197,20 @@ export function useSessionActions({
         const runtimeInfo = applyRuntimeInfo(resumed.info)
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
+
+        if (
+          resolveCurrentManagedProjectSurface(
+            resumed.session_id,
+            storedSessionId,
+            stored
+          ).status !== 'conclusively-legacy'
+        ) {
+          // The session rebound to a managed project surface while the resume
+          // RPC / transcript prefetch was in flight (same canonical session).
+          // The managed branch owns the view then; publishing this stale
+          // legacy projection would overwrite the managed transcript.
+          return
+        }
 
         updateSessionState(
           resumed.session_id,
@@ -1638,11 +1666,18 @@ export function useSessionActions({
           tiledRuntimeId === guardedTiledRuntimeId &&
           validateStoredSessionMutationAuthority(authority)
 
-        if (tileIdentityStillLegacy) {
+        // A same-R/C replacement may own the mapping now (e.g. the same
+        // conversation surfaced under another profile while this REST delete
+        // was in flight). The replacement's warm cache must survive.
+        const noReplacementRow = !$sessions
+          .get()
+          .some(session => sessionMatchesStoredId(session, storedSessionId))
+
+        if (tileIdentityStillLegacy && noReplacementRow) {
           closeSessionTile(storedSessionId)
         }
 
-        if (tileIdentityStillLegacy && tiledRuntimeId) {
+        if (tileIdentityStillLegacy && noReplacementRow && tiledRuntimeId) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
@@ -1750,11 +1785,18 @@ export function useSessionActions({
           tiledRuntimeId === guardedTiledRuntimeId &&
           resolveCurrentManagedProjectSurface(tiledRuntimeId, storedSessionId).status === 'conclusively-legacy'
 
-        if (tileIdentityStillLegacy) {
+        // A same-R/C replacement may own the mapping now (e.g. the same
+        // conversation surfaced under another profile while this REST archive
+        // was in flight). The replacement's warm cache must survive.
+        const noReplacementRow = !$sessions
+          .get()
+          .some(session => sessionMatchesStoredId(session, storedSessionId))
+
+        if (tileIdentityStillLegacy && noReplacementRow) {
           closeSessionTile(storedSessionId)
         }
 
-        if (tileIdentityStillLegacy && tiledRuntimeId) {
+        if (tileIdentityStillLegacy && noReplacementRow && tiledRuntimeId) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)

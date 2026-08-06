@@ -4521,6 +4521,61 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
     expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
   })
 
+  it('rejects a fresh-draft submit whose target retargets to a managed durable session while middleware awaited (C2)', async () => {
+    // A fresh draft (no session targets) froze legacyDraftAuthority. While the
+    // composer middleware awaited, the selected stored-session ref retargeted
+    // to durable session C, which is owned by a managed project surface. The
+    // frozen draft authority must bind target resolution too: submitText must
+    // not reconstruct the C targets and let the managed branch submit without
+    // validating the frozen authority.
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'rt-C' }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: 'stored-C' }
+    let routeToken = '/::'
+
+    setPrimaryGateway({ request: vi.fn() } as never, 'default')
+    const legacyDraftAuthority = captureFrozenLegacyDraftAuthority()
+    const driftWarning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    expect(legacyDraftAuthority).not.toBeNull()
+
+    const runtime = { ...managedSnapshot(), canonical_session_id: 'stored-C' }
+    $projects.set([{ id: runtime.project_id, managed: true } as never])
+    $activeProjectId.set(runtime.project_id)
+    $projectRuntimes.set({ [runtime.project_id]: { events: [], snapshot: runtime } })
+    executeProjectMutation.mockResolvedValue({
+      result: { accepted_turn_id: 'turn-C' },
+      status: 'succeeded'
+    })
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId="rt-C"
+        activeSessionIdRef={activeSessionIdRef}
+        getRouteToken={() => routeToken}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId="stored-C"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    const submitted = await handle!.submitTextRaw('fresh draft retargeted to managed C', {
+      legacyDraftAuthority: legacyDraftAuthority!
+    })
+
+    expect(submitted).toBe(false)
+    expect(executeProjectMutation).not.toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'turn.enqueue', project_id: runtime.project_id })
+    )
+    expect(driftWarning).toHaveBeenCalledWith('[submit-drift-abort]', 'legacy-draft-authority', {
+      phase: 'target-resolution'
+    })
+  })
+
   it('does not publish submit success after fresh-draftauthority drifts while prompt.submit awaits', async () => {
     const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }

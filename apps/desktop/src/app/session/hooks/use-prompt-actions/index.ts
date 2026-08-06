@@ -664,6 +664,24 @@ export function usePromptActions({
         options?.storedSessionId ??
         (targetSessionId === activeSessionIdRef.current ? selectedStoredSessionIdRef.current : null)
 
+      // A frozen fresh-draft authority captures a draft with NO session target
+      // (fresh chat). If reconstruction now resolves a session target — the
+      // selected stored-session ref retargeted to a durable session while
+      // composer middleware awaited — this submit belongs to a later session.
+      // The frozen draft authority must bind target resolution too: reject it
+      // rather than let the managed branch (or a later legacy session) submit
+      // without validating the frozen authority.
+      if (
+        options?.legacyDraftAuthority &&
+        (targetSessionId !== null || targetStoredSessionId !== null)
+      ) {
+        console.warn('[submit-drift-abort]', 'legacy-draft-authority', {
+          phase: 'target-resolution'
+        })
+
+        return false
+      }
+
       let managedRuntime
 
       if (options?.projectAuthority) {

@@ -29,8 +29,13 @@ import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES } from '@/lib/profile-color'
 import { exportSession } from '@/lib/session-export'
 import { activeGateway } from '@/store/gateway'
+import {
+  captureExactLegacySessionAuthority,
+  validateExactLegacySessionAuthority
+} from '@/store/legacy-session-authority'
 import { notify, notifyError } from '@/store/notifications'
 import { $projectTree, moveSessionToProject, projectIdForCwd, projectRootCwd } from '@/store/projects'
+import { $projectSurfaceAuthorityContext } from '@/store/project-surface-authority-store'
 import {
   $activeSessionId,
   $selectedStoredSessionId,
@@ -40,8 +45,9 @@ import {
   setSessions
 } from '@/store/session'
 import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
-import { $sessionTiles } from '@/store/session-states'
-import { canOpenSessionWindow } from '@/store/windows'
+import { $sessionTiles, openSessionTile } from '@/store/session-states'
+import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
+import type { SessionInfo } from '@/types/hermes'
 
 import type { SessionTitleResponse } from '../../types'
 
@@ -64,11 +70,33 @@ import type { SessionTitleResponse } from '../../types'
 export async function renameSessionPreferringRpc(
   storedSessionId: string,
   title: string,
-  profile?: string
+  profile?: string,
+  storedSession?: SessionInfo
 ): Promise<{ title?: string }> {
   const isActiveRow = storedSessionId === $selectedStoredSessionId.get()
   const runtimeId = isActiveRow ? $activeSessionId.get() : null
+  const normalizedProfile = profile?.trim() || 'default'
+  const candidates = $sessions
+    .get()
+    .filter(
+      session =>
+        sessionMatchesStoredId(session, storedSessionId) &&
+        (session.profile?.trim() || 'default') === normalizedProfile
+    )
+  const exactStoredSession = storedSession ?? (candidates.length === 1 ? candidates[0] : undefined)
   const gateway = activeGateway()
+  const authority = exactStoredSession
+    ? captureExactLegacySessionAuthority({
+        requireActiveGateway: Boolean(title && runtimeId && gateway),
+        runtimeSessionId: runtimeId,
+        storedSession: exactStoredSession,
+        storedSessionId
+      })
+    : null
+
+  if (!authority) {
+    throw new Error('project session authority is unavailable')
+  }
 
   if (title && runtimeId && gateway) {
     try {
@@ -77,8 +105,16 @@ export async function renameSessionPreferringRpc(
         title
       })
 
+      if (!validateExactLegacySessionAuthority(authority, { runtimeSessionId: runtimeId })) {
+        throw new Error('project session authority is unavailable')
+      }
+
       return { title: result?.title ?? title }
     } catch (err) {
+      if (!validateExactLegacySessionAuthority(authority, { runtimeSessionId: runtimeId })) {
+        throw new Error('project session authority is unavailable')
+      }
+
       // Fall through to REST — e.g. the socket is mid-reconnect. REST still
       // works for any session that already has a persisted row. Log so a
       // genuine RPC-side failure (which then surfaces a REST 404 for the
@@ -87,12 +123,23 @@ export async function renameSessionPreferringRpc(
     }
   }
 
-  return renameSession(storedSessionId, title, profile)
+  if (!validateExactLegacySessionAuthority(authority, { runtimeSessionId: runtimeId })) {
+    throw new Error('project session authority is unavailable')
+  }
+
+  const result = await renameSession(storedSessionId, title, authority.targetProfile)
+
+  if (!validateExactLegacySessionAuthority(authority, { runtimeSessionId: runtimeId })) {
+    throw new Error('project session authority is unavailable')
+  }
+
+  return result
 }
 
 interface SessionActions {
   sessionId: string
   title: string
+  storedSession?: SessionInfo
   pinned?: boolean
   profile?: string
   onPin?: () => void
@@ -175,6 +222,7 @@ function MoveToProjectItems({ kit, sessionId, profile }: { kit: MenuKit; session
 function useSessionActions({
   sessionId,
   title,
+  storedSession,
   pinned = false,
   profile,
   onPin,
@@ -189,8 +237,26 @@ function useSessionActions({
   const { t } = useI18n()
   const r = t.sidebar.row
   const [renameOpen, setRenameOpen] = useState(false)
+  useStore($projectSurfaceAuthorityContext)
   const tiles = useStore($sessionTiles)
+  const sessions = useStore($sessions)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const selectedRuntimeId = sessionId === selectedStoredSessionId ? $activeSessionId.get() : null
+  const normalizedProfile = profile?.trim() || 'default'
+  const exactCandidates = sessions.filter(
+    session =>
+      sessionMatchesStoredId(session, sessionId) && (session.profile?.trim() || 'default') === normalizedProfile
+  )
+  const exactStoredSession = storedSession ?? (exactCandidates.length === 1 ? exactCandidates[0] : undefined)
+
+  const sessionMutationsAllowed = Boolean(
+    exactStoredSession &&
+    captureExactLegacySessionAuthority({
+      runtimeSessionId: selectedRuntimeId,
+      storedSession: exactStoredSession,
+      storedSessionId: sessionId
+    })
+  )
 
   // Already showing as a tab somewhere (a tile, or loaded in main — main IS
   // a tab): offering "Open in new tab" again is noise.
@@ -234,15 +300,19 @@ function useSessionActions({
 
   // IDENTITY — name/mark/reference the session.
   const identityItems: ActionItemSpec[] = [
-    spec({
-      disabled: !sessionId,
-      icon: 'edit',
-      label: r.rename,
-      onSelect: () => {
-        triggerHaptic('selection')
-        setRenameOpen(true)
-      }
-    }),
+    ...(sessionMutationsAllowed
+      ? [
+          spec({
+            disabled: !sessionId,
+            icon: 'edit',
+            label: r.rename,
+            onSelect: () => {
+              triggerHaptic('selection')
+              setRenameOpen(true)
+            }
+          })
+        ]
+      : []),
     spec({
       disabled: !onPin,
       icon: 'pin',
@@ -256,18 +326,22 @@ function useSessionActions({
 
   // WORK — derive/extract from the session.
   const workItems: ActionItemSpec[] = [
-    spec({
-      disabled: !onBranch,
-      // Fork glyph to match the inline message action's GitFork icon
-      // (assistant-message.tsx). NB: this codicon font has no `git-fork`
-      // glyph (only `git-fork-private`); `repo-forked` is the fork icon.
-      icon: 'repo-forked',
-      label: r.branchFrom,
-      onSelect: () => {
-        triggerHaptic('selection')
-        onBranch?.()
-      }
-    }),
+    ...(sessionMutationsAllowed
+      ? [
+          spec({
+            disabled: !onBranch,
+            // Fork glyph to match the inline message action's GitFork icon
+            // (assistant-message.tsx). NB: this codicon font has no `git-fork`
+            // glyph (only `git-fork-private`); `repo-forked` is the fork icon.
+            icon: 'repo-forked',
+            label: r.branchFrom,
+            onSelect: () => {
+              triggerHaptic('selection')
+              onBranch?.()
+            }
+          })
+        ]
+      : []),
     spec({
       disabled: !sessionId,
       icon: 'cloud-download',
@@ -345,28 +419,30 @@ function useSessionActions({
       : []
 
   // DANGER — put it away / destroy it (delete stays last, destructive-red).
-  const dangerItems: ActionItemSpec[] = [
-    spec({
-      disabled: !onArchive,
-      icon: 'archive',
-      label: r.archive,
-      onSelect: () => {
-        triggerHaptic('selection')
-        onArchive?.()
-      }
-    }),
-    {
-      className: 'text-destructive focus:text-destructive',
-      disabled: !onDelete,
-      icon: 'trash',
-      label: t.common.delete,
-      onSelect: () => {
-        triggerHaptic('warning')
-        onDelete?.()
-      },
-      variant: 'destructive'
-    }
-  ]
+  const dangerItems: ActionItemSpec[] = sessionMutationsAllowed
+    ? [
+        spec({
+          disabled: !onArchive,
+          icon: 'archive',
+          label: r.archive,
+          onSelect: () => {
+            triggerHaptic('selection')
+            onArchive?.()
+          }
+        }),
+        {
+          className: 'text-destructive focus:text-destructive',
+          disabled: !onDelete,
+          icon: 'trash',
+          label: t.common.delete,
+          onSelect: () => {
+            triggerHaptic('warning')
+            onDelete?.()
+          },
+          variant: 'destructive'
+        }
+      ]
+    : []
 
   const renderItems = (kit: MenuKit) => (
     <>
@@ -409,8 +485,12 @@ function useSessionActions({
           {tabItems.map(item => renderActionItem(kit, item))}
         </>
       )}
-      <kit.Separator />
-      {dangerItems.map(item => renderActionItem(kit, item))}
+      {dangerItems.length > 0 && (
+        <>
+          <kit.Separator />
+          {dangerItems.map(item => renderActionItem(kit, item))}
+        </>
+      )}
       {onHideTabBar && (
         <>
           <kit.Separator />
@@ -435,6 +515,7 @@ function useSessionActions({
       open={renameOpen}
       profile={profile}
       sessionId={sessionId}
+      storedSession={exactStoredSession}
     />
   )
 
@@ -490,9 +571,17 @@ interface RenameSessionDialogProps {
   sessionId: string
   currentTitle: string
   profile?: string
+  storedSession?: SessionInfo
 }
 
-function RenameSessionDialog({ open, onOpenChange, sessionId, currentTitle, profile }: RenameSessionDialogProps) {
+function RenameSessionDialog({
+  open,
+  onOpenChange,
+  sessionId,
+  currentTitle,
+  profile,
+  storedSession
+}: RenameSessionDialogProps) {
   const { t } = useI18n()
   const r = t.sidebar.row
   const [value, setValue] = useState(currentTitle)
@@ -522,9 +611,16 @@ function RenameSessionDialog({ open, onOpenChange, sessionId, currentTitle, prof
     setSubmitting(true)
 
     try {
-      const result = await renameSessionPreferringRpc(sessionId, next, profile)
+      const result = await renameSessionPreferringRpc(sessionId, next, profile, storedSession)
       const finalTitle = result.title || next || ''
-      setSessions(prev => prev.map(s => (s.id === sessionId ? { ...s, title: finalTitle || null } : s)))
+      const targetProfile = storedSession?.profile?.trim() || profile?.trim() || 'default'
+      setSessions(prev =>
+        prev.map(s =>
+          s.id === sessionId && (s.profile?.trim() || 'default') === targetProfile
+            ? { ...s, title: finalTitle || null }
+            : s
+        )
+      )
       notify({ durationMs: 2_000, kind: 'success', message: r.renamed })
       onOpenChange(false)
     } catch (err) {

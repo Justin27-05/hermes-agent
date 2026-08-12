@@ -5,6 +5,13 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $onBattery, batteryPollInterval } from '@/store/power'
 import { refreshActiveProfile } from '@/store/profile'
+import { configureProjectCommandRuntime } from '@/store/project-command-runtime'
+import {
+  configureProjectRuntimeRequester,
+  managedProjectRuntimeIds,
+  type ProjectRuntimeRequester,
+  syncProjectRuntime
+} from '@/store/project-runtime'
 import { $activeSessionId, $currentCwd, setCurrentCwd } from '@/store/session'
 import {
   $sessionStates,
@@ -42,6 +49,9 @@ const LIVE_SESSION_STATUS_BACKSTOP_INTERVAL_MS = 30_000
 // full list refresh is heavier than the active_list snapshot. Trailing-edge
 // scheduled, so the burst's last write always lands.
 const SESSIONS_LIST_TICK_GAP_MS = 10_000
+const MANAGED_RUNTIME_POLL_INTERVAL_MS = 10_000
+const PROJECT_RUNTIME_CATALOG_POLL_INTERVAL_MS = 60_000
+const PROJECT_RUNTIME_CATALOG_BATCH_SIZE = 50
 
 interface LiveSessionStatusItem {
   id?: string
@@ -186,6 +196,93 @@ interface BackgroundSyncParams {
   refreshMessagingSessions: () => Promise<unknown> | unknown
   refreshSessions: () => Promise<unknown> | unknown
   requestGateway: GatewayRequester
+}
+
+/** Reconcile explicitly supplied bounded candidates. Legacy projects retain
+ * their established polling path: unsupported/non-managed runtime snapshots
+ * fail softly and never create managed renderer state. */
+export async function syncManagedProjectRuntimes(
+  requestGateway: ProjectRuntimeRequester,
+  candidateProjectIds = managedProjectRuntimeIds(),
+  profile?: string
+): Promise<void> {
+  configureProjectRuntimeRequester(requestGateway, profile)
+  await Promise.allSettled([...new Set(candidateProjectIds)].map(projectId => syncProjectRuntime(projectId)))
+}
+
+function projectRuntimeCatalogCandidates(value: unknown, offset: number): string[] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return []
+  }
+
+  const projects = (value as Record<string, unknown>).projects
+
+  if (!Array.isArray(projects)) {
+    return []
+  }
+
+  const ids: string[] = []
+
+  for (const project of projects) {
+    if (!project || typeof project !== 'object' || Array.isArray(project)) {
+      return []
+    }
+
+    const id = (project as Record<string, unknown>).id
+    const managed = (project as Record<string, unknown>).managed
+
+    if (typeof id !== 'string' || !id) {
+      return []
+    }
+
+    if (managed === true) {
+      if (ids.includes(id)) {
+        return []
+      }
+
+      ids.push(id)
+    }
+  }
+
+  if (!ids.length) {
+    return []
+  }
+
+  const count = Math.min(ids.length, PROJECT_RUNTIME_CATALOG_BATCH_SIZE)
+  const start = ((offset % ids.length) + ids.length) % ids.length
+
+  return Array.from({ length: count }, (_, index) => ids[(start + index) % ids.length])
+}
+
+/** Read canonical project IDs, because a flat sidebar may not hydrate its
+ * local project cache. Catalog errors deliberately preserve the legacy path. */
+export async function syncManagedProjectRuntimeCatalog(
+  requestGateway: GatewayRequester,
+  profile: string,
+  offset = 0,
+  isCurrent: () => boolean = () => true
+): Promise<number> {
+  let catalog: unknown
+
+  try {
+    catalog = await requestGateway<unknown>('projects.list', {})
+  } catch {
+    return 0
+  }
+
+  if (!isCurrent()) {
+    return 0
+  }
+
+  const candidates = projectRuntimeCatalogCandidates(catalog, offset)
+
+  if (!candidates.length) {
+    return 0
+  }
+
+  await syncManagedProjectRuntimes(requestGateway, candidates, profile)
+
+  return candidates.length
 }
 
 /** Poll a callback while the tab is visible, on `intervalMs`; re-checks on tab
@@ -355,6 +452,52 @@ export function useBackgroundSync({
       }
     }
   }, [changeEventsAvailable, gatewayState, refreshMessagingSessions, refreshSessions])
+
+  // Managed project transport frames are only hints and may be lost while the
+  // app sleeps. Re-read the canonical runtime on every open/reopen and at a
+  // bounded visible cadence. This is intentionally separate from the legacy
+  // cron/messaging polls below.
+  useEffect(() => {
+    if (gatewayState !== 'open') {
+      return
+    }
+
+    let cancelled = false
+    let catalogOffset = 0
+    configureProjectRuntimeRequester(requestGateway, activeGatewayProfile)
+    const disposeCommands = configureProjectCommandRuntime(requestGateway, activeGatewayProfile)
+
+    const discoverCatalog = async () => {
+      const count = await syncManagedProjectRuntimeCatalog(
+        requestGateway,
+        activeGatewayProfile,
+        catalogOffset,
+        () => !cancelled
+      )
+
+      if (!cancelled) {
+        catalogOffset += count || PROJECT_RUNTIME_CATALOG_BATCH_SIZE
+      }
+    }
+
+    void syncManagedProjectRuntimes(requestGateway, managedProjectRuntimeIds(), activeGatewayProfile)
+    void discoverCatalog()
+
+    const disposeKnown = visiblePoll(MANAGED_RUNTIME_POLL_INTERVAL_MS, () => {
+      void syncManagedProjectRuntimes(requestGateway, managedProjectRuntimeIds(), activeGatewayProfile)
+    })
+
+    const disposeCatalog = visiblePoll(PROJECT_RUNTIME_CATALOG_POLL_INTERVAL_MS, () => {
+      void discoverCatalog()
+    })
+
+    return () => {
+      disposeCommands()
+      cancelled = true
+      disposeKnown()
+      disposeCatalog()
+    }
+  }, [activeGatewayProfile, gatewayState, requestGateway])
 
   // Keep the cron-jobs section live without a user action (scheduler ticks in
   // the background). cron.changed (jobs.json moved: CRUD or a scheduler tick's

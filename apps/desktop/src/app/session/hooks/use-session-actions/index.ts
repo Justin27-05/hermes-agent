@@ -12,8 +12,14 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
+import {
+  captureExactLegacySessionAuthority,
+  type ExactLegacySessionAuthority,
+  validateExactLegacySessionAuthority
+} from '@/store/legacy-session-authority'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { resolveCurrentManagedProjectSurface } from '@/store/project-surface-authority-store'
 import {
   beginSessionMutation,
   endSessionMutation,
@@ -68,7 +74,13 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionMessage,
+  SessionResumeResponse,
+  UsageStats
+} from '@/types/hermes'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -196,6 +208,13 @@ function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewCha
   return typeof target === 'string' ? target.trim() || null : target
 }
 
+interface StoredSessionMutationAuthority {
+  readonly authorities: readonly ExactLegacySessionAuthority[]
+  readonly runtimeSessionIds: readonly string[]
+  readonly storedSession: Readonly<SessionInfo>
+  readonly storedSessionId: string
+}
+
 export function useSessionActions({
   activeSessionId,
   activeSessionIdRef,
@@ -218,6 +237,110 @@ export function useSessionActions({
   const { t } = useI18n()
   const copy = t.desktop
   const resumeRequestRef = useRef(0)
+
+  const exactStoredSessionRow = useCallback((storedSessionId: string, supplied?: SessionInfo): SessionInfo | null => {
+    if (supplied) {
+      return sessionMatchesStoredId(supplied, storedSessionId) ? supplied : null
+    }
+
+    const matches = $sessions.get().filter(session => sessionMatchesStoredId(session, storedSessionId))
+
+    return matches.length === 1 ? matches[0] : null
+  }, [])
+
+  const runtimeCandidatesForStoredSession = useCallback(
+    (storedSessionId: string): string[] => {
+      const candidates = new Set<string>()
+      const mapped = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+
+      if (mapped) {
+        candidates.add(mapped)
+      }
+
+      for (const [runtimeSessionId, state] of sessionStateByRuntimeIdRef.current) {
+        if (state.storedSessionId === storedSessionId) {
+          candidates.add(runtimeSessionId)
+        }
+      }
+
+      if (selectedStoredSessionId === storedSessionId && activeSessionId) {
+        candidates.add(activeSessionId)
+      }
+
+      return [...candidates].sort()
+    },
+    [activeSessionId, runtimeIdByStoredSessionIdRef, selectedStoredSessionId, sessionStateByRuntimeIdRef]
+  )
+
+  const captureStoredSessionMutationAuthority = useCallback(
+    (storedSessionId: string, supplied?: SessionInfo): StoredSessionMutationAuthority | null => {
+      const storedSession = exactStoredSessionRow(storedSessionId, supplied)
+
+      if (!storedSession) {
+        return null
+      }
+
+      const runtimeSessionIds = runtimeCandidatesForStoredSession(storedSessionId)
+      const candidates: Array<null | string> = runtimeSessionIds.length > 0 ? runtimeSessionIds : [null]
+
+      const authorities = candidates.map(runtimeSessionId =>
+        captureExactLegacySessionAuthority({
+          runtimeSessionId,
+          storedSession,
+          storedSessionId
+        })
+      )
+
+      if (authorities.some(authority => authority === null)) {
+        return null
+      }
+
+      return Object.freeze({
+        authorities: Object.freeze(authorities as ExactLegacySessionAuthority[]),
+        runtimeSessionIds: Object.freeze(runtimeSessionIds),
+        storedSession: Object.freeze({ ...storedSession }),
+        storedSessionId
+      })
+    },
+    [exactStoredSessionRow, runtimeCandidatesForStoredSession]
+  )
+
+  const validateStoredSessionMutationAuthority = useCallback(
+    (authority: StoredSessionMutationAuthority): boolean => {
+      const currentRuntimeSessionIds = runtimeCandidatesForStoredSession(authority.storedSessionId)
+
+      return (
+        currentRuntimeSessionIds.length === authority.runtimeSessionIds.length &&
+        currentRuntimeSessionIds.every(
+          (runtimeSessionId, index) => runtimeSessionId === authority.runtimeSessionIds[index]
+        ) &&
+        authority.authorities.every(ticket => validateExactLegacySessionAuthority(ticket))
+      )
+    },
+    [runtimeCandidatesForStoredSession]
+  )
+
+  const allowLegacyStoredSessionMutation = useCallback(
+    (storedSessionId: string, storedSession?: SessionInfo, runtimeSessionId: null | string = null): boolean => {
+      const resolution = resolveCurrentManagedProjectSurface(runtimeSessionId, storedSessionId, storedSession)
+
+      if (resolution.status === 'conclusively-legacy') {
+        return true
+      }
+
+      const message =
+        resolution.status === 'ambiguous'
+          ? t.statusStack.managedProject.ambiguousSession
+          : resolution.status === 'unavailable'
+            ? t.statusStack.managedProject.runtimeUnavailable
+            : t.statusStack.managedProject.historyUnsupported
+
+      notifyError(new Error(message), message)
+
+      return false
+    },
+    [t.statusStack.managedProject]
+  )
 
   // Follow auto-compression's stored-id rotation only while the exact runtime,
   // selection, and route intent still belong to the rotating conversation.
@@ -366,7 +489,7 @@ export function useSessionActions({
   )
 
   const createBackendSessionForSend = useCallback(
-    async (preview: string | null = null): Promise<string | null> => {
+    async (preview: string | null = null, validateAuthority?: () => boolean): Promise<string | null> => {
       const startingStoredSessionId = selectedStoredSessionIdRef.current
       const startingRouteToken = getRouteToken()
 
@@ -386,8 +509,20 @@ export function useSessionActions({
               : $currentCwd.get().trim() || resolveNewSessionCwd()
 
         const params = await desktopSessionCreateParams(cwd)
+
+        if (validateAuthority && !validateAuthority()) {
+          return null
+        }
+
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id ?? null
+
+        // session.create can take seconds. Never publish its result into a
+        // fresh-draft surface whose frozen producer authority changed while the
+        // RPC awaited.
+        if (validateAuthority && !validateAuthority()) {
+          return null
+        }
 
         // Only a genuine move to a DIFFERENT chat mid-create should orphan the
         // session we just minted. The active runtime ref is deliberately not a
@@ -407,7 +542,10 @@ export function useSessionActions({
 
         if (drift) {
           console.warn('[submit-drift-abort]', drift, { phase: 'mid-create' })
-          await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+
+          if (!validateAuthority || validateAuthority()) {
+            await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+          }
 
           return null
         }
@@ -445,6 +583,10 @@ export function useSessionActions({
         // User may have armed YOLO on the new-chat draft before the runtime
         // session existed — apply it to the freshly created session.
         if (yoloArmed) {
+          if (validateAuthority && !validateAuthority()) {
+            return null
+          }
+
           await setSessionYolo(requestGateway, created.session_id, true).catch(() => undefined)
         }
 
@@ -809,6 +951,20 @@ export function useSessionActions({
                 }
               }
 
+              // The runtime may have rebounded to a managed project surface
+              // (same canonical session) while the activate RPC / transcript
+              // prefetch was settling. Its warm cache is then owned by the
+              // managed branch — a stale legacy paint would clobber it.
+              if (
+                resolveCurrentManagedProjectSurface(
+                  cachedRuntimeId,
+                  storedSessionId,
+                  stored
+                ).status !== 'conclusively-legacy'
+              ) {
+                return
+              }
+
               const activatedState = updateSessionState(
                 cachedRuntimeId,
                 state => ({
@@ -1036,6 +1192,20 @@ export function useSessionActions({
         const runtimeInfo = applyRuntimeInfo(resumed.info)
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
+
+        if (
+          resolveCurrentManagedProjectSurface(
+            resumed.session_id,
+            storedSessionId,
+            stored
+          ).status !== 'conclusively-legacy'
+        ) {
+          // The session rebound to a managed project surface while the resume
+          // RPC / transcript prefetch was in flight (same canonical session).
+          // The managed branch owns the view then; publishing this stale
+          // legacy projection would overwrite the managed transcript.
+          return
+        }
 
         updateSessionState(
           resumed.session_id,
@@ -1362,10 +1532,20 @@ export function useSessionActions({
   )
 
   const removeSession = useCallback(
-    async (storedSessionId: string) => {
+    async (storedSessionId: string, suppliedSession?: SessionInfo) => {
+      const removed = exactStoredSessionRow(storedSessionId, suppliedSession)
+      const authority = captureStoredSessionMutationAuthority(storedSessionId, removed ?? undefined)
+
+      if (!authority) {
+        allowLegacyStoredSessionMutation(storedSessionId, removed ?? suppliedSession)
+
+        return
+      }
+
+      const guardedTiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+
       clearNotifications()
 
-      const removed = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
@@ -1392,10 +1572,23 @@ export function useSessionActions({
 
       try {
         if (closingRuntimeId) {
+          if (!validateStoredSessionMutationAuthority(authority)) {
+            return
+          }
+
           await requestGateway('session.close', { session_id: closingRuntimeId }).catch(() => undefined)
         }
 
-        await deleteSession(storedSessionId, removed?.profile)
+        if (!validateStoredSessionMutationAuthority(authority)) {
+          return
+        }
+
+        await deleteSession(storedSessionId, authority.storedSession.profile)
+
+        if (!validateStoredSessionMutationAuthority(authority)) {
+          return
+        }
+
         clearQueuedPrompts(storedSessionId)
 
         if (closingRuntimeId) {
@@ -1406,22 +1599,39 @@ export function useSessionActions({
         // and evict its mirrored runtime state so nothing submits to (or renders)
         // a deleted session.
         const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
-        closeSessionTile(storedSessionId)
 
-        if (tiledRuntimeId) {
+        const tileIdentityStillLegacy =
+          tiledRuntimeId === guardedTiledRuntimeId && validateStoredSessionMutationAuthority(authority)
+
+        // A same-R/C replacement may own the mapping now (e.g. the same
+        // conversation surfaced under another profile while this REST delete
+        // was in flight). The replacement's warm cache must survive.
+        const noReplacementRow = !$sessions
+          .get()
+          .some(session => sessionMatchesStoredId(session, storedSessionId))
+
+        if (tileIdentityStillLegacy && noReplacementRow) {
+          closeSessionTile(storedSessionId)
+        }
+
+        if (tileIdentityStillLegacy && noReplacementRow && tiledRuntimeId) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
         }
       } catch (err) {
-        if (removed) {
+        const authorityStillCurrent = validateStoredSessionMutationAuthority(authority)
+
+        if (removed && authorityStillCurrent) {
           setSessions(prev => [removed, ...prev])
         }
 
-        untombstoneSessions(removedIds)
-        $pinnedSessionIds.set(previousPinned)
+        if (authorityStillCurrent) {
+          untombstoneSessions(removedIds)
+          $pinnedSessionIds.set(previousPinned)
+        }
 
-        if (wasSelected) {
+        if (wasSelected && authorityStillCurrent) {
           setFreshDraftReady(false)
           setSelectedStoredSessionId(storedSessionId)
           selectedStoredSessionIdRef.current = storedSessionId
@@ -1451,22 +1661,36 @@ export function useSessionActions({
     [
       activeSessionId,
       activeSessionIdRef,
+      allowLegacyStoredSessionMutation,
+      captureStoredSessionMutationAuthority,
       copy,
+      exactStoredSessionRow,
       navigate,
       requestGateway,
       runtimeIdByStoredSessionIdRef,
       selectedStoredSessionId,
       selectedStoredSessionIdRef,
       sessionStateByRuntimeIdRef,
-      startFreshSessionDraft
+      startFreshSessionDraft,
+      validateStoredSessionMutationAuthority
     ]
   )
 
   const archiveSession = useCallback(
-    async (storedSessionId: string) => {
+    async (storedSessionId: string, suppliedSession?: SessionInfo) => {
+      const archived = exactStoredSessionRow(storedSessionId, suppliedSession)
+      const authority = captureStoredSessionMutationAuthority(storedSessionId, archived ?? undefined)
+
+      if (!authority) {
+        allowLegacyStoredSessionMutation(storedSessionId, archived ?? suppliedSession)
+
+        return
+      }
+
+      const guardedTiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+
       clearNotifications()
 
-      const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
@@ -1485,12 +1709,29 @@ export function useSessionActions({
       }
 
       try {
-        await setSessionArchived(storedSessionId, true, archived?.profile)
+        if (!validateStoredSessionMutationAuthority(authority)) {
+          return
+        }
+
+        await setSessionArchived(storedSessionId, true, authority.storedSession.profile)
         // An archived session is hidden from the sidebar; its tile must go too.
         const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
-        closeSessionTile(storedSessionId)
 
-        if (tiledRuntimeId) {
+        const tileIdentityStillLegacy =
+          tiledRuntimeId === guardedTiledRuntimeId && validateStoredSessionMutationAuthority(authority)
+
+        // A same-R/C replacement may own the mapping now (e.g. the same
+        // conversation surfaced under another profile while this REST archive
+        // was in flight). The replacement's warm cache must survive.
+        const noReplacementRow = !$sessions
+          .get()
+          .some(session => sessionMatchesStoredId(session, storedSessionId))
+
+        if (tileIdentityStillLegacy && noReplacementRow) {
+          closeSessionTile(storedSessionId)
+        }
+
+        if (tileIdentityStillLegacy && noReplacementRow && tiledRuntimeId) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
@@ -1498,18 +1739,33 @@ export function useSessionActions({
 
         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
       } catch (err) {
-        if (archived) {
+        const authorityStillCurrent = validateStoredSessionMutationAuthority(authority)
+
+        if (archived && authorityStillCurrent) {
           setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
         }
 
-        untombstoneSessions(archivedIds)
-        $pinnedSessionIds.set(previousPinned)
+        if (authorityStillCurrent) {
+          untombstoneSessions(archivedIds)
+          $pinnedSessionIds.set(previousPinned)
+        }
+
         notifyError(err, copy.archiveFailed)
       } finally {
         endSessionMutation(archivedIds)
       }
     },
-    [copy, runtimeIdByStoredSessionIdRef, selectedStoredSessionId, sessionStateByRuntimeIdRef, startFreshSessionDraft]
+    [
+      allowLegacyStoredSessionMutation,
+      captureStoredSessionMutationAuthority,
+      copy,
+      exactStoredSessionRow,
+      runtimeIdByStoredSessionIdRef,
+      selectedStoredSessionId,
+      sessionStateByRuntimeIdRef,
+      startFreshSessionDraft,
+      validateStoredSessionMutationAuthority
+    ]
   )
 
   return {

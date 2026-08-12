@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -92,6 +93,253 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     assert runner._pending_messages == {}
     assert runner._pending_approvals == {}
     assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_drains_running_agents_before_disconnect():
+    runner, adapter = make_restart_runner()
+    # Opt into a grace window (the default is 0 = interrupt immediately).
+    # This exercises the path where an agent finishes within the drain
+    # window and must NOT be interrupted.
+    runner._restart_drain_timeout = 5.0
+    disconnect_mock = AsyncMock()
+    adapter.disconnect = disconnect_mock
+
+    running_agent = MagicMock()
+    runner._running_agents = {"session": running_agent}
+
+    async def finish_agent():
+        await asyncio.sleep(0.05)
+        runner._running_agents.clear()
+
+    asyncio.create_task(finish_agent())
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    running_agent.interrupt.assert_not_called()
+    disconnect_mock.assert_awaited_once()
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_cancels_secondary_reconnects_before_session_drain():
+    runner, _adapter = make_restart_runner()
+    order: list[str] = []
+
+    async def _cancel_secondary_reconnects() -> None:
+        order.append("secondary_reconnect_cancel")
+
+    async def _notify_sessions() -> None:
+        order.append("notify_sessions")
+
+    runner._cancel_secondary_profile_reconnect_tasks = _cancel_secondary_reconnects
+    runner._notify_active_sessions_of_shutdown = _notify_sessions
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    assert order[:2] == ["secondary_reconnect_cancel", "notify_sessions"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_interrupts_after_drain_timeout():
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 0.05
+
+    disconnect_mock = AsyncMock()
+    adapter.disconnect = disconnect_mock
+
+    running_agent = MagicMock()
+    runner._running_agents = {"session": running_agent}
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    running_agent.interrupt.assert_called_once_with("Gateway shutting down")
+    disconnect_mock.assert_awaited_once()
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_bounds_background_task_that_swallows_cancellation(
+    monkeypatch,
+):
+    """A cancellation-resistant watcher cannot block executor teardown."""
+    runner, _adapter = make_restart_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_BACKGROUND_TASK_JOIN_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    shutdown_trace: list[str] = []
+
+    class RecordingExecutor:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def shutdown(self, wait=True, *, cancel_futures=False) -> None:
+            shutdown_trace.append(self.label)
+
+    runner._project_executor_lock = threading.Lock()
+    runner._project_executors_closing = False
+    runner._project_capability_executor = RecordingExecutor("capability")
+    runner._project_io_executor = RecordingExecutor("project-io")
+    runner._executor_lock = threading.Lock()
+    runner._executor_closing = False
+    runner._executor = RecordingExecutor("agent")
+
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def swallow_cancellation() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    stuck_task = asyncio.create_task(swallow_cancellation())
+    runner._background_tasks.add(stuck_task)
+    await asyncio.sleep(0)
+    try:
+        with (
+            patch("gateway.status.remove_pid_file"),
+            patch("gateway.status.write_runtime_status"),
+        ):
+            await asyncio.wait_for(runner.stop(), timeout=0.25)
+
+        assert cancelled.is_set()
+        assert shutdown_trace == ["capability", "project-io", "agent"]
+        assert runner._shutdown_event.is_set() is True
+        assert stuck_task in runner._shutdown_lingering_tasks
+    finally:
+        release.set()
+        await asyncio.wait_for(stuck_task, timeout=1)
+        await asyncio.sleep(0)
+        assert stuck_task not in runner._shutdown_lingering_tasks
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_caller_cancellation_does_not_cancel_cleanup(
+    monkeypatch,
+):
+    """The shared teardown task outlives cancellation of one stop caller."""
+    runner, _adapter = make_restart_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_BACKGROUND_TASK_JOIN_TIMEOUT_SECONDS",
+        1.0,
+        raising=False,
+    )
+    shutdown_trace: list[str] = []
+
+    class RecordingExecutor:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def shutdown(self, wait=True, *, cancel_futures=False) -> None:
+            shutdown_trace.append(self.label)
+
+    runner._project_executor_lock = threading.Lock()
+    runner._project_executors_closing = False
+    runner._project_capability_executor = RecordingExecutor("capability")
+    runner._project_io_executor = RecordingExecutor("project-io")
+    runner._executor_lock = threading.Lock()
+    runner._executor_closing = False
+    runner._executor = RecordingExecutor("agent")
+
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def swallow_cancellation() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    stuck_task = asyncio.create_task(swallow_cancellation())
+    runner._background_tasks.add(stuck_task)
+    await asyncio.sleep(0)
+    stop_caller = asyncio.create_task(runner.stop())
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    stop_caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stop_caller
+
+    assert runner._stop_task is not None
+    assert not runner._stop_task.done()
+    release.set()
+    await asyncio.wait_for(asyncio.shield(runner._stop_task), timeout=1)
+    assert shutdown_trace == ["capability", "project-io", "agent"]
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_systemd_service_restart_uses_tempfail(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    monkeypatch.setenv("INVOCATION_ID", "systemd-test")
+    runner._launch_systemd_restart_shortcut = MagicMock()
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop(restart=True, service_restart=True)
+
+    runner._launch_systemd_restart_shortcut.assert_called_once_with()
+    # Exit 75 (EX_TEMPFAIL) so RestartForceExitStatus=75 in the unit
+    # file revives the gateway via Restart=on-failure, even when the
+    # planned-restart helper fails (Polkit denial, missing user bus,
+    # headless box, or operator-managed unit using on-failure instead
+    # of always).  StartLimitBurst still bounds accidental loops.
+    assert runner._exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+    assert (tmp_path / ".restart_pending.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_launchd_service_restart_keeps_nonzero_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+
+    with patch("gateway.run.sys.platform", "darwin"), patch(
+        "gateway.status.remove_pid_file"
+    ), patch("gateway.status.write_runtime_status"):
+        await runner.stop(restart=True, service_restart=True)
+
+    assert runner._exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+
+
+@pytest.mark.asyncio
+async def test_restart_shutdown_warning_uses_restart_command_reply_anchor_for_active_session():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: MagicMock()}
+    runner._cache_session_source(session_key, source)
+    restart_source = make_restart_source(thread_id="42")
+    restart_source.message_id = "restart-command"
+    runner._restart_requested = True
+    runner._restart_command_source = restart_source
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id=source.chat_id,
+        name="Telegram",
+        thread_id=source.thread_id,
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    chat_id, message, metadata = adapter.sent_calls[0]
+    assert chat_id == source.chat_id
+    assert "Gateway restarting" in message
+    assert metadata["thread_id"] == source.thread_id
+    assert metadata["telegram_dm_topic_reply_fallback"] is True
+    assert metadata["direct_messages_topic_id"] == source.thread_id
+    assert metadata["telegram_reply_to_message_id"] == "restart-command"
 
 
 @pytest.mark.asyncio

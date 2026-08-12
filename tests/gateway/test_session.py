@@ -1530,3 +1530,156 @@ class TestGatewayRoutingTable:
         restarted._db.close()
 
 
+        # Simulate a pre-migration DB: routing table empty, JSON present.
+        import hermes_state
+        db = hermes_state.SessionDB()
+        db._conn.execute("DELETE FROM gateway_routing")
+        db._conn.commit()
+        db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        recovered = restarted.get_or_create_session(self._source())
+        assert recovered.session_id == entry.session_id
+        # And the next save persists the imported entry into the DB table.
+        rows = restarted._db.load_gateway_routing_entries(
+            scope=restarted._routing_scope()
+        )
+        assert entry.session_key in rows
+        restarted._db.close()
+
+    def test_db_entries_win_over_stale_json(self, tmp_path):
+        """When both stores have a key, the DB entry is authoritative."""
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(self._source())
+
+        # Doctor the JSON mirror to point at a different session id.
+        data = json.loads((tmp_path / "sessions.json").read_text())
+        data[entry.session_key]["session_id"] = "20990101_000000_stale999"
+        (tmp_path / "sessions.json").write_text(json.dumps(data))
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._ensure_loaded()
+        assert restarted._entries[entry.session_key].session_id == entry.session_id
+        restarted._db.close()
+
+    def test_prune_removes_routing_rows_for_ended_sessions(self, tmp_path):
+        """Startup prune drops ended sessions from the DB routing table too."""
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(self._source())
+        store._db.end_session(entry.session_id, "session_reset")
+        store._db._conn.execute(
+            "UPDATE sessions SET ended_at = 1.0, end_reason = 'session_reset' WHERE id = ?",
+            (entry.session_id,),
+        )
+        store._db._conn.commit()
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._ensure_loaded()
+        assert entry.session_key not in restarted._entries
+        rows = restarted._db.load_gateway_routing_entries(
+            scope=restarted._routing_scope()
+        )
+        assert entry.session_key not in rows
+        restarted._db.close()
+
+
+class TestProjectRuntimeSessionContext:
+    @staticmethod
+    def _entry():
+        legacy_source = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="desktop-window",
+            chat_name="Desktop project",
+            user_id="owner-1",
+        )
+        now = datetime.now()
+        return SessionEntry(
+            session_key="agent:main:local:dm:owner-1",
+            session_id="legacy-route-session",
+            created_at=now,
+            updated_at=now,
+            origin=legacy_source,
+            display_name="Desktop project",
+            platform=Platform.LOCAL,
+        )
+
+    def test_alternating_turn_sources_share_the_explicit_canonical_session(self):
+        from gateway import session as session_module
+
+        config = GatewayConfig(platforms={})
+        entry = self._entry()
+        serialized_before = entry.to_dict()
+        desktop = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="desktop-window",
+            user_id="owner-1",
+        )
+        discord = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-42",
+            chat_name="Project channel",
+            chat_type="channel",
+            user_id="owner-1",
+        )
+
+        desktop_context = session_module.build_project_session_context(
+            desktop,
+            "canonical-root",
+            config,
+            entry,
+        )
+        discord_context = session_module.build_project_session_context(
+            discord,
+            "canonical-root",
+            config,
+            entry,
+        )
+
+        assert desktop_context.source is desktop
+        assert discord_context.source is discord
+        assert desktop_context.session_id == "canonical-root"
+        assert discord_context.session_id == "canonical-root"
+        assert desktop_context.session_key == entry.session_key
+        assert discord_context.session_key == entry.session_key
+        assert entry.session_id == "legacy-route-session"
+        assert entry.origin is not None
+        assert entry.origin.platform == Platform.LOCAL
+        assert entry.to_dict() == serialized_before
+
+    def test_context_without_a_route_entry_still_uses_the_canonical_id(self):
+        from gateway import session as session_module
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-42",
+            user_id="owner-1",
+        )
+
+        context = session_module.build_project_session_context(
+            source,
+            "canonical-root",
+            GatewayConfig(platforms={}),
+        )
+
+        assert context.source is source
+        assert context.session_id == "canonical-root"
+        assert context.session_key == ""
+
+    @pytest.mark.parametrize(
+        "canonical_id",
+        ["../escape", "/absolute", "\\absolute", "C:/windows", "", None, []],
+    )
+    def test_unsafe_or_malformed_canonical_id_is_rejected(self, canonical_id):
+        from gateway import session as session_module
+
+        with pytest.raises(ValueError):
+            session_module.build_project_session_context(
+                SessionSource(platform=Platform.LOCAL, chat_id="desktop"),
+                canonical_id,
+                GatewayConfig(platforms={}),
+                self._entry(),
+            )

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { useI18n } from '@/i18n'
 import { startThinkingSound, stopThinkingSound } from '@/lib/thinking-sound'
 import { monitorSpeechDuringPlayback } from '@/lib/voice-barge-in'
@@ -26,13 +27,10 @@ interface PendingVoiceResponse {
 
 interface VoiceConversationOptions {
   busy: boolean
+  captureSubmitOptions: () => SubmitTextOptions
   enabled: boolean
   onFatalError?: () => void
-  /** Interrupt the in-flight agent turn (the same seam as the Stop button).
-   *  Fired when the user speaks while the model is still generating. */
-  onInterrupt?: () => Promise<void> | void
-  onStopWord?: () => void
-  onSubmit: (text: string) => Promise<void> | void
+  onSubmit: (text: string, options: SubmitTextOptions) => Promise<void> | void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
@@ -47,6 +45,7 @@ const INTERRUPT_SETTLE_TIMEOUT_MS = 5_000
 
 export function useVoiceConversation({
   busy,
+  captureSubmitOptions,
   enabled,
   onFatalError,
   onInterrupt,
@@ -71,8 +70,7 @@ export function useVoiceConversation({
   const speechSessionRef = useRef<null | SpeechStreamSession>(null)
   const stopBargeMonitorRef = useRef<(() => void) | null>(null)
   const bargeCapturePendingRef = useRef(false)
-  const bargedRef = useRef(false)
-  const speechStartSequenceRef = useRef(0)
+  const bargeSubmitOptionsRef = useRef<null | SubmitTextOptions>(null)
   const enabledRef = useRef(enabled)
   const mutedRef = useRef(muted)
   const busyRef = useRef(busy)
@@ -129,7 +127,7 @@ export function useVoiceConversation({
     stopBargeMonitorRef.current?.()
     stopBargeMonitorRef.current = null
     bargeCapturePendingRef.current = false
-    bargedRef.current = false
+    bargeSubmitOptionsRef.current = null
     speechSessionRef.current = null
     responseIdRef.current = null
     spokenSourceLengthRef.current = 0
@@ -144,6 +142,7 @@ export function useVoiceConversation({
       turnClosingRef.current = true
       clearTurnTimeout()
       setStatus('transcribing')
+      const submitOptions = captureSubmitOptions()
 
       try {
         const result = await handle.stop()
@@ -185,7 +184,7 @@ export function useVoiceConversation({
 
           awaitingSpokenResponseRef.current = true
           dropSpeechSession()
-          await onSubmit(transcript)
+          await onSubmit(transcript, submitOptions)
           setStatus('thinking')
         } catch (error) {
           notifyError(error, voiceCopy.transcriptionFailed)
@@ -200,7 +199,7 @@ export function useVoiceConversation({
         turnClosingRef.current = false
       }
     },
-    [handle, onSubmit, onTranscribeAudio, voiceCopy.transcriptionFailed]
+    [captureSubmitOptions, handle, onSubmit, onTranscribeAudio, voiceCopy.transcriptionFailed]
   )
 
   const startListening = useCallback(async () => {
@@ -322,6 +321,13 @@ export function useVoiceConversation({
       }
 
       setStatus('transcribing')
+      const submitOptions = bargeSubmitOptionsRef.current
+
+      if (!submitOptions) {
+        resumeListening()
+
+        return
+      }
 
       try {
         const transcript = (await onTranscribeAudio(audio)).trim()
@@ -354,7 +360,7 @@ export function useVoiceConversation({
         awaitingSpokenResponseRef.current = true
         dropSpeechSession()
         consumePendingResponse()
-        await onSubmit(transcript)
+        await onSubmit(transcript, submitOptions)
         setStatus('thinking')
       } catch (error) {
         notifyError(error, voiceCopy.transcriptionFailed)
@@ -364,46 +370,25 @@ export function useVoiceConversation({
     [consumePendingResponse, onSubmit, onTranscribeAudio, voiceCopy.transcriptionFailed]
   )
 
-  /**
-   * Full-duplex barge-in monitor for the WHOLE agent turn: armed at submit,
-   * live through generation (thinking) AND playback (speaking).
-   *
-   * - generation phase (`busy`): speech interrupts the in-flight turn via
-   *   `onInterrupt` — the same seam as the Stop button — and cuts any TTS that
-   *   managed to start, so the stale reply never speaks.
-   * - playback phase: speech cuts playback and the captured interruption is
-   *   transcribed and submitted as the next turn.
-   *
-   * Idempotent — one monitor owns the mic per turn; re-arming while one is
-   * live is a no-op (the live/fallback speech paths and the turn-drive effect
-   * all call this).
-   */
-  const ensureBargeMonitor = useCallback(() => {
-    if (stopBargeMonitorRef.current) {
-      return
-    }
-
-    stopBargeMonitorRef.current = monitorSpeechDuringPlayback({
-      isPlaying: () => $voicePlayback.get().status === 'speaking',
-      onSpeech: () => {
-        bargeCapturePendingRef.current = true
-        bargedRef.current = true
-        markVoicePlaybackInterrupted()
-        stopVoicePlayback()
-
-        if (busyRef.current) {
-          // Mid-generation: stop the in-flight turn so the captured utterance
-          // becomes the next one instead of queueing behind a stale reply.
-          void onInterruptRef.current?.()
+  /** Barge-in monitor wiring shared by the live and fallback speech paths. */
+  const openBargeMonitor = useCallback(
+    (onBarge: () => void) =>
+      monitorSpeechDuringPlayback({
+        onSpeech: () => {
+          bargeCapturePendingRef.current = true
+          bargeSubmitOptionsRef.current = captureSubmitOptions()
+          onBarge()
+          markVoicePlaybackInterrupted()
+          stopVoicePlayback()
+        },
+        onUtterance: audio => {
+          bargeCapturePendingRef.current = false
+          stopBargeMonitorRef.current = null
+          void submitCapturedUtterance(audio)
         }
-      },
-      onUtterance: audio => {
-        bargeCapturePendingRef.current = false
-        stopBargeMonitorRef.current = null
-        void submitCapturedUtterance(audio)
-      }
-    })
-  }, [submitCapturedUtterance])
+      }),
+    [captureSubmitOptions, submitCapturedUtterance]
+  )
 
   /** Push any new reply text into the live session; finish when complete. */
   const feedSpeechSession = useCallback(

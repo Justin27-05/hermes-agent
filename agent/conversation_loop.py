@@ -38,6 +38,8 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.errors import ProjectExecutionControlSignal
+from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -650,16 +652,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if getattr(agent, "_hermetic_project_mode", False) is not True:
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -1302,6 +1305,8 @@ def _apply_context_engine_selection(
     value yields the unmodified ``api_messages``. The result is request-only —
     persisted conversation history is never mutated here.
     """
+    if getattr(agent, "_hermetic_project_mode", False) is True:
+        return api_messages
     engine = getattr(agent, "context_compressor", None)
     if engine is None or not hasattr(engine, "select_context"):
         return api_messages
@@ -1387,6 +1392,8 @@ def _notify_context_engine_turn_complete(
     ``messages`` is passed as a shallow copy so the engine cannot mutate the
     persisted transcript.
     """
+    if getattr(agent, "_hermetic_project_mode", False) is True:
+        return
     engine = getattr(agent, "context_compressor", None)
     hook = getattr(engine, "on_turn_complete", None)
     if engine is None or not callable(hook):
@@ -6560,9 +6567,15 @@ def run_conversation(
                 agent._invalid_json_retries = 0
 
                 # ── Post-call guardrails ──────────────────────────
-                assistant_message.tool_calls = agent._cap_delegate_task_calls(
-                    assistant_message.tool_calls
-                )
+                if (
+                    getattr(agent, "_hermetic_project_mode", False)
+                    is not True
+                ):
+                    assistant_message.tool_calls = (
+                        agent._cap_delegate_task_calls(
+                            assistant_message.tool_calls
+                        )
+                    )
                 assistant_message.tool_calls = agent._deduplicate_tool_calls(
                     assistant_message.tool_calls
                 )
@@ -7441,23 +7454,29 @@ def run_conversation(
                 ):
                     messages.pop()
 
-                try:
-                    from agent.verification_stop import (
-                        build_verify_on_stop_nudge,
-                        verify_on_stop_enabled,
-                    )
-
-                    if verify_on_stop_enabled():
-                        _verify_nudge = build_verify_on_stop_nudge(
-                            session_id=getattr(agent, "session_id", None),
-                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
-                            attempts=getattr(agent, "_verification_stop_nudges", 0),
-                        )
-                    else:
-                        _verify_nudge = None
-                except Exception:
-                    logger.debug("verification stop-loop check failed", exc_info=True)
+                if (
+                    getattr(agent, "_hermetic_project_mode", False)
+                    is True
+                ):
                     _verify_nudge = None
+                else:
+                    try:
+                        from agent.verification_stop import (
+                            build_verify_on_stop_nudge,
+                            verify_on_stop_enabled,
+                        )
+
+                        if verify_on_stop_enabled():
+                            _verify_nudge = build_verify_on_stop_nudge(
+                                session_id=getattr(agent, "session_id", None),
+                                changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                                attempts=getattr(agent, "_verification_stop_nudges", 0),
+                            )
+                        else:
+                            _verify_nudge = None
+                    except Exception:
+                        logger.debug("verification stop-loop check failed", exc_info=True)
+                        _verify_nudge = None
 
                 if _verify_nudge:
                     agent._verification_stop_nudges = (
@@ -7636,6 +7655,8 @@ def run_conversation(
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
+        except ProjectExecutionControlSignal:
+            raise
         except Exception as e:
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the

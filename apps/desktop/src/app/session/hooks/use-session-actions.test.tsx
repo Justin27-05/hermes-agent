@@ -1,15 +1,28 @@
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
-import { getAllSessionMessages, getLatestSessionMessages, getSession, type SessionInfo } from '@/hermes'
+import { deleteSession, getAllSessionMessages, getLatestSessionMessages, getSession, getSessionMessages, setSessionArchived, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
-import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
+import {
+  $projectRuntimes,
+  configureProjectRuntimeRequester,
+  projectRuntimeAuthority,
+  resetProjectRuntimeStore
+} from '@/store/project-runtime'
+import {
+  $activeProjectId,
+  $projectCatalogAuthority,
+  $projects,
+  $projectScope,
+  $projectTree,
+  ALL_PROJECTS
+} from '@/store/projects'
 import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
@@ -22,6 +35,7 @@ import {
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
+  $sessions,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setCurrentCwd,
@@ -92,6 +106,7 @@ function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     model: null,
     output_tokens: 0,
     preview: null,
+    project_id: null,
     source: 'desktop',
     started_at: 1,
     title: 'stored',
@@ -219,6 +234,9 @@ describe('active stored-session id rotation routing', () => {
     const navigate = vi.fn()
 
     setSessions([])
+    $activeProjectId.set(null)
+    $projects.set([])
+    resetProjectRuntimeStore()
     stashSessionDraft(tipBefore, 'typed during gap', [])
     setSelectedStoredSessionId(tipBefore)
     setActiveSessionId(runtimeSessionId)
@@ -572,6 +590,36 @@ describe('createBackendSessionForSend profile routing', () => {
     })
   })
 
+  it('revalidates frozen draftauthority directly before session.create after profile readiness awaits', async () => {
+    const profileReady = deferred<void>()
+    vi.mocked(ensureGatewayProfile).mockReturnValueOnce(profileReady.promise)
+
+    const requestGateway = vi.fn(async () => ({}) as never)
+    const validateDraftAuthority = vi.fn(() => true)
+    let handle: HarnessHandle | null = null
+
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    let createPromise!: Promise<null | string>
+    act(() => {
+      createPromise = handle!.createBackendSessionForSend(null, validateDraftAuthority)
+    })
+    await waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalled())
+
+    validateDraftAuthority.mockReturnValue(false)
+    profileReady.resolve()
+
+    let result: null | string = 'unexpected'
+    await act(async () => {
+      result = await createPromise
+    })
+
+    expect(result).toBeNull()
+    expect(validateDraftAuthority).toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalledWith('session.create', expect.anything())
+  })
+
   it('falls back to the entered project cwd when the current cwd is blank', async () => {
     const params = await createWith(() => {
       $projectTree.set([
@@ -645,27 +693,201 @@ function ResumeHarness({
 }
 
 describe('resumeSession failure recovery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(ensureGatewayProfile).mockResolvedValue(undefined)
+    $activeGatewayProfile.set('default')
+    $activeProjectId.set(null)
+    $projects.set([])
+    resetProjectRuntimeStore()
+    configureProjectRuntimeRequester(
+      vi.fn(async () => undefined),
+      'default'
+    )
+    $projectCatalogAuthority.set({ catalogGeneration: 0, contextGeneration: 0, profile: 'default' })
+    setSessions([storedSession({ id: 'stored-1', profile: 'default', project_id: null })])
+  })
+
   afterEach(() => {
     cleanup()
     setActiveSessionId(null)
     setResumeFailedSessionId(null)
     setMessages([])
     setSessions([])
+    $activeProjectId.set(null)
+    $projects.set([])
+    resetProjectRuntimeStore()
     vi.restoreAllMocks()
   })
 
   async function runResume(
     requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>,
     options: {
+      preserveAuthority?: boolean
       runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
       sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
     } = {}
   ): Promise<void> {
+    const existing = $sessions.get().find(session => session.id === 'stored-1')
+    const profile = existing?.profile || 'default'
+
+    if (!existing) {
+      setSessions([storedSession({ id: 'stored-1', profile, project_id: null })])
+    }
+
+    if (!options.preserveAuthority) {
+      $activeGatewayProfile.set(profile)
+      $projectCatalogAuthority.set({ catalogGeneration: 0, contextGeneration: 0, profile })
+
+      if (Object.keys($projectRuntimes.get()).length === 0 && projectRuntimeAuthority().scope !== profile) {
+        configureProjectRuntimeRequester(
+          vi.fn(async () => undefined),
+          profile
+        )
+      } else if (Object.keys($projectRuntimes.get()).length > 0 && projectRuntimeAuthority().scope === null) {
+        const runtimes = $projectRuntimes.get()
+        configureProjectRuntimeRequester(
+          vi.fn(async () => undefined),
+          profile
+        )
+        $projectRuntimes.set(runtimes)
+      }
+    }
+
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
-    render(<ResumeHarness onReady={r => (resume = r)} requestGateway={requestGateway} {...options} />)
+    const { preserveAuthority: _preserveAuthority, ...harnessOptions } = options
+
+    render(<ResumeHarness onReady={r => (resume = r)} requestGateway={requestGateway} {...harnessOptions} />)
     await waitFor(() => expect(resume).not.toBeNull())
     await resume!('stored-1', true)
   }
+
+  it('hydrates a managed primary route from ProjectRuntime without session.resume', async () => {
+    setSessions([storedSession({ id: 'stored-1', project_id: 'project-managed' })])
+    $projects.set([{ id: 'project-managed', managed: true } as never])
+    $projectRuntimes.set({
+      'project-managed': {
+        events: [],
+        snapshot: {
+          active_run: null,
+          artifacts: [],
+          binding_id: 'binding-managed',
+          block: null,
+          canonical_session_id: 'stored-1',
+          current_phase: 'implementation',
+          delivery_status: { error_code: null, state: 'caught_up' },
+          last_sequence: 1,
+          lifecycle: 'active',
+          pending_approval: null,
+          project_id: 'project-managed',
+          queue: [],
+          transcript: [{ content: 'canonical primary transcript', role: 'assistant' }],
+          transcript_revision: 1,
+          version: 1
+        }
+      }
+    })
+    const requestGateway = vi.fn()
+
+    await runResume(requestGateway as never, {
+      sessionStateByRuntimeIdRef: { current: new Map() }
+    })
+
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(getSessionMessages).not.toHaveBeenCalled()
+    expect($activeSessionId.get()).toBe('stored-1')
+  })
+
+  it('fails a catalog-managed primary boot closed while ProjectRuntime is unavailable', async () => {
+    setSessions([storedSession({ id: 'stored-1', project_id: 'project-managed' })])
+    $projects.set([{ id: 'project-managed', managed: true } as never])
+    const requestGateway = vi.fn()
+
+    await runResume(requestGateway as never)
+
+    expect(requestGateway.mock.calls.some(([method]) => method === 'session.resume')).toBe(false)
+    expect(getSessionMessages).not.toHaveBeenCalled()
+    expect($activeSessionId.get()).toBeNull()
+  })
+
+  it('switches to the exact owning profile before resuming an explicitly legacy session', async () => {
+    setSessions([storedSession({ id: 'stored-1', profile: 'work', project_id: null })])
+    const order: string[] = []
+
+    vi.mocked(ensureGatewayProfile).mockImplementation(async profile => {
+      order.push(`profile:${profile}`)
+      $activeGatewayProfile.set(profile || 'default')
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      order.push(method)
+
+      return method === 'session.resume'
+        ? ({ info: {}, messages: [], session_id: 'runtime-work' } as never)
+        : ({} as never)
+    })
+
+    await runResume(requestGateway, { preserveAuthority: true })
+
+    expect(order.indexOf('profile:work')).toBeLessThan(order.indexOf('session.resume'))
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      expect.objectContaining({ profile: 'work', session_id: 'stored-1' })
+    )
+  })
+
+  it('uses only profile-B authority when A and B reuse ids for a managed session', async () => {
+    setSessions([storedSession({ id: 'stored-1', profile: 'work', project_id: 'shared-project' })])
+    $projects.set([{ id: 'shared-project', managed: false } as never])
+    $projectCatalogAuthority.set({ catalogGeneration: 0, contextGeneration: 0, profile: 'default' })
+
+    const profileBSnapshot = {
+      active_run: null,
+      artifacts: [],
+      binding_id: 'binding-work',
+      block: null,
+      canonical_session_id: 'stored-1',
+      current_phase: 'implementation',
+      delivery_status: { error_code: null, state: 'caught_up' as const },
+      last_sequence: 1,
+      lifecycle: 'active' as const,
+      pending_approval: null,
+      project_id: 'shared-project',
+      queue: [],
+      transcript: [{ content: 'profile B canonical history', role: 'assistant' as const }],
+      transcript_revision: 1,
+      version: 1
+    }
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'project.runtime.snapshot') {
+        return profileBSnapshot as never
+      }
+
+      if (method === 'project.runtime.ack') {
+        return { binding_id: 'binding-work', cursor: 1, project_id: 'shared-project' } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(ensureGatewayProfile).mockImplementation(async profile => {
+      expect(profile).toBe('work')
+      $activeGatewayProfile.set('work')
+      $projectCatalogAuthority.set({ catalogGeneration: 1, contextGeneration: 1, profile: 'work' })
+      $projects.set([{ id: 'shared-project', managed: true } as never])
+    })
+
+    await runResume(requestGateway as never, { preserveAuthority: true })
+
+    expect(requestGateway.mock.calls.some(([method]) => method === 'session.resume')).toBe(false)
+    expect(requestGateway.mock.calls.map(([method]) => method)).toEqual([
+      'project.runtime.snapshot',
+      'project.runtime.ack'
+    ])
+    expect(getSessionMessages).not.toHaveBeenCalled()
+    expect($activeSessionId.get()).toBe('stored-1')
+  })
 
   it('arms $resumeFailedSessionId when resume RPC and REST fallback both fail', async () => {
     // session.resume rejects (e.g. timeout against a wedged backend)...
@@ -1052,7 +1274,69 @@ function BranchHarness({
   return null
 }
 
+type StoredSessionMutationActions = Pick<
+  ReturnType<typeof useSessionActions>,
+  'archiveSession' | 'branchCurrentSession' | 'branchStoredSession' | 'removeSession'
+>
+
+function StoredSessionMutationHarness({
+  activeSessionId = null,
+  onReady,
+  requestGateway,
+  runtimeIdByStoredSessionIdRef = { current: new Map() },
+  selectedStoredSessionId = null,
+  sessionStateByRuntimeIdRef = { current: new Map() }
+}: {
+  activeSessionId?: null | string
+  onReady: (actions: StoredSessionMutationActions) => void
+  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
+  selectedStoredSessionId?: null | string
+  sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
+}) {
+  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+
+  const actions = useSessionActions({
+    activeSessionId,
+    activeSessionIdRef: ref(activeSessionId),
+    busyRef: ref(false),
+    creatingSessionRef: ref(false),
+    ensureSessionState: () => ({}) as ClientSessionState,
+    getRouteToken: () => 'token',
+    getRoutedStoredSessionId: () => null,
+    navigate: vi.fn() as never,
+    requestGateway,
+    resetViewSync: vi.fn(),
+    runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionId,
+    selectedStoredSessionIdRef: ref(selectedStoredSessionId),
+    sessionStateByRuntimeIdRef,
+    syncSessionStateToView: vi.fn(),
+    updateSessionState: () => ({}) as ClientSessionState
+  })
+
+  useEffect(() => {
+    onReady(actions)
+  }, [actions, onReady])
+
+  return null
+}
+
 describe('branchStoredSession desktop source tagging', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(ensureGatewayProfile).mockResolvedValue(undefined)
+    $activeGatewayProfile.set('default')
+    $activeProjectId.set(null)
+    $projects.set([])
+    resetProjectRuntimeStore()
+    configureProjectRuntimeRequester(
+      vi.fn(async () => undefined),
+      'default'
+    )
+    $projectCatalogAuthority.set({ catalogGeneration: 0, contextGeneration: 0, profile: 'default' })
+  })
+
   afterEach(() => {
     cleanup()
     setSessions([])
@@ -1060,6 +1344,353 @@ describe('branchStoredSession desktop source tagging', () => {
     setSelectedStoredSessionId(null)
     vi.restoreAllMocks()
   })
+
+  it.each(['branch', 'delete', 'archive'] as const)(
+    'blocks direct managed-session %s before transcript, optimistic state, or legacy mutation',
+    async operation => {
+      const managed = storedSession({
+        id: 'stored-managed',
+        message_count: 1,
+        profile: 'default',
+        project_id: 'project-managed'
+      })
+
+      setSessions([managed])
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $projectRuntimes.set({
+        'project-managed': {
+          events: [],
+          snapshot: {
+            active_run: null,
+            artifacts: [],
+            binding_id: 'binding-managed',
+            block: null,
+            canonical_session_id: 'stored-managed',
+            current_phase: 'implementation',
+            delivery_status: { error_code: null, state: 'caught_up' },
+            last_sequence: 1,
+            lifecycle: 'active',
+            pending_approval: null,
+            project_id: 'project-managed',
+            queue: [],
+            transcript: [],
+            transcript_revision: 0,
+            version: 1
+          }
+        }
+      })
+
+      const requestGateway = vi.fn()
+      let actions: StoredSessionMutationActions | null = null
+
+      render(
+        <StoredSessionMutationHarness onReady={ready => (actions = ready)} requestGateway={requestGateway as never} />
+      )
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      if (operation === 'branch') {
+        await expect(actions!.branchStoredSession('stored-managed')).resolves.toBe(false)
+      } else if (operation === 'delete') {
+        await expect(actions!.removeSession('stored-managed')).resolves.toBeUndefined()
+      } else {
+        await expect(actions!.archiveSession('stored-managed')).resolves.toBeUndefined()
+      }
+
+      expect(getSessionMessages).not.toHaveBeenCalled()
+      expect(deleteSession).not.toHaveBeenCalled()
+      expect(setSessionArchived).not.toHaveBeenCalled()
+      expect(requestGateway).not.toHaveBeenCalled()
+      expect($sessions.get()).toEqual([managed])
+    }
+  )
+
+  it('blocks the direct current-session branch action for a managed project surface', async () => {
+    const managed = storedSession({
+      id: 'stored-managed',
+      message_count: 1,
+      profile: 'default',
+      project_id: 'project-managed'
+    })
+
+    setSessions([managed])
+    setMessages([{ id: 'user-1', parts: [{ text: 'managed work', type: 'text' }], role: 'user' }])
+    $projects.set([{ id: 'project-managed', managed: true } as never])
+    $projectRuntimes.set({
+      'project-managed': {
+        events: [],
+        snapshot: {
+          active_run: null,
+          artifacts: [],
+          binding_id: 'binding-managed',
+          block: null,
+          canonical_session_id: 'stored-managed',
+          current_phase: 'implementation',
+          delivery_status: { error_code: null, state: 'caught_up' },
+          last_sequence: 1,
+          lifecycle: 'active',
+          pending_approval: null,
+          project_id: 'project-managed',
+          queue: [],
+          transcript: [{ content: 'managed work', role: 'user' }],
+          transcript_revision: 1,
+          version: 1
+        }
+      }
+    })
+    const requestGateway = vi.fn()
+    let actions: StoredSessionMutationActions | null = null
+
+    render(
+      <StoredSessionMutationHarness
+        activeSessionId="runtime-managed"
+        onReady={ready => (actions = ready)}
+        requestGateway={requestGateway as never}
+        selectedStoredSessionId="stored-managed"
+      />
+    )
+    await waitFor(() => expect(actions).not.toBeNull())
+
+    await expect(actions!.branchCurrentSession()).resolves.toBe(false)
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it.each(['delete', 'archive'] as const)(
+    'blocks %s when legacy C is paired with a live R owned by another managed canonical session',
+    async operation => {
+      const legacy = storedSession({ id: 'stored-legacy', project_id: null })
+
+      setSessions([legacy])
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $projectRuntimes.set({
+        'project-managed': {
+          events: [],
+          snapshot: {
+            active_run: null,
+            artifacts: [],
+            binding_id: 'binding-managed',
+            block: null,
+            canonical_session_id: 'runtime-managed',
+            current_phase: 'implementation',
+            delivery_status: { error_code: null, state: 'caught_up' },
+            last_sequence: 1,
+            lifecycle: 'active',
+            pending_approval: null,
+            project_id: 'project-managed',
+            queue: [],
+            transcript: [],
+            transcript_revision: 1,
+            version: 1
+          }
+        }
+      })
+      const requestGateway = vi.fn()
+      let actions: StoredSessionMutationActions | null = null
+
+      render(
+        <StoredSessionMutationHarness
+          activeSessionId="runtime-managed"
+          onReady={ready => (actions = ready)}
+          requestGateway={requestGateway as never}
+          runtimeIdByStoredSessionIdRef={{ current: new Map([['stored-legacy', 'runtime-managed']]) }}
+          selectedStoredSessionId="stored-legacy"
+        />
+      )
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      if (operation === 'delete') {
+        await actions!.removeSession('stored-legacy')
+      } else {
+        await actions!.archiveSession('stored-legacy')
+      }
+
+      expect(requestGateway).not.toHaveBeenCalled()
+      expect(deleteSession).not.toHaveBeenCalled()
+      expect(setSessionArchived).not.toHaveBeenCalled()
+      expect($sessions.get()).toEqual([legacy])
+    }
+  )
+
+  it.each(['delete', 'archive'] as const)(
+    'blocks %s when any cached R for C is managed even when the reverse map still points at legacy R1',
+    async operation => {
+      const legacy = storedSession({ id: 'stored-legacy', project_id: null })
+      const runtimeIds = { current: new Map([['stored-legacy', 'runtime-legacy']]) }
+      const states = {
+        current: new Map([
+          ['runtime-legacy', { storedSessionId: 'stored-legacy' } as ClientSessionState],
+          ['runtime-managed', { storedSessionId: 'stored-legacy' } as ClientSessionState]
+        ])
+      }
+
+      setSessions([legacy])
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $projectRuntimes.set({
+        'project-managed': {
+          events: [],
+          snapshot: {
+            active_run: null,
+            artifacts: [],
+            binding_id: 'binding-managed',
+            block: null,
+            canonical_session_id: 'runtime-managed',
+            current_phase: 'implementation',
+            delivery_status: { error_code: null, state: 'caught_up' },
+            last_sequence: 1,
+            lifecycle: 'active',
+            pending_approval: null,
+            project_id: 'project-managed',
+            queue: [],
+            transcript: [],
+            transcript_revision: 1,
+            version: 1
+          }
+        }
+      })
+      let actions: StoredSessionMutationActions | null = null
+
+      render(
+        <StoredSessionMutationHarness
+          onReady={ready => (actions = ready)}
+          requestGateway={vi.fn() as never}
+          runtimeIdByStoredSessionIdRef={runtimeIds}
+          sessionStateByRuntimeIdRef={states}
+        />
+      )
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      if (operation === 'delete') {
+        await actions!.removeSession('stored-legacy')
+      } else {
+        await actions!.archiveSession('stored-legacy')
+      }
+
+      expect(deleteSession).not.toHaveBeenCalled()
+      expect(setSessionArchived).not.toHaveBeenCalled()
+      expect($sessions.get()).toEqual([legacy])
+    }
+  )
+
+  it.each(['delete', 'archive'] as const)(
+    'does not evict a managed R2 rebound while legacy %s is awaiting the server',
+    async operation => {
+      const legacy = storedSession({ id: 'stored-legacy', project_id: null })
+      const runtimeIds = { current: new Map([['stored-legacy', 'runtime-legacy']]) }
+
+      const states = {
+        current: new Map([
+          ['runtime-legacy', { storedSessionId: 'stored-legacy' } as ClientSessionState],
+          ['runtime-managed', { storedSessionId: 'managed-D' } as ClientSessionState]
+        ])
+      }
+
+      const pending = deferred<{ ok: boolean }>()
+
+      setSessions([legacy])
+
+      if (operation === 'delete') {
+        vi.mocked(deleteSession).mockReturnValue(pending.promise)
+      } else {
+        vi.mocked(setSessionArchived).mockReturnValue(pending.promise)
+      }
+
+      let actions: StoredSessionMutationActions | null = null
+
+      render(
+        <StoredSessionMutationHarness
+          onReady={ready => (actions = ready)}
+          requestGateway={vi.fn() as never}
+          runtimeIdByStoredSessionIdRef={runtimeIds}
+          sessionStateByRuntimeIdRef={states}
+        />
+      )
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      const action =
+        operation === 'delete' ? actions!.removeSession('stored-legacy') : actions!.archiveSession('stored-legacy')
+
+      await waitFor(() => expect(operation === 'delete' ? deleteSession : setSessionArchived).toHaveBeenCalled())
+
+      runtimeIds.current.set('stored-legacy', 'runtime-managed')
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $projectRuntimes.set({
+        'project-managed': {
+          events: [],
+          snapshot: {
+            active_run: null,
+            artifacts: [],
+            binding_id: 'binding-managed',
+            block: null,
+            canonical_session_id: 'runtime-managed',
+            current_phase: 'implementation',
+            delivery_status: { error_code: null, state: 'caught_up' },
+            last_sequence: 1,
+            lifecycle: 'active',
+            pending_approval: null,
+            project_id: 'project-managed',
+            queue: [],
+            transcript: [],
+            transcript_revision: 1,
+            version: 1
+          }
+        }
+      })
+      pending.resolve({ ok: true })
+      await action
+
+      expect(runtimeIds.current.get('stored-legacy')).toBe('runtime-managed')
+      expect(states.current.has('runtime-managed')).toBe(true)
+    }
+  )
+
+  it.each(['delete', 'archive'] as const)(
+    'does not evict a same-R/C replacement from another profile while legacy %s awaits REST',
+    async operation => {
+      const legacy = storedSession({ id: 'same-C', profile: 'default', project_id: null })
+      const runtimeIds = { current: new Map([['same-C', 'same-R']]) }
+      const states = {
+        current: new Map([['same-R', { storedSessionId: 'same-C' } as ClientSessionState]])
+      }
+      const pending = deferred<{ ok: boolean }>()
+
+      setSessions([legacy])
+
+      if (operation === 'delete') {
+        vi.mocked(deleteSession).mockReturnValue(pending.promise)
+      } else {
+        vi.mocked(setSessionArchived).mockReturnValue(pending.promise)
+      }
+
+      let actions: StoredSessionMutationActions | null = null
+
+      render(
+        <StoredSessionMutationHarness
+          onReady={ready => (actions = ready)}
+          requestGateway={vi.fn() as never}
+          runtimeIdByStoredSessionIdRef={runtimeIds}
+          sessionStateByRuntimeIdRef={states}
+        />
+      )
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      const action = operation === 'delete' ? actions!.removeSession('same-C') : actions!.archiveSession('same-C')
+
+      await waitFor(() => expect(operation === 'delete' ? deleteSession : setSessionArchived).toHaveBeenCalled())
+
+      $activeGatewayProfile.set('work')
+      configureProjectRuntimeRequester(
+        vi.fn(async () => undefined),
+        'work'
+      )
+      $projectCatalogAuthority.set({ catalogGeneration: 2, contextGeneration: 2, profile: 'work' })
+      setSessions([storedSession({ id: 'same-C', profile: 'work', project_id: null })])
+
+      pending.resolve({ ok: true })
+      await action
+
+      expect(runtimeIds.current.get('same-C')).toBe('same-R')
+      expect(states.current.has('same-R')).toBe(true)
+    }
+  )
 
   it('opens the branch as a new tab and leaves the parent chat selected', async () => {
     const requestGateway = vi.fn(async (method: string) => {
@@ -1354,12 +1985,55 @@ describe('resumeSession drops a redundant tile when the session loads into main'
 const clientState = (storedSessionId: string | null): ClientSessionState => createClientSessionState(storedSessionId)
 
 describe('resumeSession warm-cache mapping integrity', () => {
+  const reboundToManaged = (canonicalSessionId: string) => {
+    $projects.set([{ id: 'project-managed', managed: true } as never])
+    $projectRuntimes.set({
+      'project-managed': {
+        events: [],
+        snapshot: {
+          active_run: null,
+          artifacts: [],
+          binding_id: 'binding-managed',
+          block: null,
+          canonical_session_id: canonicalSessionId,
+          current_phase: 'implementation',
+          delivery_status: { error_code: null, state: 'caught_up' },
+          last_sequence: 2,
+          lifecycle: 'active',
+          pending_approval: null,
+          project_id: 'project-managed',
+          queue: [],
+          transcript: [{ content: 'managed replacement', role: 'assistant' }],
+          transcript_revision: 2,
+          version: 2
+        }
+      }
+    })
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    $activeGatewayProfile.set('default')
+    $activeProjectId.set(null)
+    $projects.set([])
+    resetProjectRuntimeStore()
+    configureProjectRuntimeRequester(
+      vi.fn(async () => undefined),
+      'default'
+    )
+    $projectCatalogAuthority.set({ catalogGeneration: 0, contextGeneration: 0, profile: 'default' })
+    setSessions([storedSession({ id: 'stored-A', project_id: null })])
+  })
+
   afterEach(() => {
     cleanup()
     setActiveSessionId(null)
     setResumeFailedSessionId(null)
     setMessages([])
     setSessions([])
+    $activeProjectId.set(null)
+    $projects.set([])
+    resetProjectRuntimeStore()
     vi.restoreAllMocks()
   })
 
@@ -1463,6 +2137,161 @@ describe('resumeSession warm-cache mapping integrity', () => {
       expect.objectContaining({ omit_messages: true, session_id: 'rt-A' })
     )
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
+  })
+
+  it('does not publish a warm session.activate result after C rebounds to managed on the same R', async () => {
+    const runtimeIdByStoredSessionIdRef = {
+      current: new Map([['stored-A', 'same-R']])
+    } satisfies MutableRefObject<Map<string, string>>
+    const sessionStateByRuntimeIdRef = {
+      current: new Map([['same-R', clientState('stored-A')]])
+    } satisfies MutableRefObject<Map<string, ClientSessionState>>
+    const activated = deferred<{
+      info: Record<string, never>
+      messages: never[]
+      running: boolean
+      session_id: string
+      session_key: string
+    }>()
+    const onStateUpdate = vi.fn()
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return (await activated.promise) as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        onStateUpdate={onStateUpdate}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    let action!: Promise<unknown>
+    act(() => {
+      action = resume!('stored-A', true)
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.activate', expect.anything()))
+
+    reboundToManaged('same-R')
+    activated.resolve({
+      info: {},
+      messages: [],
+      running: false,
+      session_id: 'same-R',
+      session_key: 'stored-A'
+    })
+    await action
+
+    expect(onStateUpdate).not.toHaveBeenCalled()
+  })
+
+  it('does not publish a warm REST prefetch after authority rebounds while activation is settling', async () => {
+    const runtimeIdByStoredSessionIdRef = {
+      current: new Map([['stored-A', 'same-R']])
+    } satisfies MutableRefObject<Map<string, string>>
+    const sessionStateByRuntimeIdRef = {
+      current: new Map([['same-R', clientState('stored-A')]])
+    } satisfies MutableRefObject<Map<string, ClientSessionState>>
+    const prefetch = deferred<{ messages: never[]; session_id: string }>()
+    const onStateUpdate = vi.fn()
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          messages: [],
+          running: false,
+          session_id: 'same-R',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getSessionMessages).mockReturnValue(prefetch.promise as never)
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        onStateUpdate={onStateUpdate}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    let action!: Promise<unknown>
+    act(() => {
+      action = resume!('stored-A', true)
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.activate', expect.anything()))
+
+    reboundToManaged('same-R')
+    prefetch.resolve({ messages: [], session_id: 'stored-A' })
+    await action
+
+    expect(onStateUpdate).not.toHaveBeenCalled()
+  })
+
+  it('does not publish a cold session.resume result after same-C/R is replaced by another profile', async () => {
+    const resumed = deferred<{
+      info: Record<string, never>
+      messages: never[]
+      running: boolean
+      session_id: string
+      session_key: string
+    }>()
+    const onStateUpdate = vi.fn()
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return (await resumed.promise) as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(<ResumeHarness onReady={ready => (resume = ready)} onStateUpdate={onStateUpdate} requestGateway={requestGateway} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    let action!: Promise<unknown>
+    act(() => {
+      action = resume!('stored-A', true)
+    })
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.resume', expect.anything()))
+
+    $activeGatewayProfile.set('work')
+    configureProjectRuntimeRequester(
+      vi.fn(async () => undefined),
+      'work'
+    )
+    $projectCatalogAuthority.set({ catalogGeneration: 2, contextGeneration: 2, profile: 'work' })
+    setSessions([storedSession({ id: 'stored-A', profile: 'work', project_id: 'project-managed' })])
+    reboundToManaged('same-R')
+    resumed.resolve({
+      info: {},
+      messages: [],
+      running: false,
+      session_id: 'same-R',
+      session_key: 'stored-A'
+    })
+    await action
+
+    expect(onStateUpdate).not.toHaveBeenCalled()
   })
 
   it('preserves cached image attachments through an idle persisted transcript refresh', async () => {
@@ -1710,4 +2539,361 @@ describe('selectSidebarItem', () => {
     expect(noteActiveTreeGroup).toHaveBeenCalledWith(null)
     expect(revealTreePane).toHaveBeenCalledWith('workspace')
   })
+
+type CleanupMutationActions = Pick<ReturnType<typeof useSessionActions>, 'archiveSession' | 'removeSession'>
+
+function CleanupMutationHarness({
+  activeSessionId = null,
+  onReady,
+  requestGateway,
+  runtimeIdByStoredSessionIdRef = { current: new Map() },
+  selectedStoredSessionId = null,
+  sessionStateByRuntimeIdRef = { current: new Map() }
+}: {
+  activeSessionId?: null | string
+  onReady: (actions: CleanupMutationActions) => void
+  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
+  selectedStoredSessionId?: null | string
+  sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
+}) {
+  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+
+  const actions = useSessionActions({
+    activeSessionId,
+    activeSessionIdRef: ref(activeSessionId),
+    busyRef: ref(false),
+    creatingSessionRef: ref(false),
+    ensureSessionState: () => ({}) as ClientSessionState,
+    getRouteToken: () => 'token',
+    getRoutedStoredSessionId: () => null,
+    navigate: vi.fn() as never,
+    requestGateway,
+    resetViewSync: vi.fn(),
+    runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionId,
+    selectedStoredSessionIdRef: ref(selectedStoredSessionId),
+    sessionStateByRuntimeIdRef,
+    syncSessionStateToView: vi.fn(),
+    updateSessionState: () => ({}) as ClientSessionState
+  })
+
+  useEffect(() => {
+    onReady(actions)
+  }, [actions, onReady])
+
+  return null
+}
+
+describe('stored-session cleanup authority', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(ensureGatewayProfile).mockResolvedValue(undefined)
+    $activeGatewayProfile.set('default')
+    $activeProjectId.set(null)
+    $projects.set([])
+    resetProjectRuntimeStore()
+    configureProjectRuntimeRequester(
+      vi.fn(async () => undefined),
+      'default'
+    )
+    $projectCatalogAuthority.set({ catalogGeneration: 0, contextGeneration: 0, profile: 'default' })
+  })
+
+  afterEach(() => {
+    cleanup()
+    setSessions([])
+    $sessionTiles.set([])
+    setSelectedStoredSessionId(null)
+    vi.restoreAllMocks()
+  })
+
+  it.each(['delete', 'archive'] as const)(
+    'blocks direct managed-session %s before optimistic or remote cleanup',
+    async operation => {
+      const managed = storedSession({ id: 'stored-managed', message_count: 1, project_id: 'project-managed' })
+      setSessions([managed])
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $projectRuntimes.set({
+        'project-managed': {
+          events: [],
+          snapshot: {
+            active_run: null,
+            artifacts: [],
+            binding_id: 'binding-managed',
+            block: null,
+            canonical_session_id: 'stored-managed',
+            current_phase: 'implementation',
+            delivery_status: { error_code: null, state: 'caught_up' },
+            last_sequence: 1,
+            lifecycle: 'active',
+            pending_approval: null,
+            project_id: 'project-managed',
+            queue: [],
+            transcript: [],
+            transcript_revision: 0,
+            version: 1
+          }
+        }
+      })
+      const requestGateway = vi.fn()
+      let actions: CleanupMutationActions | null = null
+      render(<CleanupMutationHarness onReady={ready => (actions = ready)} requestGateway={requestGateway as never} />)
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      if (operation === 'delete') {
+        await actions!.removeSession('stored-managed')
+      } else {
+        await actions!.archiveSession('stored-managed')
+      }
+
+      expect(deleteSession).not.toHaveBeenCalled()
+      expect(setSessionArchived).not.toHaveBeenCalled()
+      expect(requestGateway).not.toHaveBeenCalled()
+      expect($sessions.get()).toEqual([managed])
+    }
+  )
+
+  it.each(['delete', 'archive'] as const)(
+    'blocks %s when legacy C is paired with a live R owned by another managed canonical session',
+    async operation => {
+      const legacy = storedSession({ id: 'stored-legacy', project_id: null })
+
+      setSessions([legacy])
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $projectRuntimes.set({
+        'project-managed': {
+          events: [],
+          snapshot: {
+            active_run: null,
+            artifacts: [],
+            binding_id: 'binding-managed',
+            block: null,
+            canonical_session_id: 'runtime-managed',
+            current_phase: 'implementation',
+            delivery_status: { error_code: null, state: 'caught_up' },
+            last_sequence: 1,
+            lifecycle: 'active',
+            pending_approval: null,
+            project_id: 'project-managed',
+            queue: [],
+            transcript: [],
+            transcript_revision: 1,
+            version: 1
+          }
+        }
+      })
+      const requestGateway = vi.fn()
+      let actions: CleanupMutationActions | null = null
+
+      render(
+        <CleanupMutationHarness
+          activeSessionId="runtime-managed"
+          onReady={ready => (actions = ready)}
+          requestGateway={requestGateway as never}
+          runtimeIdByStoredSessionIdRef={{ current: new Map([['stored-legacy', 'runtime-managed']]) }}
+          selectedStoredSessionId="stored-legacy"
+        />
+      )
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      if (operation === 'delete') {
+        await actions!.removeSession('stored-legacy')
+      } else {
+        await actions!.archiveSession('stored-legacy')
+      }
+
+      expect(requestGateway).not.toHaveBeenCalled()
+      expect(deleteSession).not.toHaveBeenCalled()
+      expect(setSessionArchived).not.toHaveBeenCalled()
+      expect($sessions.get()).toEqual([legacy])
+    }
+  )
+
+  it.each(['delete', 'archive'] as const)(
+    'blocks %s when any cached R for C is managed even when the reverse map still points at legacy R1',
+    async operation => {
+      const legacy = storedSession({ id: 'stored-legacy', project_id: null })
+      const runtimeIds = { current: new Map([['stored-legacy', 'runtime-legacy']]) }
+
+      const states = {
+        current: new Map([
+          ['runtime-legacy', { storedSessionId: 'stored-legacy' } as ClientSessionState],
+          ['runtime-managed', { storedSessionId: 'stored-legacy' } as ClientSessionState]
+        ])
+      }
+
+      setSessions([legacy])
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $projectRuntimes.set({
+        'project-managed': {
+          events: [],
+          snapshot: {
+            active_run: null,
+            artifacts: [],
+            binding_id: 'binding-managed',
+            block: null,
+            canonical_session_id: 'runtime-managed',
+            current_phase: 'implementation',
+            delivery_status: { error_code: null, state: 'caught_up' },
+            last_sequence: 1,
+            lifecycle: 'active',
+            pending_approval: null,
+            project_id: 'project-managed',
+            queue: [],
+            transcript: [],
+            transcript_revision: 1,
+            version: 1
+          }
+        }
+      })
+      let actions: CleanupMutationActions | null = null
+
+      render(
+        <CleanupMutationHarness
+          onReady={ready => (actions = ready)}
+          requestGateway={vi.fn() as never}
+          runtimeIdByStoredSessionIdRef={runtimeIds}
+          sessionStateByRuntimeIdRef={states}
+        />
+      )
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      if (operation === 'delete') {
+        await actions!.removeSession('stored-legacy')
+      } else {
+        await actions!.archiveSession('stored-legacy')
+      }
+
+      expect(deleteSession).not.toHaveBeenCalled()
+      expect(setSessionArchived).not.toHaveBeenCalled()
+      expect($sessions.get()).toEqual([legacy])
+    }
+  )
+
+  it.each(['delete', 'archive'] as const)(
+    'does not evict a managed R2 rebound while legacy %s is awaiting the server',
+    async operation => {
+      const legacy = storedSession({ id: 'stored-legacy', project_id: null })
+      const runtimeIds = { current: new Map([['stored-legacy', 'runtime-legacy']]) }
+
+      const states = {
+        current: new Map([
+          ['runtime-legacy', { storedSessionId: 'stored-legacy' } as ClientSessionState],
+          ['runtime-managed', { storedSessionId: 'managed-D' } as ClientSessionState]
+        ])
+      }
+
+      const pending = deferred<{ ok: boolean }>()
+
+      setSessions([legacy])
+
+      if (operation === 'delete') {
+        vi.mocked(deleteSession).mockReturnValue(pending.promise)
+      } else {
+        vi.mocked(setSessionArchived).mockReturnValue(pending.promise)
+      }
+
+      let actions: CleanupMutationActions | null = null
+
+      render(
+        <CleanupMutationHarness
+          onReady={ready => (actions = ready)}
+          requestGateway={vi.fn() as never}
+          runtimeIdByStoredSessionIdRef={runtimeIds}
+          sessionStateByRuntimeIdRef={states}
+        />
+      )
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      const action =
+        operation === 'delete' ? actions!.removeSession('stored-legacy') : actions!.archiveSession('stored-legacy')
+
+      await waitFor(() => expect(operation === 'delete' ? deleteSession : setSessionArchived).toHaveBeenCalled())
+
+      runtimeIds.current.set('stored-legacy', 'runtime-managed')
+      $projects.set([{ id: 'project-managed', managed: true } as never])
+      $projectRuntimes.set({
+        'project-managed': {
+          events: [],
+          snapshot: {
+            active_run: null,
+            artifacts: [],
+            binding_id: 'binding-managed',
+            block: null,
+            canonical_session_id: 'runtime-managed',
+            current_phase: 'implementation',
+            delivery_status: { error_code: null, state: 'caught_up' },
+            last_sequence: 1,
+            lifecycle: 'active',
+            pending_approval: null,
+            project_id: 'project-managed',
+            queue: [],
+            transcript: [],
+            transcript_revision: 1,
+            version: 1
+          }
+        }
+      })
+      pending.resolve({ ok: true })
+      await action
+
+      expect(runtimeIds.current.get('stored-legacy')).toBe('runtime-managed')
+      expect(states.current.has('runtime-managed')).toBe(true)
+    }
+  )
+
+  it.each(['delete', 'archive'] as const)(
+    'does not evict a same-R/C replacement from another profile while legacy %s awaits REST',
+    async operation => {
+      const legacy = storedSession({ id: 'same-C', profile: 'default', project_id: null })
+      const runtimeIds = { current: new Map([['same-C', 'same-R']]) }
+
+      const states = {
+        current: new Map([['same-R', { storedSessionId: 'same-C' } as ClientSessionState]])
+      }
+
+      const pending = deferred<{ ok: boolean }>()
+
+      setSessions([legacy])
+
+      if (operation === 'delete') {
+        vi.mocked(deleteSession).mockReturnValue(pending.promise)
+      } else {
+        vi.mocked(setSessionArchived).mockReturnValue(pending.promise)
+      }
+
+      let actions: CleanupMutationActions | null = null
+
+      render(
+        <CleanupMutationHarness
+          onReady={ready => (actions = ready)}
+          requestGateway={vi.fn() as never}
+          runtimeIdByStoredSessionIdRef={runtimeIds}
+          sessionStateByRuntimeIdRef={states}
+        />
+      )
+      await waitFor(() => expect(actions).not.toBeNull())
+
+      const action = operation === 'delete' ? actions!.removeSession('same-C') : actions!.archiveSession('same-C')
+
+      await waitFor(() => expect(operation === 'delete' ? deleteSession : setSessionArchived).toHaveBeenCalled())
+
+      $activeGatewayProfile.set('work')
+      configureProjectRuntimeRequester(
+        vi.fn(async () => undefined),
+        'work'
+      )
+      $projectCatalogAuthority.set({ catalogGeneration: 2, contextGeneration: 2, profile: 'work' })
+      setSessions([storedSession({ id: 'same-C', profile: 'work', project_id: null })])
+
+      pending.resolve({ ok: true })
+      await action
+
+      expect(runtimeIds.current.get('same-C')).toBe('same-R')
+      expect(states.current.has('same-R')).toBe(true)
+    }
+  )
+})
+
 })

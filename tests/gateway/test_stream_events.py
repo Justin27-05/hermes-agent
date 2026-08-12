@@ -20,6 +20,7 @@ from gateway.stream_events import (
     MessageStop,
     ToolCallChunk,
     ToolCallFinished,
+    canonical_project_event_notice,
 )
 
 
@@ -103,3 +104,48 @@ def test_new_mode_dedups_same_tool():
 # ── Control events → gateway-owned hooks ─────────────────────────────────────
 
 
+
+def test_gateway_notice_routes_to_hook():
+    seen = []
+    d = GatewayEventDispatcher(
+        _base_adapter(), _FakeSink(), on_notice=seen.append,
+    )
+    d.dispatch(GatewayNotice(kind="restart", text="Gateway restarted"))
+    assert seen[0].kind == "restart"
+
+
+def test_dispatch_swallows_render_errors():
+    """A render error must never propagate into the agent worker thread."""
+    adapter = _base_adapter()
+    def _boom(event, sink):
+        raise RuntimeError("render blew up")
+    adapter.render_message_event = _boom
+    d = GatewayEventDispatcher(adapter, _FakeSink())
+    d.dispatch(MessageChunk("x"))  # must not raise
+
+
+def test_project_event_notice_is_only_a_replay_hint():
+    from types import MappingProxyType
+
+    from hermes_cli.project_events import ProjectEvent
+
+    event = ProjectEvent(
+        event_id="event-1",
+        project_id="project-1",
+        sequence=7,
+        kind="run.progress",
+        turn_id="turn-1",
+        payload=MappingProxyType({"text": "not-for-live-hint"}),
+        created_at="2026-07-29T00:00:00Z",
+    )
+
+    notice = canonical_project_event_notice(event)
+
+    assert notice == GatewayNotice(
+        kind="project_event",
+        extra={
+            "event_id": "event-1",
+            "project_id": "project-1",
+            "sequence": 7,
+        },
+    )

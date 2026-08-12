@@ -95,6 +95,11 @@ def build_parser(
     p_restore = sub.add_parser("restore", help="Restore an archived project")
     p_restore.add_argument("project", help="Project id or slug")
 
+    p_delete = sub.add_parser(
+        "delete", help="Hard-delete a project that was never managed"
+    )
+    p_delete.add_argument("project", help="Project id or slug")
+
     p_bind = sub.add_parser("bind-board", help="Bind a kanban board to a project")
     p_bind.add_argument("project", help="Project id or slug")
     p_bind.add_argument(
@@ -132,6 +137,7 @@ def projects_command(args: argparse.Namespace) -> int:
         "use": _cmd_use,
         "archive": _cmd_archive,
         "restore": _cmd_restore,
+        "delete": _cmd_delete,
         "bind-board": _cmd_bind_board,
     }
     handler = handlers.get(action)
@@ -163,6 +169,32 @@ def _with_project(fn):
                 return 1
             try:
                 return fn(args, conn, proj)
+            except pdb.ManagedProjectDeleteError:
+                print(
+                    f"project: {pdb.PROJECT_MANAGED_DELETE_FORBIDDEN}: "
+                    "managed projects cannot be deleted; "
+                    "complete and archive the project instead",
+                    file=sys.stderr,
+                )
+                return 2
+            except pdb.ManagedProjectArchiveError:
+                print(
+                    f"project: "
+                    f"{pdb.PROJECT_MANAGED_ARCHIVE_REQUIRES_COMPLETION}: "
+                    "managed projects must be completed "
+                    "before they can be archived",
+                    file=sys.stderr,
+                )
+                return 2
+            except pdb.ManagedProjectMutationError:
+                print(
+                    f"project: "
+                    f"{pdb.PROJECT_MANAGED_MUTATION_REQUIRES_COMMAND}: "
+                    "managed projects must be changed through "
+                    "the canonical project command",
+                    file=sys.stderr,
+                )
+                return 2
             except ValueError as exc:
                 print(f"project: {exc}", file=sys.stderr)
                 return 2
@@ -300,6 +332,13 @@ def _cmd_archive(args, conn, proj) -> int:
 def _cmd_restore(args, conn, proj) -> int:
     pdb.restore_project(conn, proj.id)
     print(f"Restored {proj.slug}")
+    return 0
+
+
+@_with_project
+def _cmd_delete(args, conn, proj) -> int:
+    pdb.delete_project(conn, proj.id)
+    print(f"Deleted {proj.slug}")
     return 0
 
 

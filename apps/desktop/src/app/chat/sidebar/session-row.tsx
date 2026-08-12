@@ -194,6 +194,7 @@ function SidebarSessionRowImpl({
       pinned={isPinned}
       profile={session.profile}
       sessionId={session.id}
+      storedSession={session}
       title={title}
     >
       <SidebarRowShell
@@ -223,6 +224,7 @@ function SidebarSessionRowImpl({
               pinned={isPinned}
               profile={session.profile}
               sessionId={session.id}
+              storedSession={session}
               title={title}
             >
               <Button

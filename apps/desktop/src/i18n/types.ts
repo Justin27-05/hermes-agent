@@ -1588,10 +1588,15 @@ export interface Translations {
       create: string
       menu: string
       menuRename: string
+      menuAcceptCompletion: string
       menuAppearance: string
+      menuContinueWork: string
       noColor: string
       menuAddFolder: string
+      menuReopen: string
+      menuResume: string
       menuSetActive: string
+      menuStop: string
       menuDelete: string
       moveToProject: string
       movedTo: (name: string) => string
@@ -1601,7 +1606,23 @@ export interface Translations {
       reveal: string
       copyPath: string
       removeFromSidebar: string
+      activationFailed: string
       createFailed: string
+      mutationConflict: string
+      mutationFailed: string
+      mutationPending: string
+      mutationRetry: string
+      runtimeApproval: string
+      runtimeApprovalNone: string
+      runtimeApprovalPending: string
+      runtimeBlock: string
+      runtimeBlockNone: string
+      runtimeDelivery: string
+      runtimeLifecycle: string
+      runtimePhase: string
+      runtimeQueue: string
+      runtimeRetryPending: string
+      runtimeStatus: string
       staleBackend: string
       deleteConfirm: string
       startWork: string
@@ -1790,6 +1811,26 @@ export interface Translations {
     stop: string
     dismiss: string
     exit: (code: number) => string
+    managedProject: {
+      ambiguousSession: string
+      attachmentsUnsupported: string
+      conflict: string
+      historyUnsupported: string
+      invalidRetryReceipt: string
+      legacyDraftRecovery: string
+      messageFailed: string
+      missingAcceptedTurn: string
+      restoreDraft: string
+      retryFailed: string
+      retryRequired: string
+      retryScopeChanged: string
+      retryUnavailable: string
+      stopUnavailable: string
+      runtimeUnavailable: string
+      voiceDraftRecovery: string
+      voiceScopeChanged: string
+      title: string
+    }
     coding: {
       title: string
       noBranch: string
@@ -2380,6 +2421,7 @@ export interface Translations {
       alwaysAllow: string
     }
     clarify: {
+      managedUnsupported: string
       notReady: string
       gatewayDisconnected: string
       sendFailed: string

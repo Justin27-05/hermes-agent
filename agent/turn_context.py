@@ -456,6 +456,9 @@ def build_turn_context(
     """
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
+    project_mode = (
+        getattr(agent, "_hermetic_project_mode", False) is True
+    )
 
     # Recover a session rotated by another path before binding log/turn ids or
     # copying client-supplied history. Everything in this turn must consistently
@@ -1152,33 +1155,40 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
-        )
+        if project_mode:
+            _pre_results = ()
+        else:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _pre_results = _invoke_hook(
+                "pre_llm_call",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                is_first_turn=(not bool(conversation_history)),
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
+            )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin
         # can't inflate every subsequent turn's prompt. Ported from
         # openai/codex PR #21069 ("Spill large hook outputs from context").
-        try:
-            from tools.hook_output_spill import (
-                get_spill_config as _spill_cfg,
-                spill_if_oversized as _spill_if_oversized,
-            )
-            _spill_config_cached = _spill_cfg()
-        except Exception:
+        if project_mode:
             _spill_if_oversized = None  # type: ignore[assignment]
             _spill_config_cached = None
+        else:
+            try:
+                from tools.hook_output_spill import (
+                    get_spill_config as _spill_cfg,
+                    spill_if_oversized as _spill_if_oversized,
+                )
+                _spill_config_cached = _spill_cfg()
+            except Exception:
+                _spill_if_oversized = None  # type: ignore[assignment]
+                _spill_config_cached = None
         for r in _pre_results:
             _piece: str = ""
             if isinstance(r, dict) and r.get("context"):
@@ -1246,7 +1256,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if agent._memory_manager and not project_mode:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1258,7 +1268,7 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and not project_mode:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):

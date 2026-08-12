@@ -11,3 +11,14 @@ class EmptyStreamError(RuntimeError):
 
 class MoAPresetNotFoundError(ValueError):
     """Raised when a persisted MoA preset no longer exists in config."""
+
+
+class ProjectExecutionControlSignal(Exception):
+    """Terminal project-turn signal that must bypass conversation retries."""
+
+
+class ProjectToolExecutionDenied(
+    PermissionError,
+    ProjectExecutionControlSignal,
+):
+    """Fail-closed project firewall denial."""

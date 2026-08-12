@@ -120,6 +120,65 @@ async def test_unknown_slash_command_returns_guidance(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unknown_slash_command_underscored_form_also_guarded(monkeypatch):
+    """Telegram may send /foo_bar — same guard must trigger for underscored
+    commands that normalize to unknown hyphenated names."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError(
+            "unknown slash command leaked through to the agent"
+        )
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("/made_up_thing"))
+
+    assert result is not None
+    assert "Unknown command" in result
+    assert "/made_up_thing" in result
+    runner._run_agent.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "/project use project-1",
+        "/project clear",
+    ),
+)
+@pytest.mark.asyncio
+async def test_unclaimed_project_legacy_verbs_keep_existing_unknown_command_safety(
+    text,
+    monkeypatch,
+):
+    """There is no built-in legacy project handler outside managed scope."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError(
+            "unclaimed /project text leaked through to the agent"
+        )
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    result = await runner._handle_message(_make_event(text))
+
+    assert result is not None
+    assert "Unknown command `/project`" in result
+    runner._run_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_known_slash_command_not_flagged_as_unknown(monkeypatch):
     """A real built-in like /status must NOT hit the unknown-command guard."""
     runner = _make_runner()

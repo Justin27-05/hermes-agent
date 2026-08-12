@@ -141,7 +141,12 @@ function TileChat({
     [attachments, runtimeId, storedSessionId, view.$messages]
   )
 
-  const actions = useSessionTileActions({ runtimeId, scope, storedSessionId })
+  const actions = useSessionTileActions({
+    runtimeId,
+    scope,
+    storedSession: tileStoredRow(storedSessionId, activeGatewayProfile),
+    storedSessionId
+  })
 
   // The same attach/pick/paste/drop pipeline the primary composer uses,
   // pointed at this tile's chips + session.
@@ -225,8 +230,10 @@ function TileChat({
 
 export function SessionTilePane({ storedSessionId }: { storedSessionId: string }) {
   const tiles = useStore($sessionTiles)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const tile = tiles.find(t => t.storedSessionId === storedSessionId)
   const runtimeId = tile?.runtimeId ?? null
+  const storedSession = tileStoredRow(storedSessionId, activeGatewayProfile)
   const gatewayOpen = useStore($gatewayState) === 'open'
   const resumingRef = useRef(false)
   const view = useMemo(() => buildTileView(storedSessionId), [storedSessionId])
@@ -294,10 +301,16 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
       return
     }
 
+    if (!storedSession) {
+      patchSessionTile(storedSessionId, { error: 'Exact stored session authority is unavailable.' })
+
+      return
+    }
+
     resumingRef.current = true
 
     delegate
-      .resumeTile(storedSessionId)
+      .resumeTile(storedSession)
       .then(id => patchSessionTile(storedSessionId, { error: undefined, runtimeId: id }))
       .catch((err: unknown) => {
         const message = err instanceof Error ? err.message : String(err)
@@ -314,7 +327,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
       .finally(() => {
         resumingRef.current = false
       })
-  }, [gatewayOpen, runtimeId, storedSessionId, tile?.error])
+  }, [gatewayOpen, runtimeId, storedSession, storedSessionId, tile?.error])
 
   // The gateway (re)opening invalidates any latched error — it likely came
   // from a not-yet-open gateway or the previous connection. Clearing it
@@ -363,8 +376,12 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
  *  the paginated recents page, so it has no `$sessions` row at all until new
  *  activity lands it there — resolving through the tree keeps its tab titled
  *  and tinted instead of a grey "Session" placeholder. */
-export function tileStoredRow(storedSessionId: string): SessionInfo | undefined {
-  const match = (s: SessionInfo) => sessionMatchesStoredId(s, storedSessionId)
+export function tileStoredRow(storedSessionId: string, profile?: string): SessionInfo | undefined {
+  const normalizedProfile = profile?.trim() || 'default'
+
+  const match = (session: SessionInfo) =>
+    sessionMatchesStoredId(session, storedSessionId) &&
+    (!profile || (session.profile?.trim() || 'default') === normalizedProfile)
 
   return (
     $sessions.get().find(match) ??
@@ -520,15 +537,16 @@ export function SessionTabMenu({
   return (
     <span className="contents" onContextMenu={event => event.stopPropagation()}>
       <SessionContextMenu
-        onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
-        onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
+        onArchive={stored ? () => void sessionTileDelegate()?.archiveSession(stored) : undefined}
+        onBranch={stored ? () => void sessionTileDelegate()?.branchSession(stored) : undefined}
         onClose={onClose}
-        onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
+        onDelete={stored ? () => void sessionTileDelegate()?.deleteSession(stored) : undefined}
         onHideTabBar={onHideTabBar}
         onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
         pinned={pinned}
         profile={profile}
         sessionId={storedSessionId}
+        storedSession={stored}
         surface="tab"
         tabPaneId={tabPaneId}
         title={title}

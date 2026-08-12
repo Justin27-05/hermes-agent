@@ -1,9 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import type { ProjectRuntimeState } from '@/store/project-runtime'
 import { $connection } from '@/store/session'
-import type { SessionInfo, SessionMessage } from '@/types/hermes'
+import type { ProjectInfo, SessionInfo, SessionMessage } from '@/types/hermes'
 
-import { artifactImageSrc, collectArtifactsForSession, loadArtifactsForSessions } from './artifact-utils'
+import {
+  artifactImageSrc,
+  artifactsForCurrentAuthority,
+  collectArtifactsForProjectRuntimes,
+  collectArtifactsForSession,
+  legacyArtifactSessions
+} from './artifact-utils'
 
 function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
@@ -20,6 +27,24 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     started_at: 1000,
     title: 'Session',
     tool_call_count: 0,
+    ...overrides
+  }
+}
+
+function makeProject(overrides: Partial<ProjectInfo> = {}): ProjectInfo {
+  return {
+    archived: false,
+    board_slug: null,
+    color: null,
+    created_at: 1,
+    description: null,
+    folders: [{ added_at: 1, is_primary: true, label: null, path: '/srv/demo' }],
+    icon: null,
+    id: 'project-a',
+    managed: true,
+    name: 'Demo',
+    primary_path: '/srv/demo',
+    slug: 'demo',
     ...overrides
   }
 }
@@ -90,54 +115,316 @@ describe('collectArtifactsForSession', () => {
   })
 })
 
-describe('loadArtifactsForSessions', () => {
-  it('loads transcripts serially and continues after a session fails', async () => {
-    const sessions = [
-      makeSession({ id: 'session-1' }),
-      makeSession({ id: 'session-2' }),
-      makeSession({ id: 'session-3' })
+describe('collectArtifactsForProjectRuntimes', () => {
+  it('uses the canonical managed snapshot instead of a stale transcript and keeps local artifacts closed', () => {
+    const runtimes: Record<string, ProjectRuntimeState> = {
+      'project-a': {
+        events: [],
+        snapshot: {
+          active_run: null,
+          artifacts: [
+            {
+              artifact_id: 'artifact-local',
+              presentation: {
+                created_at: 2000,
+                kind: 'file',
+                label: 'report.pdf',
+                open_target: null,
+                sha256: 'a'.repeat(64),
+                size_bytes: 42
+              }
+            },
+            {
+              artifact_id: 'artifact-link',
+              presentation: {
+                created_at: 3000,
+                kind: 'link',
+                label: 'release-notes',
+                open_target: { href: 'https://example.com/releases/1', kind: 'external_url' },
+                sha256: null,
+                size_bytes: null
+              }
+            }
+          ],
+          binding_id: 'binding-a',
+          block: null,
+          canonical_session_id: 'managed-session',
+          current_phase: 'working',
+          delivery_status: { error_code: null, state: 'caught_up' },
+          last_sequence: 2,
+          lifecycle: 'active',
+          pending_approval: null,
+          project_id: 'project-a',
+          queue: [],
+          transcript: [
+            {
+              content: 'stale local path /private/should-not-appear.pdf',
+              role: 'assistant',
+              timestamp: 1000
+            }
+          ],
+          transcript_revision: 1,
+          version: 1
+        }
+      }
+    }
+
+    const artifacts = collectArtifactsForProjectRuntimes(
+      runtimes,
+      [makeSession({ id: 'managed-session', title: 'Managed project' })],
+      'default'
+    )
+
+    expect(artifacts).toEqual([
+      expect.objectContaining({
+        href: null,
+        kind: 'file',
+        label: 'report.pdf',
+        sha256: 'a'.repeat(64),
+        sizeBytes: 42,
+        source: 'canonical',
+        timestamp: 2000,
+        value: ''
+      }),
+      expect.objectContaining({
+        href: 'https://example.com/releases/1',
+        kind: 'link',
+        label: 'release-notes',
+        source: 'canonical',
+        timestamp: 3000,
+        value: 'https://example.com/releases/1'
+      })
+    ])
+    expect(JSON.stringify(artifacts)).not.toContain('/private/should-not-appear.pdf')
+  })
+
+  it('never schedules a managed canonical session for transcript indexing', () => {
+    const runtimes = {
+      'project-a': {
+        events: [],
+        snapshot: { canonical_session_id: 'managed-session' }
+      }
+    }
+
+    const sessions = [makeSession({ id: 'managed-session' }), makeSession({ id: 'legacy-session' })]
+
+    expect(legacyArtifactSessions(sessions, runtimes, [])).toEqual([sessions[1]])
+  })
+
+  it('does not schedule transcript indexing for a managed project whose runtime has not loaded yet', () => {
+    const managedSession = makeSession({
+      id: 'managed-before-runtime',
+      project_id: 'project-a'
+    } as Partial<SessionInfo>)
+
+    const projectTree = [
+      {
+        id: 'project-a',
+        label: 'Demo',
+        path: '/srv/demo',
+        repos: [
+          {
+            groups: [
+              {
+                id: 'main',
+                label: 'main',
+                path: '/srv/demo',
+                sessions: []
+              }
+            ],
+            id: '/srv/demo',
+            label: 'demo',
+            path: '/srv/demo',
+            sessionCount: 1
+          }
+        ],
+        previewSessions: [
+          makeSession({ id: 'newer-preview-1' }),
+          makeSession({ id: 'newer-preview-2' }),
+          makeSession({ id: 'newer-preview-3' })
+        ],
+        sessionCount: 1
+      }
     ]
 
-    const callOrder: string[] = []
-    let activeLoads = 0
-    let maxActiveLoads = 0
+    expect(legacyArtifactSessions([managedSession], {}, [makeProject()], 'default', projectTree)).toEqual([])
+  })
 
-    const result = await loadArtifactsForSessions(sessions, async session => {
-      activeLoads += 1
-      maxActiveLoads = Math.max(maxActiveLoads, activeLoads)
-      callOrder.push(`start:${session.id}`)
-
-      try {
-        await Promise.resolve()
-
-        if (session.id === 'session-2') {
-          throw new Error('Session transcript exceeds the Desktop safe-load limit')
+  it('uses the runtime profile when duplicate session ids have different titles', () => {
+    const runtime = {
+      'project-a': {
+        events: [],
+        snapshot: {
+          ...({} as ProjectRuntimeState['snapshot']),
+          artifacts: [
+            {
+              artifact_id: 'artifact-a',
+              presentation: {
+                created_at: 1,
+                kind: 'file' as const,
+                label: 'result.pdf',
+                open_target: null,
+                sha256: null,
+                size_bytes: null
+              }
+            }
+          ],
+          canonical_session_id: 'shared-session',
+          project_id: 'project-a'
         }
-
-        return [
-          {
-            content: `https://example.com/${session.id}.png`,
-            role: 'assistant',
-            timestamp: 2000
-          }
-        ]
-      } finally {
-        callOrder.push(`end:${session.id}`)
-        activeLoads -= 1
       }
+    }
+
+    const sessions = [
+      makeSession({ id: 'shared-session', profile: 'work', title: 'Work title' }),
+      makeSession({ id: 'shared-session', profile: 'default', title: 'Default title' })
+    ]
+
+    expect(collectArtifactsForProjectRuntimes(runtime, sessions, 'work')).toEqual([
+      expect.objectContaining({
+        profile: 'work',
+        sessionId: 'shared-session',
+        sessionTitle: 'Work title'
+      })
+    ])
+  })
+
+  it('preserves legacy indexing for an explicitly unmanaged session in another profile', () => {
+    const otherProfileSession = makeSession({
+      cwd: '/srv/demo',
+      git_repo_root: '/srv/demo',
+      id: 'other-profile-session',
+      profile: 'other'
     })
 
-    expect(maxActiveLoads).toBe(1)
-    expect(callOrder).toEqual([
-      'start:session-1',
-      'end:session-1',
-      'start:session-2',
-      'end:session-2',
-      'start:session-3',
-      'end:session-3'
+    expect(legacyArtifactSessions([otherProfileSession], {}, [makeProject()], 'default')).toEqual([otherProfileSession])
+  })
+
+  it('fails closed for a project-bound session from another profile without that profile authority', () => {
+    const foreignManagedSession = makeSession({
+      id: 'foreign-managed-session',
+      profile: 'work',
+      project_id: 'project-a'
+    })
+
+    expect(
+      legacyArtifactSessions([foreignManagedSession], {}, [makeProject({ id: 'project-a', managed: false })], 'default')
+    ).toEqual([])
+  })
+
+  it('treats a non-empty project binding as opaque and fails closed when it is padded or malformed', () => {
+    const padded = makeSession({ id: 'padded', project_id: ' project-a ' })
+    const whitespaceOnly = makeSession({ id: 'whitespace', project_id: '   ' })
+
+    expect(legacyArtifactSessions([padded, whitespaceOnly], {}, [makeProject({ managed: false })], 'default')).toEqual(
+      []
+    )
+  })
+
+  it('prunes a rendered legacy path immediately when its project becomes managed while refresh is pending', () => {
+    const session = makeSession({
+      cwd: '/srv/demo',
+      git_repo_root: '/srv/demo',
+      id: 'transition-session',
+      project_id: 'project-a'
+    })
+
+    const [legacyArtifact] = collectArtifactsForSession(session, [
+      { content: '/private/stale-result.pdf', role: 'assistant', timestamp: 4 }
     ])
-    expect(result.artifacts.map(artifact => artifact.sessionId)).toEqual(['session-1', 'session-3'])
-    expect(result.failures).toHaveLength(1)
-    expect(result.failures[0]?.session.id).toBe('session-2')
+
+    let finishRefresh: (() => void) | undefined
+
+    const pendingRefresh = new Promise<void>(resolve => {
+      finishRefresh = resolve
+    })
+
+    expect(
+      artifactsForCurrentAuthority([legacyArtifact], {
+        currentScope: 'default',
+        loadedScope: 'default',
+        projects: [makeProject({ managed: false })],
+        projectsContextGeneration: 1,
+        projectsGeneration: 1,
+        projectsScope: 'default',
+        runtimeScope: 'default',
+        runtimes: {},
+        sessions: [session]
+      })
+    ).toEqual([legacyArtifact])
+    expect(
+      artifactsForCurrentAuthority([legacyArtifact], {
+        currentScope: 'default',
+        loadedScope: 'default',
+        projects: [makeProject({ managed: true })],
+        projectsContextGeneration: 1,
+        projectsGeneration: 1,
+        projectsScope: 'default',
+        runtimeScope: 'default',
+        runtimes: {},
+        sessions: [session]
+      })
+    ).toEqual([])
+    expect(pendingRefresh).toBeInstanceOf(Promise)
+    finishRefresh?.()
+  })
+
+  it('cannot retain an artifact row across a profile or runtime authority transition', () => {
+    const session = makeSession({ id: 'managed-session' })
+
+    const [canonicalArtifact] = collectArtifactsForProjectRuntimes(
+      {
+        'project-a': {
+          events: [],
+          snapshot: {
+            ...({} as ProjectRuntimeState['snapshot']),
+            artifacts: [
+              {
+                artifact_id: 'artifact-a',
+                presentation: {
+                  created_at: 1,
+                  kind: 'file',
+                  label: 'result.pdf',
+                  open_target: null,
+                  sha256: null,
+                  size_bytes: null
+                }
+              }
+            ],
+            canonical_session_id: session.id,
+            project_id: 'project-a'
+          }
+        }
+      },
+      [session],
+      'default'
+    )
+
+    expect(
+      artifactsForCurrentAuthority([canonicalArtifact], {
+        currentScope: 'profile-b',
+        loadedScope: 'profile-a',
+        projects: [],
+        projectsContextGeneration: 1,
+        projectsGeneration: 1,
+        projectsScope: 'profile-a',
+        runtimeScope: 'profile-a',
+        runtimes: {},
+        sessions: [session]
+      })
+    ).toEqual([])
+    expect(
+      artifactsForCurrentAuthority([canonicalArtifact], {
+        currentScope: 'profile-a',
+        loadedScope: 'profile-a',
+        projects: [],
+        projectsContextGeneration: 1,
+        projectsGeneration: 1,
+        projectsScope: 'profile-a',
+        runtimeScope: 'profile-a',
+        runtimes: {},
+        sessions: [session]
+      })
+    ).toEqual([canonicalArtifact])
   })
 })

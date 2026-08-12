@@ -582,6 +582,16 @@ def build_tree(
     ``previewSessions``. When True (drill-in), lanes carry full session rows.
     """
     active_projects = [p for p in projects if not p.get("archived")]
+    active_by_id = {
+        project["id"]: project
+        for project in active_projects
+        if type(project.get("id")) is str and project["id"]
+    }
+    known_by_id = {
+        project["id"]: project
+        for project in projects
+        if type(project.get("id")) is str and project["id"]
+    }
     _junk = is_junk_root or (lambda _root: False)
     _junk_cwd = is_junk_cwd or (lambda _cwd: False)
     _exists = exists or (lambda _path: True)
@@ -589,8 +599,40 @@ def build_tree(
 
     by_project: dict[str, list[dict]] = {}
     unowned: list[dict] = []
+    blocked_sessions: list[dict[str, str]] = []
     for session in sessions:
-        owner = _project_for_session(session, folder_index, resolve)
+        exact_project_id = session.get("project_id")
+        if exact_project_id is not None:
+            owner = (
+                active_by_id.get(exact_project_id)
+                if type(exact_project_id) is str
+                else None
+            )
+            if owner is None:
+                reason = (
+                    "project_archived"
+                    if (
+                        type(exact_project_id) is str
+                        and exact_project_id in known_by_id
+                    )
+                    else "project_not_found"
+                )
+                blocked_sessions.append(
+                    {
+                        "sessionId": str(session.get("id") or ""),
+                        "projectId": (
+                            exact_project_id
+                            if type(exact_project_id) is str
+                            else ""
+                        ),
+                        "reason": reason,
+                    }
+                )
+                continue
+        else:
+            owner = _project_for_session(
+                session, folder_index, resolve
+            )
         if owner:
             by_project.setdefault(owner["id"], []).append(session)
         else:
@@ -783,4 +825,8 @@ def build_tree(
             ),
         )
 
-    return {"projects": result, "scoped_session_ids": scoped_ids}
+    return {
+        "projects": result,
+        "scoped_session_ids": scoped_ids,
+        "blockedSessions": blocked_sessions,
+    }

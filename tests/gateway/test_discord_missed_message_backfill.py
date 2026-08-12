@@ -294,6 +294,105 @@ async def test_recovered_mention_reuses_live_auth_and_mention_gates(adapter, mon
     )
 
 
+@pytest.mark.asyncio
+async def test_recovery_does_not_treat_unmentioned_message_as_dispatched(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["free_response_channels"] = ""
+    adapter.handle_message = AsyncMock()
+    message = make_message(message_id=95, content="not addressed")
+
+    assert await adapter._dispatch_recovered_message(message) is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovered_managed_message_reuses_canonical_route_without_mention(
+    adapter, monkeypatch
+):
+    from gateway.project_surfaces import DiscordProjectWorkspaceConfig
+
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter.config.project_workspaces = DiscordProjectWorkspaceConfig(
+        enabled=True,
+        guild_id="777",
+        owner_user_id="42",
+        active_category_id="10",
+        completed_category_id="20",
+    )
+    adapter.handle_message = AsyncMock()
+    channel = FakeChannel(channel_id=123)
+    channel.category_id = 10
+    message = make_message(message_id=97, channel=channel, content="recover project")
+
+    assert await adapter._dispatch_recovered_message(message) is True
+    assert await adapter._dispatch_recovered_message(message) is False
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert getattr(event, "_hermes_managed_project_candidate", False) is True
+    adapter._handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovered_messages_bypass_live_text_debounce(adapter, monkeypatch):
+    bot_user = adapter._client.user
+    message = make_message(
+        message_id=96,
+        content=f"<@{bot_user.id}> recover",
+        mentions=[bot_user],
+    )
+    adapter._text_batch_delay_seconds = 0.6
+    adapter._handle_message = DiscordAdapter._handle_message.__get__(
+        adapter, DiscordAdapter
+    )
+    adapter.handle_message = AsyncMock()
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    assert await adapter._dispatch_recovered_message(message) is True
+    adapter.handle_message.assert_awaited_once()
+    assert adapter._pending_text_batches == {}
+
+
+def test_missed_message_backfill_config_bridge(monkeypatch, tmp_path):
+    from gateway.config import load_gateway_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for key in (
+        "DISCORD_MISSED_MESSAGE_BACKFILL",
+        "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
+        "DISCORD_MISSED_MESSAGE_BACKFILL_WINDOW_SECONDS",
+        "DISCORD_MISSED_MESSAGE_BACKFILL_LIMIT",
+        "DISCORD_MISSED_MESSAGE_BACKFILL_MAX_DISPATCHES",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    (tmp_path / "config.yaml").write_text(
+        "platforms:\n"
+        "  discord:\n"
+        "    enabled: true\n"
+        "discord:\n"
+        "  missed_message_backfill:\n"
+        "    enabled: true\n"
+        "    channels: ['1501971993405292796']\n"
+        "    window_seconds: 3600\n"
+        "    limit: 25\n"
+        "    max_dispatches: 3\n"
+    )
+
+    config = load_gateway_config()
+    backfill = config.platforms[Platform.DISCORD].extra[
+        "missed_message_backfill"
+    ]
+
+    assert backfill == {
+        "enabled": True,
+        "channels": ["1501971993405292796"],
+        "window_seconds": 3600,
+        "limit": 25,
+        "max_dispatches": 3,
+    }
+
+
 def test_default_config_exposes_missed_message_backfill_settings():
     from hermes_cli.config import DEFAULT_CONFIG
 

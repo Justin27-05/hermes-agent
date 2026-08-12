@@ -22,11 +22,18 @@ import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 import { $panesFlipped, dismissAutoProject } from '@/store/layout'
+import type { ProjectMutationName } from '@/store/project-command-runtime'
+import { $projectRuntimes } from '@/store/project-runtime'
 import {
+  $pendingProjectMutations,
+  $projects,
   copyPath,
   deleteProject,
+  executeProjectMutationWithFeedback,
+  isEffectivelyManagedProject,
   openProjectAddFolder,
   openProjectRename,
+  projectMutationPendingKey,
   revealPath,
   setActiveProject,
   setProjectAppearance
@@ -165,6 +172,36 @@ export function ProjectMenu({
   // Open toward the content area: right when the sidebar is on the left, left
   // when the panes are flipped (sidebar on the right).
   const panesFlipped = useStore($panesFlipped)
+  const projects = useStore($projects)
+  const projectRuntimes = useStore($projectRuntimes)
+  const pendingProjectMutations = useStore($pendingProjectMutations)
+  const managed = isEffectivelyManagedProject(project.id, projects, projectRuntimes)
+  const runtime = managed ? projectRuntimes[project.id]?.snapshot : undefined
+
+  const pendingAction = (
+    [
+      'project.rename',
+      'project.accept_completion',
+      'project.reopen',
+      'run.stop',
+      'run.resume'
+    ] satisfies ProjectMutationName[]
+  ).find(name => pendingProjectMutations[projectMutationPendingKey(name, project.id)])
+
+  const isActionPending = (name: ProjectMutationName): boolean =>
+    Boolean(pendingProjectMutations[projectMutationPendingKey(name, project.id)])
+
+  const runtimeApproval = runtime?.pending_approval
+    ? `${p.runtimeApprovalPending} (${runtime.pending_approval.kind})`
+    : p.runtimeApprovalNone
+
+  const runtimeDelivery = runtime
+    ? `${runtime.delivery_status.state}${
+        runtime.delivery_status.error_code ? ` (${runtime.delivery_status.error_code})` : ''
+      }`
+    : ''
+
+  const runtimeBlock = runtime?.block ? `${runtime.block.kind} (${runtime.block.code})` : p.runtimeBlockNone
 
   const { confirmDialog, dangerItem, identityItems, pathItems } = useProjectActions({
     isActive,
@@ -172,6 +209,19 @@ export function ProjectMenu({
     project,
     scoped
   })
+
+  const runManagedCommand = (name: ProjectMutationName, payload: Record<string, unknown> = {}) => {
+    if (!runtime || isActionPending(name)) {
+      return
+    }
+
+    void executeProjectMutationWithFeedback({
+      expected_version: runtime.version,
+      name,
+      payload,
+      project_id: project.id
+    }).catch(() => undefined)
+  }
 
   // Appearance writes route through the adopt-aware helper: an auto project is
   // materialized on its first change (its id then changes), so close the picker
@@ -226,10 +276,28 @@ export function ProjectMenu({
             Suppress that refocus so it survives. */}
         <DropdownMenuContent
           align="end"
-          className="w-48"
+          className={cn('w-48', runtime && 'w-64')}
           onCloseAutoFocus={event => event.preventDefault()}
           sideOffset={6}
         >
+          {runtime ? (
+            <>
+              <div
+                aria-label={p.runtimeStatus}
+                className="grid gap-0.5 px-2 py-1 text-xs text-(--ui-text-secondary)"
+                role="status"
+              >
+                <span>{`${p.runtimePhase}: ${runtime.current_phase}`}</span>
+                <span>{`${p.runtimeLifecycle}: ${runtime.lifecycle}`}</span>
+                <span>{`${p.runtimeQueue}: ${runtime.queue.length}`}</span>
+                <span>{`${p.runtimeApproval}: ${runtimeApproval}`}</span>
+                <span className="break-all">{`${p.runtimeDelivery}: ${runtimeDelivery}`}</span>
+                <span className="break-all">{`${p.runtimeBlock}: ${runtimeBlock}`}</span>
+                {pendingAction ? <span>{`${p.runtimeRetryPending}: ${pendingAction}`}</span> : null}
+              </div>
+              <DropdownMenuSeparator />
+            </>
+          ) : null}
           {project.isAuto ? (
             // Inherited (auto) repos can still be themed — the change adopts the
             // repo as a real project. Rename / add-folder / set-active stay out
@@ -242,15 +310,100 @@ export function ProjectMenu({
             )
           ) : (
             <>
-              {identityItems.slice(0, 1).map(item => renderActionItem(DROPDOWN_KIT, item))}
-              {appearanceItem}
-              {identityItems.slice(1).map(item => renderActionItem(DROPDOWN_KIT, item))}
+              <DropdownMenuItem
+                disabled={(managed && !runtime) || isActionPending('project.rename')}
+                onSelect={() => openProjectRename(target)}
+              >
+                <Codicon name="edit" size="0.875rem" />
+                <span>{p.menuRename}</span>
+              </DropdownMenuItem>
+              {!managed ? (
+                <>
+                  {appearanceItem}
+                  <DropdownMenuItem onSelect={() => openProjectAddFolder(target)}>
+                    <Codicon name="new-folder" size="0.875rem" />
+                    <span>{p.menuAddFolder}</span>
+                  </DropdownMenuItem>
+                </>
+              ) : null}
+              <DropdownMenuItem disabled={isActive} onSelect={() => void setActiveProject(project.id)}>
+                <Codicon name="target" size="0.875rem" />
+                <span>{p.menuSetActive}</span>
+              </DropdownMenuItem>
+              {managed && runtime?.lifecycle === 'awaiting_acceptance' ? (
+                <>
+                  <DropdownMenuItem
+                    disabled={isActionPending('project.accept_completion')}
+                    onSelect={() => runManagedCommand('project.accept_completion')}
+                  >
+                    <Codicon name="pass-filled" size="0.875rem" />
+                    <span>{p.menuAcceptCompletion}</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={isActionPending('project.reopen')}
+                    onSelect={() => runManagedCommand('project.reopen')}
+                  >
+                    <Codicon name="debug-continue" size="0.875rem" />
+                    <span>{p.menuContinueWork}</span>
+                  </DropdownMenuItem>
+                </>
+              ) : null}
+              {managed && runtime?.lifecycle === 'completed' ? (
+                <DropdownMenuItem
+                  disabled={isActionPending('project.reopen')}
+                  onSelect={() => runManagedCommand('project.reopen')}
+                >
+                  <Codicon name="debug-restart" size="0.875rem" />
+                  <span>{p.menuReopen}</span>
+                </DropdownMenuItem>
+              ) : null}
+              {managed &&
+              runtime?.lifecycle === 'active' &&
+              (runtime.active_run?.control_state === 'running' ||
+                runtime.active_run?.control_state === 'awaiting_approval') ? (
+                <DropdownMenuItem
+                  disabled={isActionPending('run.stop')}
+                  onSelect={() =>
+                    runManagedCommand('run.stop', {
+                      expected_control_version: runtime.active_run!.control_version,
+                      turn_id: runtime.active_run!.turn_id
+                    })
+                  }
+                >
+                  <Codicon name="debug-stop" size="0.875rem" />
+                  <span>{p.menuStop}</span>
+                </DropdownMenuItem>
+              ) : null}
+              {managed && runtime?.lifecycle === 'active' && runtime.active_run?.control_state === 'stopped' ? (
+                <DropdownMenuItem
+                  disabled={isActionPending('run.resume')}
+                  onSelect={() =>
+                    runManagedCommand('run.resume', {
+                      expected_control_version: runtime.active_run!.control_version,
+                      turn_id: runtime.active_run!.turn_id
+                    })
+                  }
+                >
+                  <Codicon name="debug-continue" size="0.875rem" />
+                  <span>{p.menuResume}</span>
+                </DropdownMenuItem>
+              ) : null}
               <DropdownMenuSeparator />
             </>
           )}
           {pathItems.map(item => renderActionItem(DROPDOWN_KIT, item))}
           <DropdownMenuSeparator />
-          {renderActionItem(DROPDOWN_KIT, dangerItem)}
+          {project.isAuto ? (
+            <DropdownMenuItem onSelect={removeAuto} variant="destructive">
+              <Codicon name="trash" size="0.875rem" />
+              <span>{p.removeFromSidebar}</span>
+            </DropdownMenuItem>
+          ) : managed ? null : (
+            <DropdownMenuItem onSelect={() => setConfirmDeleteOpen(true)} variant="destructive">
+              <Codicon name="trash" size="0.875rem" />
+              <span>{`${p.menuDelete}…`}</span>
+            </DropdownMenuItem>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
       <PopoverContent
@@ -268,7 +421,17 @@ export function ProjectMenu({
           onIcon={icon => void applyAppearance({ icon })}
         />
       </PopoverContent>
-      {confirmDialog}
+      {!project.isAuto && !managed ? (
+        <ConfirmDialog
+          confirmLabel={p.menuDelete}
+          description={p.deleteConfirm}
+          destructive
+          onClose={() => setConfirmDeleteOpen(false)}
+          onConfirm={confirmDelete}
+          open={confirmDeleteOpen}
+          title={`${p.menuDelete} "${project.label}"?`}
+        />
+      ) : null}
     </Popover>
   )
 }

@@ -340,3 +340,164 @@ async def test_matrix_resume_cross_room_requires_explicit_flag_and_warns():
     runner.session_store.switch_session.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_matrix_resume_lists_only_current_room_by_default():
+    source_a = _make_matrix_source(PROJECT_A_ROOM_ID, PROJECT_A_NAME, PROJECT_A_TOPIC)
+    source_b = _make_matrix_source(PROJECT_B_ROOM_ID, PROJECT_B_NAME, PROJECT_B_TOPIC)
+    runner = _make_runner(
+        source_b,
+        [_entry(source_a, "session-a", "Project A Plan"), _entry(source_b, "session-b", "Project B Plan")],
+    )
+
+    result = await runner._handle_resume_command(_event("/resume", source_b))
+
+    assert "Project B Plan" in result
+    assert "Project A Plan" not in result
+
+
+@pytest.mark.asyncio
+async def test_matrix_resume_all_lists_room_names():
+    source_a = _make_matrix_source(PROJECT_A_ROOM_ID, PROJECT_A_NAME, PROJECT_A_TOPIC)
+    source_b = _make_matrix_source(PROJECT_B_ROOM_ID, PROJECT_B_NAME, PROJECT_B_TOPIC)
+    runner = _make_runner(
+        source_b,
+        [_entry(source_a, "session-a", "Project A Plan"), _entry(source_b, "session-b", "Project B Plan")],
+    )
+    # Cross-room `/resume --all` listing is admin-gated (IDOR scoping), so this
+    # cross-room listing test must run as a configured admin.
+    runner._resume_caller_is_admin = lambda _src: True
+
+    result = await runner._handle_resume_command(_event("/resume --all", source_b))
+
+    assert "Project A Plan" in result
+    assert PROJECT_A_NAME in result
+    assert "Project B Plan" in result
+
+
+def test_task7_c13_worker_context_cache_is_surface_neutral_and_revision_isolated(
+    tmp_path,
+):
+    """A project agent identity ignores delivery surface but not revisions.
+
+    This catches a project cache that splits Desktop and Discord agents (and
+    consequently their prompts/history), or which reuses an agent after the
+    contract/tool/model construction snapshot changed.
+    """
+    import hashlib
+    import json
+    import os
+
+    from gateway import project_runtime_worker as worker_module
+    from gateway import session as session_module
+
+    assert hasattr(worker_module, "ProjectAgentRevisions")
+    assert callable(getattr(worker_module, "project_agent_cache_key", None))
+    assert callable(
+        getattr(worker_module, "project_agent_cache_signature", None)
+    )
+    assert callable(
+        getattr(
+            session_module,
+            "build_canonical_project_session_context",
+            None,
+        )
+    )
+
+    profile_home = tmp_path / "Profile"
+    key = worker_module.project_agent_cache_key(
+        profile_home,
+        "project-c13",
+        "canonical-tip",
+    )
+    same_key_from_other_surface = worker_module.project_agent_cache_key(
+        profile_home,
+        "project-c13",
+        "canonical-tip",
+    )
+    assert key == same_key_from_other_surface
+    expected_home_digest = hashlib.sha256(
+        os.path.normcase(os.path.realpath(profile_home)).encode("utf-8")
+    ).hexdigest()
+    assert key == (
+        f"project:v1:{expected_home_digest}:project-c13:canonical-tip"
+    )
+    assert key != worker_module.project_agent_cache_key(
+        tmp_path / "other-profile", "project-c13", "canonical-tip"
+    )
+    assert key != worker_module.project_agent_cache_key(
+        profile_home, "other-project", "canonical-tip"
+    )
+    assert key != worker_module.project_agent_cache_key(
+        profile_home, "project-c13", "other-tip"
+    )
+
+    revisions = worker_module.ProjectAgentRevisions(
+        base_signature="base-config",
+        tool_revision="tools-v1",
+        model_revision="model-v1",
+    )
+    desktop_signature = worker_module.project_agent_cache_signature(
+        revisions, 1
+    )
+    expected_signature = hashlib.sha256(
+        json.dumps(
+            ["base-config", 1, "tools-v1", "model-v1"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert desktop_signature == expected_signature
+    assert desktop_signature == worker_module.project_agent_cache_signature(
+        revisions, 1
+    )
+    assert desktop_signature != worker_module.project_agent_cache_signature(
+        revisions, 2
+    )
+    assert desktop_signature != worker_module.project_agent_cache_signature(
+        worker_module.ProjectAgentRevisions(
+            base_signature="other-base-config",
+            tool_revision="tools-v1",
+            model_revision="model-v1",
+        ),
+        1,
+    )
+    assert desktop_signature != worker_module.project_agent_cache_signature(
+        worker_module.ProjectAgentRevisions(
+            base_signature="base-config",
+            tool_revision="tools-v2",
+            model_revision="model-v1",
+        ),
+        1,
+    )
+    assert desktop_signature != worker_module.project_agent_cache_signature(
+        worker_module.ProjectAgentRevisions(
+            base_signature="base-config",
+            tool_revision="tools-v1",
+            model_revision="model-v2",
+        ),
+        1,
+    )
+
+    desktop_context = session_module.build_canonical_project_session_context(
+        "project-c13",
+        "canonical-tip",
+        GatewayConfig(),
+        session_key=key,
+    )
+    discord_context = session_module.build_canonical_project_session_context(
+        "project-c13",
+        "canonical-tip",
+        GatewayConfig(),
+        session_key=key,
+    )
+    assert desktop_context.session_id == "canonical-tip"
+    assert desktop_context.session_key == key
+    assert desktop_context.source.platform is Platform.LOCAL
+    assert desktop_context.source.chat_id == "project:project-c13"
+    assert desktop_context.source.chat_name is None
+    assert desktop_context.source.user_id is None
+    assert desktop_context.source.thread_id is None
+    assert build_session_context_prompt(desktop_context) == (
+        build_session_context_prompt(discord_context)
+    )

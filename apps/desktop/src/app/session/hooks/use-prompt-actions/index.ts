@@ -19,15 +19,35 @@ import {
   updateComposerAttachment
 } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
+import {
+  captureExactLegacySessionAuthority,
+  type ExactLegacySessionAuthority,
+  rebindExactLegacySessionAuthority,
+  validateExactLegacySessionAuthority
+} from '@/store/legacy-session-authority'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
+import {
+  markManagedComposerNotice,
+  projectComposerMessages,
+  reconcileManagedComposerState,
+  reconcileOptimisticProjectPrompts,
+  resolveCapturedProjectSubmitAuthority,
+  resolveManagedProjectSession,
+  submitManagedProjectPrompt
+} from '@/store/project-composer-queue'
+import { $projectRuntimes } from '@/store/project-runtime'
+import { resolveCurrentManagedProjectSurface } from '@/store/project-surface-authority-store'
+import { executeProjectMutationWithFeedback } from '@/store/projects'
 import { clearAllPrompts } from '@/store/prompts'
 import {
   $busy,
   $connection,
   $currentCwd,
   $messages,
+  $sessions,
   $terminalBackend,
+  sessionMatchesStoredId,
   setActiveSessionId,
   setAwaitingResponse,
   setBusy,
@@ -78,8 +98,15 @@ interface HandoffResult {
   error?: string
 }
 
-const WINDOWS_ABSOLUTE_PATH_RE = /^(?:[A-Za-z]:[\\/]|\\\\)/
-const POSIX_ABSOLUTE_PATH_RE = /^\/(?!\/)/
+class LegacyAuthorityDriftError extends Error {
+  constructor() {
+    super('legacy session authority changed')
+    this.name = 'LegacyAuthorityDriftError'
+  }
+}
+
+const WINDOWS_ABSOLUTE_PATH_RE = /^[A-Za-z]:\\/
+const POSIX_ABSOLUTE_PATH_RE = /^\//
 
 // Terminal backends whose execution environment has its own filesystem
 // (docker/ssh/singularity/modal/...) cannot see the desktop's host paths —
@@ -99,6 +126,27 @@ function attachmentPathNeedsUpload(path: string, backendCwd?: null | string, ter
   }
 
   return WINDOWS_ABSOLUTE_PATH_RE.test(path.trim()) && POSIX_ABSOLUTE_PATH_RE.test(backendCwd?.trim() || '')
+}
+
+function captureCurrentExactLegacyAuthority(
+  runtimeSessionId: string,
+  storedSessionId: null | string
+): ExactLegacySessionAuthority | null {
+  if (!storedSessionId) {
+    return null
+  }
+
+  const matches = $sessions.get().filter(session => sessionMatchesStoredId(session, storedSessionId))
+
+  return matches.length === 1
+    ? captureExactLegacySessionAuthority({
+        allowCrossProfileGateway: true,
+        requireActiveGateway: true,
+        runtimeSessionId,
+        storedSession: matches[0],
+        storedSessionId
+      })
+    : null
 }
 
 /**
@@ -219,7 +267,7 @@ interface PromptActionsOptions {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   branchCurrentSession: () => Promise<boolean>
-  createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
+  createBackendSessionForSend: (preview?: string | null, validateAuthority?: () => boolean) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
@@ -266,6 +314,54 @@ export function usePromptActions({
 }: PromptActionsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
+  const managedProjectCopy = t.statusStack.managedProject
+  const projectRuntimes = useStore($projectRuntimes)
+
+  const resolveProjectSurface = useCallback(
+    (runtimeSessionId: null | string | undefined, storedSessionId: null | string | undefined) =>
+      resolveCurrentManagedProjectSurface(runtimeSessionId, storedSessionId),
+    []
+  )
+
+  useEffect(() => {
+    const canonicalSessionIds = new Set(
+      Object.values(projectRuntimes).map(runtime => runtime.snapshot.canonical_session_id)
+    )
+
+    for (const canonicalSessionId of canonicalSessionIds) {
+      const resolution = resolveManagedProjectSession(projectRuntimes, canonicalSessionId)
+
+      const surfaceSessionId =
+        getRuntimeIdForStoredSession(canonicalSessionId) ??
+        (selectedStoredSessionIdRef.current === canonicalSessionId ? activeSessionIdRef.current : null) ??
+        canonicalSessionId
+
+      if (resolution.status === 'ambiguous') {
+        updateSessionState(surfaceSessionId, state => ({ ...state, messages: [] }), canonicalSessionId)
+
+        continue
+      }
+
+      if (resolution.status === 'legacy') {
+        continue
+      }
+
+      reconcileOptimisticProjectPrompts(resolution.snapshot)
+      updateSessionState(
+        surfaceSessionId,
+        state => ({ ...state, messages: projectComposerMessages(resolution.snapshot) }),
+        resolution.snapshot.canonical_session_id
+      )
+    }
+
+    reconcileManagedComposerState(projectRuntimes)
+  }, [
+    activeSessionIdRef,
+    getRuntimeIdForStoredSession,
+    projectRuntimes,
+    selectedStoredSessionIdRef,
+    updateSessionState
+  ])
 
   const appendSessionTextMessage = useCallback(
     (
@@ -331,8 +427,9 @@ export function usePromptActions({
     async (
       sessionId: string,
       attachments: ComposerAttachment[],
-      options: { updateComposerAttachments?: boolean } = {}
+      options: { requestGateway?: GatewayRequest; updateComposerAttachments?: boolean } = {}
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
+      const attachmentRequestGateway = options.requestGateway ?? requestGateway
       const updateComposerAttachments = options.updateComposerAttachments ?? true
       const remote = $connection.get()?.mode === 'remote'
       const storedSessionId = selectedStoredSessionIdRef.current
@@ -373,9 +470,8 @@ export function usePromptActions({
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
           const nextAttachment = await uploadComposerAttachment(attachment, {
-            backendCwd: $currentCwd.get(),
             remote,
-            requestGateway,
+            requestGateway: attachmentRequestGateway,
             sessionId: liveSessionId,
             storedSessionId,
             onSessionRecovered,
@@ -412,23 +508,56 @@ export function usePromptActions({
   // small and still byte-upload at submit via image.attach_bytes.
   const eagerlyUploadAttachment = useCallback(
     async (sessionId: string, attachment: ComposerAttachment) => {
+      const legacyAuthority = captureCurrentExactLegacyAuthority(sessionId, selectedStoredSessionIdRef.current)
+
+      if (!legacyAuthority || !validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: sessionId })) {
+        return
+      }
+
+      const validateAuthority = () =>
+        validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: sessionId })
+      const guardedRequestGateway: GatewayRequest = async <T>(
+        method: string,
+        params?: Record<string, unknown>,
+        timeoutMs?: number
+      ): Promise<T> => {
+        if (!validateAuthority()) {
+          throw new LegacyAuthorityDriftError()
+        }
+
+        const response = await requestGateway<T>(method, params, timeoutMs)
+
+        if (!validateAuthority()) {
+          throw new LegacyAuthorityDriftError()
+        }
+
+        return response
+      }
       const remote = $connection.get()?.mode === 'remote'
 
       setComposerAttachmentUploadState(attachment.id, 'uploading')
 
       try {
+        const uploaded = await uploadComposerAttachment(attachment, {
+          remote,
+          requestGateway: guardedRequestGateway,
+          sessionId
+        })
+
+        if (!validateAuthority()) {
+          setComposerAttachmentUploadState(attachment.id)
+          return
+        }
+
         // Update-only: if the user removed the chip while this was uploading,
         // don't resurrect it — just drop the staged result on the floor.
-        updateComposerAttachment(
-          await uploadComposerAttachment(attachment, {
-            backendCwd: $currentCwd.get(),
-            remote,
-            requestGateway,
-            sessionId,
-            terminalBackend: $terminalBackend.get()
-          })
-        )
+        updateComposerAttachment(uploaded)
       } catch (err) {
+        if (err instanceof LegacyAuthorityDriftError || !validateAuthority()) {
+          setComposerAttachmentUploadState(attachment.id)
+          return
+        }
+
         // Leave the chip in place so submit-time sync can retry (or the user can
         // remove it) and flag the card; also toast so a hard failure (unreadable
         // file, gateway perms) isn't swallowed while the user keeps typing.
@@ -436,7 +565,7 @@ export function usePromptActions({
         notifyError(err, copy.dropFiles)
       }
     },
-    [copy.dropFiles, requestGateway]
+    [copy.dropFiles, requestGateway, selectedStoredSessionIdRef]
   )
 
   const composerAttachments = useStore($composerAttachments)
@@ -588,6 +717,103 @@ export function usePromptActions({
     async (rawText: string, options?: SubmitTextOptions) => {
       const visibleText = sanitizeComposerInput(rawText).trim()
       const attachments = options?.attachments ?? $composerAttachments.get()
+      const targetSessionId = options?.sessionId ?? activeSessionIdRef.current
+
+      const targetStoredSessionId =
+        options?.storedSessionId ??
+        (targetSessionId === activeSessionIdRef.current ? selectedStoredSessionIdRef.current : null)
+
+      // A frozen fresh-draft authority captures a draft with NO session target
+      // (fresh chat). If reconstruction now resolves a session target — the
+      // selected stored-session ref retargeted to a durable session while
+      // composer middleware awaited — this submit belongs to a later session.
+      // The frozen draft authority must bind target resolution too: reject it
+      // rather than let the managed branch (or a later legacy session) submit
+      // without validating the frozen authority.
+      if (
+        options?.legacyDraftAuthority &&
+        (targetSessionId !== null || targetStoredSessionId !== null)
+      ) {
+        console.warn('[submit-drift-abort]', 'legacy-draft-authority', {
+          phase: 'target-resolution'
+        })
+
+        return false
+      }
+
+      let managedRuntime
+
+      if (options?.projectAuthority) {
+        const capturedResolution = resolveCapturedProjectSubmitAuthority(options.projectAuthority)
+
+        const surfaceResolution = options?.storedSession
+          ? resolveCurrentManagedProjectSurface(targetSessionId, targetStoredSessionId, options.storedSession)
+          : resolveProjectSurface(targetSessionId, targetStoredSessionId)
+
+        const capturedManagedMatchesSurface =
+          capturedResolution.status === 'managed' &&
+          surfaceResolution.status === 'managed' &&
+          capturedResolution.snapshot.binding_id === surfaceResolution.snapshot.binding_id &&
+          capturedResolution.snapshot.project_id === surfaceResolution.snapshot.project_id &&
+          capturedResolution.snapshot.canonical_session_id === surfaceResolution.snapshot.canonical_session_id
+
+        const capturedLegacyMatchesSurface =
+          capturedResolution.status === 'legacy' && surfaceResolution.status === 'conclusively-legacy'
+
+        if (!capturedManagedMatchesSurface && !capturedLegacyMatchesSurface) {
+          notifyError(new Error(managedProjectCopy.voiceScopeChanged), managedProjectCopy.voiceScopeChanged)
+
+          return false
+        }
+
+        managedRuntime = capturedManagedMatchesSurface ? capturedResolution.snapshot : undefined
+      } else {
+        const managedResolution = resolveProjectSurface(targetSessionId, targetStoredSessionId)
+
+        if (managedResolution.status === 'ambiguous' || managedResolution.status === 'unavailable') {
+          const message =
+            managedResolution.status === 'ambiguous'
+              ? managedProjectCopy.ambiguousSession
+              : managedProjectCopy.runtimeUnavailable
+
+          notifyError(new Error(message), message)
+
+          return false
+        }
+
+        managedRuntime = managedResolution.status === 'managed' ? managedResolution.snapshot : undefined
+      }
+
+      // Managed projects use ProjectRuntime as the sole turn authority. In
+      // particular, a busy run is a FIFO enqueue, never a local queue entry or
+      // legacy prompt.submit retry. Attachments stay blocked until an explicit
+      // canonical attachment contract exists, so local paths cannot cross this
+      // boundary through the message payload.
+      if (managedRuntime) {
+        const surfaceSessionId = targetSessionId ?? managedRuntime.canonical_session_id
+
+        return await submitManagedProjectPrompt({
+          attachmentsPresent: attachments.length > 0,
+          copy: managedProjectCopy,
+          fromQueue: Boolean(options?.fromQueue),
+          onOptimistic: optimistic =>
+            updateSessionState(
+              surfaceSessionId,
+              state => ({
+                ...state,
+                messages: state.messages.some(message => message.id === optimistic.local_id)
+                  ? state.messages
+                  : [
+                      ...state.messages,
+                      { id: optimistic.local_id, parts: [textPart(visibleText)], pending: true, role: 'user' }
+                    ]
+              }),
+              options?.storedSessionId
+            ),
+          snapshot: managedRuntime,
+          text: visibleText
+        })
+      }
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
@@ -600,7 +826,15 @@ export function usePromptActions({
 
       return await submitPromptText(rawText, options)
     },
-    [executeSlashCommand, submitPromptText]
+    [
+      activeSessionIdRef,
+      executeSlashCommand,
+      managedProjectCopy,
+      resolveProjectSurface,
+      selectedStoredSessionIdRef,
+      submitPromptText,
+      updateSessionState
+    ]
   )
 
   const transcribeVoiceAudio = useCallback(
@@ -615,6 +849,29 @@ export function usePromptActions({
       return result.transcript
     },
     [copy.sttDisabled, sttEnabled]
+  )
+
+  const blockManagedHistoryMutation = useCallback(
+    (sessionId: string): boolean => {
+      const resolution = resolveProjectSurface(sessionId, selectedStoredSessionIdRef.current)
+
+      if (resolution.status === 'conclusively-legacy') {
+        return false
+      }
+
+      if (resolution.status === 'managed') {
+        markManagedComposerNotice(resolution.snapshot, {
+          message: managedProjectCopy.historyUnsupported,
+          status: 'blocked',
+          text: ''
+        })
+      } else {
+        notifyError(new Error(managedProjectCopy.historyUnsupported), managedProjectCopy.historyUnsupported)
+      }
+
+      return true
+    },
+    [managedProjectCopy.historyUnsupported, resolveProjectSurface, selectedStoredSessionIdRef]
   )
 
   const cancelRun = useCallback(async () => {
@@ -634,15 +891,65 @@ export function usePromptActions({
       setBusy(false)
     }
 
-    setAwaitingResponse(false)
-    setTurnStartedAt(null)
-
     if (!sessionId) {
+      setAwaitingResponse(false)
+      setTurnStartedAt(null)
       releaseBusy()
       setMessages(finalizeInterruptedMessages($messages.get()))
 
       return
     }
+
+    const managedResolution = resolveProjectSurface(sessionId, selectedStoredSessionIdRef.current)
+
+    if (managedResolution.status === 'ambiguous' || managedResolution.status === 'unavailable') {
+      const message =
+        managedResolution.status === 'ambiguous'
+          ? managedProjectCopy.ambiguousSession
+          : managedProjectCopy.runtimeUnavailable
+
+      notifyError(new Error(message), message)
+
+      return
+    }
+
+    if (managedResolution.status === 'managed') {
+      const { active_run: activeRun } = managedResolution.snapshot
+
+      if (!activeRun || activeRun.control_state !== 'running') {
+        markManagedComposerNotice(managedResolution.snapshot, {
+          message: managedProjectCopy.stopUnavailable,
+          status: 'blocked',
+          text: ''
+        })
+
+        return
+      }
+
+      setAwaitingResponse(false)
+      setTurnStartedAt(null)
+
+      await executeProjectMutationWithFeedback({
+        expected_version: managedResolution.snapshot.version,
+        name: 'run.stop',
+        payload: {
+          expected_control_version: activeRun.control_version,
+          turn_id: activeRun.turn_id
+        },
+        project_id: managedResolution.snapshot.project_id
+      }).catch(() => undefined)
+
+      return
+    }
+
+    let legacyAuthority = captureCurrentExactLegacyAuthority(sessionId, selectedStoredSessionIdRef.current)
+
+    if (!legacyAuthority) {
+      return
+    }
+
+    setAwaitingResponse(false)
+    setTurnStartedAt(null)
 
     updateSessionState(sessionId, state => {
       const streamId = state.streamId
@@ -673,10 +980,28 @@ export function usePromptActions({
     clearClarifyRequest(undefined, sessionId)
 
     try {
+      const guardedRequestGateway: GatewayRequest = async <T>(
+        method: string,
+        params?: Record<string, unknown>,
+        timeoutMs?: number
+      ): Promise<T> => {
+        if (!validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: sessionId })) {
+          throw new LegacyAuthorityDriftError()
+        }
+
+        const response = await requestGateway<T>(method, params, timeoutMs)
+
+        if (!validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: sessionId })) {
+          throw new LegacyAuthorityDriftError()
+        }
+
+        return response
+      }
+
       await withSessionNotFoundResume(
         sessionId,
         selectedStoredSessionIdRef.current,
-        liveId => requestGateway('session.interrupt', { session_id: liveId }),
+        liveId => guardedRequestGateway('session.interrupt', { session_id: liveId }),
         {
           requestGateway,
           onRecovered: recoveredId => {
@@ -690,7 +1015,18 @@ export function usePromptActions({
       releaseBusy()
       notifyError(err, copy.stopFailed)
     }
-  }, [activeSessionIdRef, busyRef, copy.stopFailed, requestGateway, selectedStoredSessionIdRef, updateSessionState])
+  }, [
+    activeSessionIdRef,
+    busyRef,
+    copy.stopFailed,
+    managedProjectCopy.ambiguousSession,
+    managedProjectCopy.runtimeUnavailable,
+    managedProjectCopy.stopUnavailable,
+    requestGateway,
+    resolveProjectSurface,
+    selectedStoredSessionIdRef,
+    updateSessionState
+  ])
 
   // The desktop steering action is an immediate correction: the core cancels
   // model generation and rebuilds the live turn with displayed reasoning and
@@ -708,12 +1044,41 @@ export function usePromptActions({
         return false
       }
 
+      if (resolveProjectSurface(sessionId, selectedStoredSessionIdRef.current).status !== 'conclusively-legacy') {
+        return submitText(rawText, { sessionId })
+      }
+
+      const storedSessionId = selectedStoredSessionIdRef.current
+      const matchingRows = storedSessionId
+        ? $sessions.get().filter(session => sessionMatchesStoredId(session, storedSessionId))
+        : []
+      const capturedAuthority =
+        storedSessionId && matchingRows.length === 1
+          ? captureExactLegacySessionAuthority({
+              allowCrossProfileGateway: true,
+              requireActiveGateway: true,
+              runtimeSessionId: sessionId,
+              storedSession: matchingRows[0],
+              storedSessionId
+            })
+          : null
+
+      if (!capturedAuthority) {
+        return false
+      }
+
+      let legacyAuthority = capturedAuthority
+
       // Accepted whether the live turn was redirected in place or queued for
       // the next turn (the build window, before the agent is wired) — either
       // way the correction reaches the model, so record it once as a real user
       // message after the interrupted checkpoint, matching the durable core
       // transcript rather than a system note that changes role after reload.
       const send = async (id: string): Promise<boolean> => {
+        if (!validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: id })) {
+          return false
+        }
+
         // Redirect aborts the model request, so the completion event can race
         // its RPC response. Insert before the live reply *before* awaiting the
         // gateway; appending after the response leaves the correction below a
@@ -737,6 +1102,12 @@ export function usePromptActions({
 
         try {
           const result = await requestGateway<SessionRedirectResponse>('session.redirect', { session_id: id, text })
+
+          if (!validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: id })) {
+            discardOptimisticMessage()
+
+            return false
+          }
 
           if (result?.status === 'redirected') {
             triggerHaptic('submit')
@@ -781,7 +1152,15 @@ export function usePromptActions({
 
       return false
     },
-    [activeSessionIdRef, appendSessionTextMessage, requestGateway, selectedStoredSessionIdRef, updateSessionState]
+    [
+      activeSessionIdRef,
+      appendSessionTextMessage,
+      requestGateway,
+      resolveProjectSurface,
+      selectedStoredSessionIdRef,
+      submitText,
+      updateSessionState
+    ]
   )
 
   const reloadFromMessage = useCallback(
@@ -790,7 +1169,7 @@ export function usePromptActions({
       // stale session deletes the wrong transcript.
       const sessionId = activeSessionIdRef.current
 
-      if (!sessionId || $busy.get()) {
+      if (!sessionId || blockManagedHistoryMutation(sessionId) || $busy.get()) {
         return
       }
 
@@ -800,10 +1179,24 @@ export function usePromptActions({
         return
       }
 
+      const legacyAuthority = captureCurrentExactLegacyAuthority(sessionId, selectedStoredSessionIdRef.current)
+
+      if (!legacyAuthority || !validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: sessionId })) {
+        return
+      }
+
       clearNotifications()
       updateSessionState(sessionId, state => applyReloadOptimistic(state, plan))
 
+      if (!validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: sessionId })) {
+        return
+      }
+
       try {
+        if (!validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: sessionId })) {
+          return
+        }
+
         await requestGateway(
           'prompt.submit',
           {
@@ -814,6 +1207,10 @@ export function usePromptActions({
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
       } catch (err) {
+        if (!validateExactLegacySessionAuthority(legacyAuthority, { runtimeSessionId: sessionId })) {
+          return
+        }
+
         updateSessionState(sessionId, state => ({
           ...state,
           busy: false,
@@ -822,7 +1219,14 @@ export function usePromptActions({
         notifyError(err, copy.regenerateFailed)
       }
     },
-    [activeSessionIdRef, copy.regenerateFailed, requestGateway, updateSessionState]
+    [
+      activeSessionIdRef,
+      blockManagedHistoryMutation,
+      copy.regenerateFailed,
+      requestGateway,
+      selectedStoredSessionIdRef,
+      updateSessionState
+    ]
   )
 
   // Cursor-style "restore checkpoint": rewind the conversation to a past user
@@ -856,8 +1260,17 @@ export function usePromptActions({
         throw new Error('No active session to restore.')
       }
 
+      if (blockManagedHistoryMutation(sessionId)) {
+        return
+      }
+
       const messages = $messages.get()
       const plan = planRestore(messages, messageId, target)
+      const legacyAuthority = captureCurrentExactLegacyAuthority(sessionId, selectedStoredSessionIdRef.current)
+
+      if (!legacyAuthority) {
+        return
+      }
 
       // The turns we're discarding may have spawned todos and background
       // processes; they belong to the abandoned timeline, so wipe their status
@@ -873,7 +1286,13 @@ export function usePromptActions({
       updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex))
 
       try {
-        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+        await submitRewindPrompt(
+          sessionId,
+          plan.text,
+          plan.truncateOrdinal,
+          busyRef.current || $busy.get(),
+          legacyAuthority
+        )
       } catch (err) {
         // The rewind never landed (e.g. the gateway stayed busy past the retry
         // deadline). Roll the optimistic truncation back to the full original
@@ -888,10 +1307,22 @@ export function usePromptActions({
           awaitingResponse: false,
           messages
         }))
+
+        if (err instanceof LegacyAuthorityDriftError) {
+          return
+        }
+
         throw err
       }
     },
-    [activeSessionIdRef, busyRef, submitRewindPrompt, updateSessionState]
+    [
+      activeSessionIdRef,
+      blockManagedHistoryMutation,
+      busyRef,
+      selectedStoredSessionIdRef,
+      submitRewindPrompt,
+      updateSessionState
+    ]
   )
 
   const editMessage = useCallback(
@@ -899,10 +1330,21 @@ export function usePromptActions({
       // Ref, not the closure-captured prop — an edit rewinds and resubmits, so
       // a stale target rewrites the wrong session's history.
       const sessionId = activeSessionIdRef.current
+
+      if (sessionId && blockManagedHistoryMutation(sessionId)) {
+        return
+      }
+
       const messages = $messages.get()
       const plan = sessionId ? planEdit(messages, edited) : null
 
       if (!sessionId || !plan) {
+        return
+      }
+
+      const legacyAuthority = captureCurrentExactLegacyAuthority(sessionId, selectedStoredSessionIdRef.current)
+
+      if (!legacyAuthority) {
         return
       }
 
@@ -924,14 +1366,20 @@ export function usePromptActions({
         /no longer in session history|not in session history/i.test(err instanceof Error ? err.message : String(err))
 
       try {
-        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+        await submitRewindPrompt(
+          sessionId,
+          plan.text,
+          plan.truncateOrdinal,
+          busyRef.current || $busy.get(),
+          legacyAuthority
+        )
       } catch (err) {
         let surfaced = err
 
         if (!plan.isFailedTurn && isStaleTargetError(err)) {
           try {
             // Already interrupted on the first attempt — submit as a plain resend.
-            await submitRewindPrompt(sessionId, plan.text, undefined, false)
+            await submitRewindPrompt(sessionId, plan.text, undefined, false, legacyAuthority)
 
             return
           } catch (retryErr) {
@@ -946,10 +1394,23 @@ export function usePromptActions({
         setBusy(false)
         setAwaitingResponse(false)
         updateSessionState(sessionId, state => ({ ...state, busy: false, awaitingResponse: false, messages }))
+
+        if (surfaced instanceof LegacyAuthorityDriftError) {
+          return
+        }
+
         notifyError(surfaced, copy.editFailed)
       }
     },
-    [activeSessionIdRef, busyRef, copy.editFailed, submitRewindPrompt, updateSessionState]
+    [
+      activeSessionIdRef,
+      blockManagedHistoryMutation,
+      busyRef,
+      copy.editFailed,
+      selectedStoredSessionIdRef,
+      submitRewindPrompt,
+      updateSessionState
+    ]
   )
 
   const handleThreadMessagesChange = useCallback(

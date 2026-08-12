@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import type { HermesGateway } from '@/hermes'
+import type { SessionInfo } from '@/types/hermes'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
 
@@ -40,6 +41,8 @@ export interface ChatBarProps {
   gateway?: HermesGateway | null
   queueSessionKey?: string | null
   sessionId?: string | null
+  storedSessionId?: string | null
+  storedSession?: SessionInfo
   cwd?: string | null
   onCancel: () => Promise<void> | void
   onAddContextRef?: (refText: string, label?: string, detail?: string) => void

@@ -6,7 +6,10 @@ import type { ProfileInfo } from '@/types/hermes'
 
 // Keep profile.ts's side-effecting imports inert: the gateway socket layer and
 // the REST query client must not run for real in a unit test.
-const ensureGatewayForProfile = vi.fn(async () => undefined)
+const ensureGatewayForProfile = vi.fn<(profile: string, isCurrent?: () => boolean) => Promise<void>>(
+  async () => undefined
+)
+
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
@@ -46,7 +49,8 @@ const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnectio
 
 beforeEach(() => {
   getConnection.mockReset()
-  ensureGatewayForProfile.mockClear()
+  ensureGatewayForProfile.mockReset()
+  ensureGatewayForProfile.mockResolvedValue(undefined)
   openGatewayForProfile.mockClear()
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
@@ -72,7 +76,7 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
 
     await ensureGatewayProfile('vps-remote')
 
-    expect(ensureGatewayForProfile).toHaveBeenCalledWith('vps-remote')
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('vps-remote', expect.any(Function))
     expect(getConnection).toHaveBeenCalledWith('vps-remote')
     expect($connection.get()?.mode).toBe('remote')
     expect($connection.get()?.profile).toBe('vps-remote')
@@ -107,6 +111,41 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect(getConnection).not.toHaveBeenCalled()
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
     expect($connection.get()?.mode).toBe('remote')
+  })
+
+  it('keeps the latest external activation authoritative after deferred artifact activations resume', async () => {
+    let releaseArtifactA: (() => void) | undefined
+    let releaseArtifactB: (() => void) | undefined
+
+    ensureGatewayForProfile.mockImplementation(profile =>
+      profile === 'artifact-a'
+        ? new Promise<void>(resolve => {
+            releaseArtifactA = resolve
+          })
+        : profile === 'artifact-b'
+          ? new Promise<void>(resolve => {
+              releaseArtifactB = resolve
+            })
+          : Promise.resolve()
+    )
+    getConnection.mockImplementation(async profile => remoteConn({ profile: profile || 'default' }))
+
+    const artifactA = ensureGatewayProfile('artifact-a')
+
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('artifact-a', expect.any(Function)))
+
+    const artifactB = ensureGatewayProfile('artifact-b')
+    const external = ensureGatewayProfile('external')
+
+    releaseArtifactA?.()
+
+    await vi.waitFor(() => expect($activeGatewayProfile.get()).toBe('external'))
+
+    releaseArtifactB?.()
+    await Promise.all([artifactA, artifactB, external])
+
+    expect($activeGatewayProfile.get()).toBe('external')
+    expect($connection.get()?.profile).toBe('external')
   })
 })
 

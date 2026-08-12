@@ -1887,6 +1887,327 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     return report
 
 
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS system_prompts (
+    hash TEXT PRIMARY KEY,
+    prompt TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    source TEXT NOT NULL,
+    user_id TEXT,
+    session_key TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    display_name TEXT,
+    origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
+    model TEXT,
+    model_config TEXT,
+    system_prompt TEXT,
+    system_prompt_hash TEXT,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    git_branch TEXT,
+    git_repo_root TEXT,
+    billing_provider TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    title TEXT,
+    last_activity_at REAL,
+    last_activity_description TEXT,
+    last_activity_provenance TEXT,
+    api_call_count INTEGER DEFAULT 0,
+    handoff_state TEXT,
+    handoff_platform TEXT,
+    handoff_error TEXT,
+    compression_failure_cooldown_until REAL,
+    compression_failure_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT,
+    rewind_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    last_read_at REAL,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
+    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_call_id TEXT,
+    tool_calls TEXT,
+    tool_name TEXT,
+    effect_disposition TEXT,
+    timestamp REAL NOT NULL,
+    token_count INTEGER,
+    finish_reason TEXT,
+    reasoning TEXT,
+    reasoning_content TEXT,
+    reasoning_details TEXT,
+    codex_reasoning_items TEXT,
+    codex_message_items TEXT,
+    platform_message_id TEXT,
+    observed INTEGER DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    compacted INTEGER NOT NULL DEFAULT 0,
+    api_content TEXT,
+    display_kind TEXT,
+    display_metadata TEXT
+);
+
+CREATE TABLE IF NOT EXISTS session_model_usage (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    billing_provider TEXT NOT NULL DEFAULT '',
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    billing_mode TEXT NOT NULL DEFAULT '',
+    task TEXT NOT NULL DEFAULT '',
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    actual_cost_usd REAL NOT NULL DEFAULT 0,
+    cost_status TEXT,
+    cost_source TEXT,
+    first_seen REAL,
+    last_seen REAL,
+    PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
+);
+
+CREATE TABLE IF NOT EXISTS state_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS gateway_routing (
+    scope TEXT NOT NULL DEFAULT '',
+    session_key TEXT NOT NULL,
+    entry_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (scope, session_key)
+);
+
+CREATE TABLE IF NOT EXISTS compression_locks (
+    session_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS async_delegations (
+    delegation_id TEXT PRIMARY KEY,
+    origin_session TEXT NOT NULL,
+    origin_ui_session_id TEXT NOT NULL DEFAULT '',
+    parent_session_id TEXT,
+    state TEXT NOT NULL,
+    dispatched_at REAL NOT NULL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    event_json TEXT,
+    result_json TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    task_json TEXT,
+    delivery_claim TEXT,
+    delivery_claimed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
+    ON async_delegations(delivery_state, completed_at);
+"""
+
+# Indexes that reference columns added in later schema versions must be
+# created AFTER _reconcile_columns() has had a chance to ADD them on
+# existing databases. SCHEMA_SQL above is run by sqlite executescript
+# which would otherwise fail on legacy DBs ("no such column: active").
+DEFERRED_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_messages_session_active
+    ON messages(session_id, active, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_active_null
+    ON messages(active) WHERE active IS NULL;
+CREATE INDEX IF NOT EXISTS idx_sessions_session_key
+    ON sessions(session_key, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
+    ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
+    ON sessions(handoff_state, started_at);
+"""
+
+# ── Deferred FTS rebuild bookkeeping (schema v23) ──
+# While a background index rebuild is pending, two state_meta keys define
+# which message rows are currently IN the FTS indexes:
+#
+#   fts_rebuild_high_water  H — MAX(messages.id) at the moment the old
+#                                indexes were dropped
+#   fts_rebuild_progress    P — highest id the chunked backfill has indexed
+#
+# A row is indexed iff  id <= P  (backfilled)  OR  id > H  (inserted after
+# the drop; ids are AUTOINCREMENT so new rows are always > H and the insert
+# triggers index them live).  Rows in (P, H] are not yet indexed.
+#
+# Every trigger below gates on that same predicate: firing an FTS5
+# external-content 'delete' for a row that is NOT in the index corrupts the
+# index, and skipping it for a row that IS indexed leaves a stale entry.
+# When no rebuild is pending both keys are absent and COALESCE turns the
+# predicate into a tautology (id > -1 OR id <= -1), i.e. normal operation.
+# The two state_meta PK probes per write are negligible next to the FTS
+# insert itself.
+FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    tool_name,
+    tool_calls,
+    content='messages',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages
+WHEN (new.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                         WHERE key = 'fts_rebuild_high_water'), -1)
+   OR new.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                          WHERE key = 'fts_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO messages_fts(rowid, content, tool_name, tool_calls)
+    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages
+WHEN (old.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                         WHERE key = 'fts_rebuild_high_water'), -1)
+   OR old.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                          WHERE key = 'fts_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, tool_name, tool_calls)
+    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages
+WHEN (old.content IS NOT new.content
+    OR old.tool_name IS NOT new.tool_name
+    OR old.tool_calls IS NOT new.tool_calls)
+   AND (old.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                           WHERE key = 'fts_rebuild_high_water'), -1)
+     OR old.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                            WHERE key = 'fts_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, tool_name, tool_calls)
+    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+    INSERT INTO messages_fts(rowid, content, tool_name, tool_calls)
+    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+END;
+"""
+
+# Trigram FTS5 table for CJK substring search.  The default unicode61
+# tokenizer splits CJK characters into individual tokens, breaking phrase
+# matching.  The trigram tokenizer creates overlapping 3-byte sequences so
+# substring queries work natively for any script (CJK, Thai, etc.).
+#
+# The trigram index is the most expensive index in state.db (~2.6x the size
+# of the text it covers), and ``role='tool'`` rows are ~90% of message bytes
+# while being almost entirely machine noise (base64 payloads, file dumps,
+# delegation transcripts).  The index therefore reads through
+# ``messages_fts_trigram_src``, a view that excludes tool rows — they stay
+# fully stored in ``messages`` and fully searchable via the standard
+# ``messages_fts`` index; they just don't get trigram (CJK substring)
+# treatment.  ``search_messages`` routes CJK queries that filter on
+# ``role='tool'`` to the LIKE fallback for the same reason.
+FTS_TRIGRAM_SQL = """
+CREATE VIEW IF NOT EXISTS messages_fts_trigram_src AS
+    SELECT id, role, content, tool_name, tool_calls
+    FROM messages
+    WHERE role <> 'tool';
+
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+    content,
+    tool_name,
+    tool_calls,
+    content='messages_fts_trigram_src',
+    content_rowid='id',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages
+WHEN new.role <> 'tool'
+   AND (new.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                           WHERE key = 'fts_rebuild_high_water'), -1)
+     OR new.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                            WHERE key = 'fts_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
+    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages
+WHEN old.role <> 'tool'
+   AND (old.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                           WHERE key = 'fts_rebuild_high_water'), -1)
+     OR old.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                            WHERE key = 'fts_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
+    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages
+WHEN (old.content IS NOT new.content
+    OR old.tool_name IS NOT new.tool_name
+    OR old.tool_calls IS NOT new.tool_calls
+    OR old.role IS NOT new.role)
+   AND (old.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                           WHERE key = 'fts_rebuild_high_water'), -1)
+     OR old.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                            WHERE key = 'fts_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
+    SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+    WHERE old.role <> 'tool';
+    INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
+    SELECT new.id, new.content, new.tool_name, new.tool_calls
+    WHERE new.role <> 'tool';
+END;
+"""
+
 # ── CJK-bigram FTS index (replaces the trigram index when available) ────
 #
 # The trigram tokenizer needs >=3 chars per query term, so 1-2 char CJK
@@ -3860,6 +4181,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def set_session_project_id(
+        self, session_id: str, project_id: str | None
+    ) -> bool:
+        """Set the recoverable project projection once, without inference."""
+        if not (
+            type(session_id) is str
+            and bool(session_id)
+            and type(project_id) is str
+            and bool(project_id)
+        ):
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT project_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["project_id"] == project_id:
+                return True
+            if row["project_id"] is not None:
+                return False
+            cursor = conn.execute(
+                """
+                UPDATE sessions
+                SET project_id = ?
+                WHERE id = ? AND project_id IS NULL
+                """,
+                (project_id, session_id),
+            )
+            return cursor.rowcount == 1
+
+        return self._execute_write(_do)
 
     def record_gateway_session_peer(
         self,

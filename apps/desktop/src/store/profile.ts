@@ -225,6 +225,16 @@ export function prewarmProfileBackend(name: string): void {
 }
 
 let gatewaySwitch: Promise<void> | null = null
+let gatewayProfileGeneration = 0
+let gatewayProfileTarget = normalizeProfileKey($activeGatewayProfile.get())
+
+export function gatewayProfileAuthorityGeneration(): number {
+  return gatewayProfileGeneration
+}
+
+export function gatewayProfileAuthorityTarget(): string {
+  return gatewayProfileTarget
+}
 
 // Keep the renderer's $connection (mode / baseUrl / profile) in lockstep with
 // the profile the live gateway is now on. $connection seeds from the PRIMARY
@@ -238,7 +248,7 @@ let gatewaySwitch: Promise<void> | null = null
 // browser and /api/media fetches targeted the wrong machine (#46651).
 // Best-effort: a failed descriptor fetch leaves the prior connection intact for
 // boot/reconnect to resync.
-async function syncConnectionToActiveProfile(profile: string): Promise<void> {
+async function syncConnectionToActiveProfile(profile: string, isCurrent: () => boolean): Promise<void> {
   const getConnection = window.hermesDesktop?.getConnection
 
   if (!getConnection) {
@@ -246,7 +256,11 @@ async function syncConnectionToActiveProfile(profile: string): Promise<void> {
   }
 
   try {
-    setConnection(await getConnection(profile))
+    const connection = await getConnection(profile)
+
+    if (isCurrent()) {
+      setConnection(connection)
+    }
   } catch {
     // Leave the prior connection in place; boot/reconnect resyncs it later.
   }
@@ -271,37 +285,52 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   }
 
   const target = normalizeProfileKey(profile)
+  const generation = ++gatewayProfileGeneration
+  gatewayProfileTarget = target
 
-  if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+  if (gatewaySwitch === null && normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
     return
   }
 
-  // Serialize concurrent activations so two rapid session switches don't race
-  // the active pointer.
-  if (gatewaySwitch) {
-    await gatewaySwitch.catch(() => undefined)
-
-    if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
-      return
-    }
-  }
+  const predecessor = gatewaySwitch
 
   $gatewaySwapTarget.set(target)
-  gatewaySwitch = (async () => {
+
+  const activation = (async () => {
+    if (predecessor) {
+      await predecessor.catch(() => undefined)
+    }
+
+    if (generation !== gatewayProfileGeneration) {
+      return
+    }
+
     // ensureGatewayForProfile opens (or reuses) the target's socket and points
     // the active gateway at it — without closing the profile you came from.
-    await ensureGatewayForProfile(target)
-    $activeGatewayProfile.set(target)
+    await ensureGatewayForProfile(target, () => generation === gatewayProfileGeneration)
+
+    if (generation !== gatewayProfileGeneration) {
+      return
+    }
+
     // The active backend just changed; resync $connection so remote-aware
     // paths (image.attach_bytes vs image.attach, /api/fs/*, /api/media) follow.
-    await syncConnectionToActiveProfile(target)
+    await syncConnectionToActiveProfile(target, () => generation === gatewayProfileGeneration)
+
+    if (generation === gatewayProfileGeneration) {
+      $activeGatewayProfile.set(target)
+    }
   })()
 
+  gatewaySwitch = activation
+
   try {
-    await gatewaySwitch
+    await activation
   } finally {
-    gatewaySwitch = null
-    $gatewaySwapTarget.set(null)
+    if (gatewaySwitch === activation) {
+      gatewaySwitch = null
+      $gatewaySwapTarget.set(null)
+    }
   }
 }
 

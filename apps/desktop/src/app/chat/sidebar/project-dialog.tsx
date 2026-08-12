@@ -20,12 +20,15 @@ import { type ProjectIdeaTemplate, randomIdeaTemplates } from '@/lib/project-ide
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import {
+  $pendingProjectMutations,
   $projectDialog,
   addProjectFolder,
   closeProjectDialog,
   createProject,
   generateProjectIdea,
+  isHandledProjectMutationError,
   pickProjectFolder,
+  projectMutationPendingKey,
   renameProject
 } from '@/store/projects'
 
@@ -36,8 +39,16 @@ export function ProjectDialog() {
   const { t } = useI18n()
   const p = t.sidebar.projects
   const state = useStore($projectDialog)
+  const pendingProjectMutations = useStore($pendingProjectMutations)
   const open = state !== null
   const mode = state?.mode ?? 'create'
+
+  const pendingMutation =
+    mode === 'create'
+      ? pendingProjectMutations[projectMutationPendingKey('project.create', null)]
+      : mode === 'rename' && state?.projectId
+        ? pendingProjectMutations[projectMutationPendingKey('project.rename', state.projectId)]
+        : undefined
 
   const [name, setName] = useState('')
   const [folders, setFolders] = useState<string[]>([])
@@ -46,6 +57,7 @@ export function ProjectDialog() {
   const [generatingIdea, setGeneratingIdea] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
+  const writeDisabled = submitting || Boolean(pendingMutation)
 
   useEffect(() => {
     if (open) {
@@ -60,7 +72,7 @@ export function ProjectDialog() {
         window.setTimeout(() => nameRef.current?.select(), 0)
       }
     }
-  }, [open, mode, state?.name])
+  }, [mode, open, state])
 
   const onOpenChange = (next: boolean) => {
     if (!next) {
@@ -70,18 +82,22 @@ export function ProjectDialog() {
 
   // One submit beat for every flow: guard re-entry, run the write, close on
   // success, surface a toast on failure. Callers pass only the write.
-  const runSubmit = async (write: () => Promise<unknown>) => {
-    if (submitting) {
+  const runSubmit = async (write: (origin: NonNullable<typeof state>) => Promise<unknown>) => {
+    const origin = state
+
+    if (submitting || pendingMutation || !origin) {
       return
     }
 
     setSubmitting(true)
 
     try {
-      await write()
-      closeProjectDialog()
+      await write(origin)
+      closeProjectDialog(origin)
     } catch (err) {
-      notifyError(err, p.createFailed)
+      if (!isHandledProjectMutationError(err)) {
+        notifyError(err, p.createFailed)
+      }
     } finally {
       setSubmitting(false)
     }
@@ -113,9 +129,13 @@ export function ProjectDialog() {
     const trimmed = name.trim()
     const projectId = state?.projectId
 
+    if (pendingMutation) {
+      return
+    }
+
     if (mode === 'rename' && projectId) {
       if (trimmed) {
-        await runSubmit(() => renameProject(projectId, trimmed))
+        await runSubmit(origin => renameProject(projectId, trimmed, { dialog: origin }))
       }
 
       return
@@ -124,7 +144,9 @@ export function ProjectDialog() {
     // A project owns sessions by folder (cwd-prefix), so creation requires at
     // least one — a folder-less project couldn't hold a session anyway.
     if (mode === 'create' && trimmed && folders.length) {
-      await runSubmit(() => createProject({ folders, idea: idea.trim() || undefined, name: trimmed, use: true }))
+      await runSubmit(origin =>
+        createProject({ folders, idea: idea.trim() || undefined, name: trimmed, use: true }, { dialog: origin })
+      )
     }
   }
 
@@ -159,7 +181,7 @@ export function ProjectDialog() {
         {mode !== 'add-folder' && (
           <Input
             autoFocus
-            disabled={submitting}
+            disabled={writeDisabled}
             onChange={event => setName(event.target.value)}
             onKeyDown={event => {
               if (event.key === 'Enter') {
@@ -202,6 +224,7 @@ export function ProjectDialog() {
                       <Button
                         aria-label={p.removeFolder}
                         className="size-5 shrink-0 text-(--ui-text-quaternary) hover:text-foreground"
+                        disabled={writeDisabled}
                         onClick={() => setFolders(prev => prev.filter(f => f !== folder))}
                         size="icon-xs"
                         type="button"
@@ -216,7 +239,7 @@ export function ProjectDialog() {
             )}
             <Button
               className="self-start"
-              disabled={submitting}
+              disabled={writeDisabled}
               onClick={() => void pickFolder()}
               size="sm"
               type="button"
@@ -234,14 +257,14 @@ export function ProjectDialog() {
             <div className="relative">
               <Textarea
                 className="min-h-20 pr-8 text-[0.8125rem]"
-                disabled={submitting}
+                disabled={writeDisabled}
                 onChange={event => setIdea(event.target.value)}
                 placeholder={p.ideaPlaceholder}
                 value={idea}
               />
               <GenerateButton
                 className="absolute top-1 right-1"
-                disabled={submitting}
+                disabled={writeDisabled}
                 generating={generatingIdea}
                 generatingLabel={p.ideaGenerating}
                 label={p.ideaGenerate}
@@ -252,7 +275,7 @@ export function ProjectDialog() {
               {templates.map(template => (
                 <button
                   className="flex items-center gap-1 rounded-full border border-(--ui-stroke-tertiary) px-2 py-0.5 text-[0.6875rem] text-(--ui-text-secondary) transition-colors hover:border-(--ui-stroke-secondary) hover:bg-(--ui-control-hover-background) hover:text-foreground disabled:opacity-50"
-                  disabled={submitting}
+                  disabled={writeDisabled}
                   key={template.label}
                   onClick={() => setIdea(template.idea)}
                   type="button"
@@ -265,7 +288,7 @@ export function ProjectDialog() {
                 <Button
                   aria-label={p.ideaShuffle}
                   className="size-5 text-(--ui-text-quaternary) hover:text-foreground"
-                  disabled={submitting}
+                  disabled={writeDisabled}
                   onClick={() => setTemplates(randomIdeaTemplates())}
                   size="icon-xs"
                   type="button"
@@ -279,7 +302,7 @@ export function ProjectDialog() {
         )}
 
         {mode === 'add-folder' && (
-          <Button disabled={submitting} onClick={() => void pickFolder()} type="button">
+          <Button disabled={writeDisabled} onClick={() => void pickFolder()} type="button">
             <Codicon name="folder-opened" size="0.875rem" />
             {p.addFolder}
           </Button>
@@ -287,11 +310,16 @@ export function ProjectDialog() {
 
         {mode !== 'add-folder' && (
           <DialogFooter>
+            {pendingMutation ? (
+              <span className="mr-auto text-xs text-(--ui-text-secondary)" role="status">
+                {p.mutationPending}
+              </span>
+            ) : null}
             <Button disabled={submitting} onClick={() => onOpenChange(false)} type="button" variant="ghost">
               {t.common.cancel}
             </Button>
             <Button
-              disabled={submitting || !name.trim() || (mode === 'create' && folders.length === 0)}
+              disabled={writeDisabled || !name.trim() || (mode === 'create' && folders.length === 0)}
               onClick={() => void submit()}
               type="button"
             >
